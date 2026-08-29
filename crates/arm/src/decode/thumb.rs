@@ -14,7 +14,8 @@
 //! fields are not yet implemented and currently preserve the raw halfword.
 
 use crate::instruction::thumb::{
-    AddSubOperand, ThumbAluOp, ThumbHiRegOp, ThumbImmediateOp, ThumbInstruction, ThumbShiftOp,
+    AddSubOperand, LoadAddressSource, ThumbAluOp, ThumbHiRegOp, ThumbImmediateOp, ThumbInstruction,
+    ThumbShiftOp, ThumbSignExtendOp,
 };
 use crate::register::Register;
 
@@ -216,44 +217,119 @@ fn decode_thumb_alu_op(bits: u16) -> ThumbAluOp {
     }
 }
 
+/// Format 6 — PC-relative load. Destination is bits 10..8, the word offset is
+/// bits 7..0.
 fn decode_pc_relative_load(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::PcRelativeLoad {
+        rd: low_register(raw >> 8),
+        word8: raw as u8,
+    }
 }
 
+/// Format 7 — load/store with a register offset. Bit 11 is load, bit 10 is byte.
 fn decode_load_store_register(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::LoadStoreRegister {
+        load: raw & (1 << 11) != 0,
+        byte: raw & (1 << 10) != 0,
+        ro: low_register(raw >> 6),
+        rb: low_register(raw >> 3),
+        rd: low_register(raw),
+    }
 }
 
+/// Format 8 — sign-extended load/store with a register offset. The operation is
+/// the `S` (bit 10) and `H` (bit 11) pair.
 fn decode_load_store_sign_extended(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    let s = (raw >> 10) & 1;
+    let h = (raw >> 11) & 1;
+    let op = match (s << 1) | h {
+        0b00 => ThumbSignExtendOp::StoreHalfword,
+        0b01 => ThumbSignExtendOp::LoadHalfword,
+        0b10 => ThumbSignExtendOp::LoadSignedByte,
+        0b11 => ThumbSignExtendOp::LoadSignedHalfword,
+        _ => unreachable!(),
+    };
+    ThumbInstruction::LoadStoreSignExtended {
+        op,
+        ro: low_register(raw >> 6),
+        rb: low_register(raw >> 3),
+        rd: low_register(raw),
+    }
 }
 
+/// Format 9 — load/store with a 5-bit immediate offset. Bit 12 is byte, bit 11
+/// is load, the offset is bits 10..6.
 fn decode_load_store_immediate(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::LoadStoreImmediate {
+        load: raw & (1 << 11) != 0,
+        byte: raw & (1 << 12) != 0,
+        offset: ((raw >> 6) & 0x1F) as u8,
+        rb: low_register(raw >> 3),
+        rd: low_register(raw),
+    }
 }
 
+/// Format 10 — load/store halfword with a 5-bit immediate offset (bits 10..6).
 fn decode_load_store_halfword(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::LoadStoreHalfword {
+        load: raw & (1 << 11) != 0,
+        offset: ((raw >> 6) & 0x1F) as u8,
+        rb: low_register(raw >> 3),
+        rd: low_register(raw),
+    }
 }
 
+/// Format 11 — SP-relative load/store. Destination is bits 10..8, the word
+/// offset is bits 7..0.
 fn decode_sp_relative_load_store(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::SpRelativeLoadStore {
+        load: raw & (1 << 11) != 0,
+        rd: low_register(raw >> 8),
+        word8: raw as u8,
+    }
 }
 
+/// Format 12 — load address. Bit 11 selects the SP or PC base.
 fn decode_load_address(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    let source = if raw & (1 << 11) != 0 {
+        LoadAddressSource::Sp
+    } else {
+        LoadAddressSource::Pc
+    };
+    ThumbInstruction::LoadAddress {
+        source,
+        rd: low_register(raw >> 8),
+        word8: raw as u8,
+    }
 }
 
+/// Format 13 — adjust the stack pointer. Bit 7 selects subtract, the word offset
+/// is bits 6..0.
 fn decode_adjust_stack_pointer(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::AdjustStackPointer {
+        subtract: raw & (1 << 7) != 0,
+        word7: (raw & 0x7F) as u8,
+    }
 }
 
+/// Format 14 — push/pop. Bit 11 is pop, bit 8 is the `R` bit (LR on push, PC on
+/// pop), and the low-register list is bits 7..0.
 fn decode_push_pop(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::PushPop {
+        pop: raw & (1 << 11) != 0,
+        include_pc_lr: raw & (1 << 8) != 0,
+        register_list: raw as u8,
+    }
 }
 
+/// Format 15 — block transfer. Bit 11 is load, the base is bits 10..8, and the
+/// low-register list is bits 7..0.
 fn decode_block_transfer(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::BlockTransfer {
+        load: raw & (1 << 11) != 0,
+        rb: low_register(raw >> 8),
+        register_list: raw as u8,
+    }
 }
 
 fn decode_conditional_branch(raw: u16) -> ThumbInstruction {
@@ -430,6 +506,236 @@ mod tests {
                 op: ThumbHiRegOp::Bx,
                 rs: Register::LR,
                 rd: Register::new(0),
+            }
+        );
+    }
+
+    #[test]
+    fn pc_relative_load_decodes() {
+        // LDR r3, [PC, #0x40]  (word8 = 0x10)
+        assert_eq!(
+            decode_thumb(0x4B10),
+            ThumbInstruction::PcRelativeLoad {
+                rd: Register::new(3),
+                word8: 0x10,
+            }
+        );
+    }
+
+    #[test]
+    fn load_store_register_decodes() {
+        // LDR r0, [r1, r2]
+        assert_eq!(
+            decode_thumb(0x5888),
+            ThumbInstruction::LoadStoreRegister {
+                load: true,
+                byte: false,
+                ro: Register::new(2),
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+        // STRB r5, [r6, r7]
+        assert_eq!(
+            decode_thumb(0x55F5),
+            ThumbInstruction::LoadStoreRegister {
+                load: false,
+                byte: true,
+                ro: Register::new(7),
+                rb: Register::new(6),
+                rd: Register::new(5),
+            }
+        );
+    }
+
+    #[test]
+    fn load_store_sign_extended_decodes() {
+        // STRH r0, [r1, r2]  (S=0 H=0)
+        assert_eq!(
+            decode_thumb(0x5288),
+            ThumbInstruction::LoadStoreSignExtended {
+                op: ThumbSignExtendOp::StoreHalfword,
+                ro: Register::new(2),
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+        // LDRSB r0, [r1, r2]  (S=1 H=0)
+        assert_eq!(
+            decode_thumb(0x5688),
+            ThumbInstruction::LoadStoreSignExtended {
+                op: ThumbSignExtendOp::LoadSignedByte,
+                ro: Register::new(2),
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+        // LDRSH r0, [r1, r2]  (S=1 H=1)
+        assert_eq!(
+            decode_thumb(0x5E88),
+            ThumbInstruction::LoadStoreSignExtended {
+                op: ThumbSignExtendOp::LoadSignedHalfword,
+                ro: Register::new(2),
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+    }
+
+    #[test]
+    fn load_store_immediate_decodes() {
+        // LDR r0, [r1, #0x14]  (offset = 5)
+        assert_eq!(
+            decode_thumb(0x6948),
+            ThumbInstruction::LoadStoreImmediate {
+                load: true,
+                byte: false,
+                offset: 5,
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+        // STRB r2, [r3, #7]
+        assert_eq!(
+            decode_thumb(0x71DA),
+            ThumbInstruction::LoadStoreImmediate {
+                load: false,
+                byte: true,
+                offset: 7,
+                rb: Register::new(3),
+                rd: Register::new(2),
+            }
+        );
+    }
+
+    #[test]
+    fn load_store_halfword_decodes() {
+        // LDRH r0, [r1, #4]  (offset = 2)
+        assert_eq!(
+            decode_thumb(0x8888),
+            ThumbInstruction::LoadStoreHalfword {
+                load: true,
+                offset: 2,
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+        // STRH r0, [r1, #0x3E]  (offset = 31)
+        assert_eq!(
+            decode_thumb(0x87C8),
+            ThumbInstruction::LoadStoreHalfword {
+                load: false,
+                offset: 31,
+                rb: Register::new(1),
+                rd: Register::new(0),
+            }
+        );
+    }
+
+    #[test]
+    fn sp_relative_load_store_decodes() {
+        // LDR r2, [SP, #0x20]  (word8 = 8)
+        assert_eq!(
+            decode_thumb(0x9A08),
+            ThumbInstruction::SpRelativeLoadStore {
+                load: true,
+                rd: Register::new(2),
+                word8: 8,
+            }
+        );
+        // STR r0, [SP, #0]
+        assert_eq!(
+            decode_thumb(0x9000),
+            ThumbInstruction::SpRelativeLoadStore {
+                load: false,
+                rd: Register::new(0),
+                word8: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn load_address_decodes() {
+        // ADD r4, PC, #0x100  (word8 = 0x40)
+        assert_eq!(
+            decode_thumb(0xA440),
+            ThumbInstruction::LoadAddress {
+                source: LoadAddressSource::Pc,
+                rd: Register::new(4),
+                word8: 0x40,
+            }
+        );
+        // ADD r0, SP, #0x28  (word8 = 0x0A)
+        assert_eq!(
+            decode_thumb(0xA80A),
+            ThumbInstruction::LoadAddress {
+                source: LoadAddressSource::Sp,
+                rd: Register::new(0),
+                word8: 0x0A,
+            }
+        );
+    }
+
+    #[test]
+    fn adjust_stack_pointer_decodes() {
+        // ADD SP, #0x40  (word7 = 0x10)
+        assert_eq!(
+            decode_thumb(0xB010),
+            ThumbInstruction::AdjustStackPointer {
+                subtract: false,
+                word7: 0x10,
+            }
+        );
+        // SUB SP, #0x10  (word7 = 4)
+        assert_eq!(
+            decode_thumb(0xB084),
+            ThumbInstruction::AdjustStackPointer {
+                subtract: true,
+                word7: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn push_pop_decodes() {
+        // PUSH {r0-r3, lr}
+        assert_eq!(
+            decode_thumb(0xB50F),
+            ThumbInstruction::PushPop {
+                pop: false,
+                include_pc_lr: true,
+                register_list: 0x0F,
+            }
+        );
+        // POP {r0-r7, pc}
+        assert_eq!(
+            decode_thumb(0xBDFF),
+            ThumbInstruction::PushPop {
+                pop: true,
+                include_pc_lr: true,
+                register_list: 0xFF,
+            }
+        );
+    }
+
+    #[test]
+    fn block_transfer_decodes() {
+        // STMIA r1!, {r0-r3}
+        assert_eq!(
+            decode_thumb(0xC10F),
+            ThumbInstruction::BlockTransfer {
+                load: false,
+                rb: Register::new(1),
+                register_list: 0x0F,
+            }
+        );
+        // LDMIA r7!, {r0, r7}
+        assert_eq!(
+            decode_thumb(0xCF81),
+            ThumbInstruction::BlockTransfer {
+                load: true,
+                rb: Register::new(7),
+                register_list: 0x81,
             }
         );
     }
