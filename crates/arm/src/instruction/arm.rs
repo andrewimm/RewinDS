@@ -46,6 +46,57 @@ pub enum ArmOperation {
     },
 }
 
+impl ArmOperation {
+    /// Whether this is a dedicated control-transfer instruction — one whose
+    /// purpose is to redirect execution regardless of its operands (`B`/`BL`,
+    /// `BX`, `SWI`).
+    ///
+    /// Instructions that merely *can* write the PC as a side effect (`LDR pc`,
+    /// `MOV pc`, `LDM {…, pc}`) are not control-transfer instructions and are
+    /// reported by [`ArmOperation::may_modify_pc`] instead. Undefined encodings
+    /// trap, but are a decode catch-all rather than a control-flow instruction,
+    /// so they are excluded here.
+    pub fn is_control_flow(&self) -> bool {
+        matches!(
+            self,
+            ArmOperation::Branch(_)
+                | ArmOperation::BranchExchange(_)
+                | ArmOperation::SoftwareInterrupt(_)
+        )
+    }
+
+    /// Whether executing this operation, per its defined semantics, can write a
+    /// new value to r15 (the PC) and so redirect execution.
+    ///
+    /// This is the superset [`ArmOperation::is_control_flow`] belongs to: it
+    /// adds every result-writing instruction whose destination is r15. It is the
+    /// question a code generator asks to decide whether an instruction can end a
+    /// straight-line run of code.
+    pub fn may_modify_pc(&self) -> bool {
+        match self {
+            ArmOperation::Branch(_)
+            | ArmOperation::BranchExchange(_)
+            | ArmOperation::SoftwareInterrupt(_) => true,
+
+            // Result-writing operations redirect execution only when their
+            // destination is r15.
+            ArmOperation::DataProcessing(op) => op.rd.is_pc() && !op.opcode.is_comparison(),
+            ArmOperation::Mrs(op) => op.rd.is_pc(),
+            ArmOperation::SingleTransfer(op) => op.load && op.rd.is_pc(),
+            ArmOperation::HalfwordTransfer(op) => op.load && op.rd.is_pc(),
+            ArmOperation::Swap(op) => op.rd.is_pc(),
+            ArmOperation::BlockTransfer(op) => op.load && op.register_list & (1 << 15) != 0,
+
+            // Multiplies to r15 are unpredictable (not a defined PC write), MSR
+            // targets a status register, and Undefined writes nothing itself.
+            ArmOperation::Multiply(_)
+            | ArmOperation::MultiplyLong(_)
+            | ArmOperation::Msr(_)
+            | ArmOperation::Undefined { .. } => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data processing
 // ---------------------------------------------------------------------------
@@ -83,6 +134,20 @@ pub enum DataProcessingOpcode {
     Mov, // 1101
     Bic, // 1110
     Mvn, // 1111
+}
+
+impl DataProcessingOpcode {
+    /// The four opcodes (`TST`/`TEQ`/`CMP`/`CMN`) that only update the flags and
+    /// never write a destination register.
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            DataProcessingOpcode::Tst
+                | DataProcessingOpcode::Teq
+                | DataProcessingOpcode::Cmp
+                | DataProcessingOpcode::Cmn
+        )
+    }
 }
 
 /// The "flexible second operand" shared by data-processing instructions.
@@ -315,4 +380,130 @@ pub struct Msr {
 pub enum MsrSource {
     Register(Register),
     Immediate { value: u8, rotate: u8 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_flow_instructions_are_both() {
+        for op in [
+            ArmOperation::Branch(Branch {
+                link: true,
+                offset: 0,
+            }),
+            ArmOperation::BranchExchange(BranchExchange { rn: Register::LR }),
+            ArmOperation::SoftwareInterrupt(SoftwareInterrupt { comment: 0 }),
+        ] {
+            assert!(op.is_control_flow());
+            assert!(op.may_modify_pc());
+        }
+    }
+
+    #[test]
+    fn pc_writes_modify_pc_but_are_not_control_flow() {
+        // MOV pc, lr
+        let mov_pc = ArmOperation::DataProcessing(DataProcessing {
+            opcode: DataProcessingOpcode::Mov,
+            set_flags: false,
+            rd: Register::PC,
+            rn: Register::new(0),
+            operand2: Operand2::Register {
+                rm: Register::LR,
+                shift: Shift {
+                    kind: ShiftKind::Lsl,
+                    source: ShiftSource::Immediate(0),
+                },
+            },
+        });
+        assert!(mov_pc.may_modify_pc());
+        assert!(!mov_pc.is_control_flow());
+
+        // LDR pc, [r0]
+        let ldr_pc = ArmOperation::SingleTransfer(SingleTransfer {
+            load: true,
+            byte: false,
+            pre_indexed: true,
+            add: true,
+            writeback: false,
+            rn: Register::new(0),
+            rd: Register::PC,
+            offset: SingleOffset::Immediate(0),
+        });
+        assert!(ldr_pc.may_modify_pc());
+        assert!(!ldr_pc.is_control_flow());
+
+        // LDM sp!, {pc}
+        let ldm_pc = ArmOperation::BlockTransfer(BlockTransfer {
+            load: true,
+            pre_indexed: false,
+            add: true,
+            writeback: true,
+            psr_force_user: false,
+            rn: Register::SP,
+            register_list: 1 << 15,
+        });
+        assert!(ldm_pc.may_modify_pc());
+        assert!(!ldm_pc.is_control_flow());
+    }
+
+    #[test]
+    fn non_pc_writes_do_not_modify_pc() {
+        // ADD r0, r0, #1
+        let add = ArmOperation::DataProcessing(DataProcessing {
+            opcode: DataProcessingOpcode::Add,
+            set_flags: false,
+            rd: Register::new(0),
+            rn: Register::new(0),
+            operand2: Operand2::Immediate {
+                value: 1,
+                rotate: 0,
+            },
+        });
+        assert!(!add.may_modify_pc());
+
+        // A comparison never writes a register, even if the rd field reads r15.
+        let cmp = ArmOperation::DataProcessing(DataProcessing {
+            opcode: DataProcessingOpcode::Cmp,
+            set_flags: true,
+            rd: Register::PC,
+            rn: Register::new(0),
+            operand2: Operand2::Immediate {
+                value: 0,
+                rotate: 0,
+            },
+        });
+        assert!(!cmp.may_modify_pc());
+
+        // A store to r15 writes memory, not the PC.
+        let str_pc = ArmOperation::SingleTransfer(SingleTransfer {
+            load: false,
+            byte: false,
+            pre_indexed: true,
+            add: true,
+            writeback: false,
+            rn: Register::new(0),
+            rd: Register::PC,
+            offset: SingleOffset::Immediate(0),
+        });
+        assert!(!str_pc.may_modify_pc());
+
+        // A load that does not include r15 in its list.
+        let ldm = ArmOperation::BlockTransfer(BlockTransfer {
+            load: true,
+            pre_indexed: false,
+            add: true,
+            writeback: true,
+            psr_force_user: false,
+            rn: Register::SP,
+            register_list: 0x00FF,
+        });
+        assert!(!ldm.may_modify_pc());
+
+        // Undefined writes nothing itself.
+        let undef = ArmOperation::Undefined { raw: 0 };
+        assert!(!undef.may_modify_pc());
+        assert!(!undef.is_control_flow());
+    }
 }

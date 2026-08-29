@@ -17,8 +17,9 @@
 use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
-    ArmInstruction, ArmOperation, DataProcessing, DataProcessingOpcode, HalfwordKind,
-    HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, SingleOffset, SingleTransfer, Swap,
+    ArmInstruction, ArmOperation, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
+    HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, SingleOffset,
+    SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -277,12 +278,25 @@ fn decode_swap(raw: u32) -> ArmOperation {
     })
 }
 
+/// `B` / `BL` — PC-relative branch.
+///
+/// The 24-bit field is a signed word count. We sign-extend it and multiply by 4
+/// to a byte offset (that `<< 2` is inherent to the encoding); the `PC + 8`
+/// pipeline adjustment is left to the interpreter. Shifting the word left by 8
+/// drops the condition/class/link bits and lands the sign bit in bit 31, so a
+/// single arithmetic right shift by 6 does the extend-and-scale.
 fn decode_branch(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::Branch(Branch {
+        link: raw & (1 << 24) != 0,
+        offset: ((raw << 8) as i32) >> 6,
+    })
 }
 
+/// `BX` — branch and exchange. The target register is bits 3..0.
 fn decode_branch_exchange(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::BranchExchange(BranchExchange {
+        rn: Register::new(raw as u8),
+    })
 }
 
 fn decode_swi_or_coprocessor(raw: u32) -> ArmOperation {
@@ -295,8 +309,12 @@ fn decode_swi_or_coprocessor(raw: u32) -> ArmOperation {
     }
 }
 
+/// `SWI` — software interrupt. Bits 23..0 are the comment field, ignored by the
+/// CPU but retained for the BIOS/handler.
 fn decode_software_interrupt(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::SoftwareInterrupt(SoftwareInterrupt {
+        comment: raw & 0x00FF_FFFF,
+    })
 }
 
 #[cfg(test)]
@@ -611,15 +629,50 @@ mod tests {
     }
 
     #[test]
-    fn coarse_classes_route_to_undefined_for_now() {
-        // The classes whose decoders are still stubs decode without panicking
-        // and preserve their raw word.
-        for raw in [
-            0xE8BD_00FFu32, // LDM (block transfer)
-            0xEA00_0000,    // B (branch)
-            0xEF12_3456,    // SWI
-        ] {
-            assert_eq!(decode_arm(raw).operation, ArmOperation::Undefined { raw });
-        }
+    fn branch_decodes_link_and_offset() {
+        // B forward: offset field 0x0A -> byte offset 40.
+        assert_eq!(
+            decode_arm(0xEA00_000A).operation,
+            ArmOperation::Branch(Branch {
+                link: false,
+                offset: 40,
+            })
+        );
+        // BL with a negative field 0xFFFFFE -> byte offset -8.
+        assert_eq!(
+            decode_arm(0xEBFF_FFFE).operation,
+            ArmOperation::Branch(Branch {
+                link: true,
+                offset: -8,
+            })
+        );
+    }
+
+    #[test]
+    fn branch_exchange_decodes_register() {
+        // BX lr
+        assert_eq!(
+            decode_arm(0xE12F_FF1E).operation,
+            ArmOperation::BranchExchange(BranchExchange {
+                rn: Register::new(14),
+            })
+        );
+    }
+
+    #[test]
+    fn swi_decodes_comment() {
+        assert_eq!(
+            decode_arm(0xEF12_3456).operation,
+            ArmOperation::SoftwareInterrupt(SoftwareInterrupt { comment: 0x12_3456 })
+        );
+    }
+
+    #[test]
+    fn block_transfer_still_stubbed() {
+        // The one remaining unimplemented class preserves its raw word.
+        assert_eq!(
+            decode_arm(0xE8BD_00FF).operation,
+            ArmOperation::Undefined { raw: 0xE8BD_00FF }
+        );
     }
 }
