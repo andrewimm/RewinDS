@@ -1,0 +1,7 @@
+[package]
+name = "arm"
+version = "0.1.0"
+edition = "2021"
+description = "Decoding and interpreting ARM and Thumb instructions"
+
+[dependencies]
