@@ -15,7 +15,10 @@
 //! broader pattern that would also match it.
 
 use crate::condition::Condition;
-use crate::instruction::arm::{ArmInstruction, ArmOperation, Swap};
+use crate::decode::operand::decode_operand2;
+use crate::instruction::arm::{
+    ArmInstruction, ArmOperation, DataProcessing, DataProcessingOpcode, Mrs, Msr, MsrSource, Swap,
+};
 use crate::register::Register;
 
 /// Decode a 32-bit ARM instruction word.
@@ -99,9 +102,85 @@ fn matches_halfword_transfer(raw: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 fn decode_data_processing(raw: u32) -> ArmOperation {
-    // Also the home of MRS/MSR, which occupy the comparison opcodes with the
-    // S bit clear and are split out here once implemented.
-    ArmOperation::Undefined { raw }
+    let opcode = decode_dp_opcode(raw >> 21);
+    let set_flags = raw & (1 << 20) != 0;
+    let immediate = raw & (1 << 25) != 0;
+
+    // `TST`/`TEQ`/`CMP`/`CMN` exist only to set flags, so they are always
+    // encoded with S set. The S-clear encoding of those four opcodes is reused
+    // for status-register access (MRS/MSR), which we split out here.
+    if !set_flags && is_status_opcode(opcode) {
+        return decode_psr_transfer(raw, immediate);
+    }
+
+    ArmOperation::DataProcessing(DataProcessing {
+        opcode,
+        set_flags,
+        rd: Register::new((raw >> 12) as u8),
+        rn: Register::new((raw >> 16) as u8),
+        operand2: decode_operand2(raw, immediate),
+    })
+}
+
+/// Decode the 4-bit data-processing opcode (bits 24..21).
+fn decode_dp_opcode(bits: u32) -> DataProcessingOpcode {
+    use DataProcessingOpcode::*;
+    match bits & 0xF {
+        0x0 => And,
+        0x1 => Eor,
+        0x2 => Sub,
+        0x3 => Rsb,
+        0x4 => Add,
+        0x5 => Adc,
+        0x6 => Sbc,
+        0x7 => Rsc,
+        0x8 => Tst,
+        0x9 => Teq,
+        0xA => Cmp,
+        0xB => Cmn,
+        0xC => Orr,
+        0xD => Mov,
+        0xE => Bic,
+        0xF => Mvn,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether an opcode is one of the four comparison ops (`TST`/`TEQ`/`CMP`/`CMN`)
+/// whose S-clear encoding is repurposed for MRS/MSR.
+fn is_status_opcode(opcode: DataProcessingOpcode) -> bool {
+    use DataProcessingOpcode::*;
+    matches!(opcode, Tst | Teq | Cmp | Cmn)
+}
+
+/// Decode the MRS/MSR encodings that share the S-clear comparison opcode space.
+/// Bit 21 selects between them: clear is `MRS` (read PSR), set is `MSR` (write
+/// PSR). Bit 22 selects CPSR vs SPSR.
+fn decode_psr_transfer(raw: u32, immediate: bool) -> ArmOperation {
+    let spsr = raw & (1 << 22) != 0;
+    if raw & (1 << 21) == 0 {
+        ArmOperation::Mrs(Mrs {
+            source_spsr: spsr,
+            rd: Register::new((raw >> 12) as u8),
+        })
+    } else {
+        let source = if immediate {
+            MsrSource::Immediate {
+                value: raw as u8,
+                rotate: (raw >> 8) as u8 & 0xF,
+            }
+        } else {
+            MsrSource::Register(Register::new(raw as u8))
+        };
+        ArmOperation::Msr(Msr {
+            dest_spsr: spsr,
+            write_flags: raw & (1 << 19) != 0,
+            write_status: raw & (1 << 18) != 0,
+            write_extension: raw & (1 << 17) != 0,
+            write_control: raw & (1 << 16) != 0,
+            source,
+        })
+    }
 }
 
 fn decode_single_transfer(raw: u32) -> ArmOperation {
@@ -159,6 +238,7 @@ fn decode_software_interrupt(raw: u32) -> ArmOperation {
 mod tests {
     use super::*;
     use crate::condition::Condition;
+    use crate::instruction::arm::{Operand2, Shift, ShiftKind, ShiftSource};
 
     #[test]
     fn extracts_condition() {
@@ -228,12 +308,148 @@ mod tests {
     }
 
     #[test]
+    fn dp_immediate_operand() {
+        // MOV r0, #0x1F
+        let op = decode_arm(0xE3A0_001F).operation;
+        assert_eq!(
+            op,
+            ArmOperation::DataProcessing(DataProcessing {
+                opcode: DataProcessingOpcode::Mov,
+                set_flags: false,
+                rd: Register::new(0),
+                rn: Register::new(0),
+                operand2: Operand2::Immediate {
+                    value: 0x1F,
+                    rotate: 0,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn dp_register_with_immediate_shift() {
+        // ADD r0, r1, r2, LSL #3
+        let op = decode_arm(0xE081_0182).operation;
+        assert_eq!(
+            op,
+            ArmOperation::DataProcessing(DataProcessing {
+                opcode: DataProcessingOpcode::Add,
+                set_flags: false,
+                rd: Register::new(0),
+                rn: Register::new(1),
+                operand2: Operand2::Register {
+                    rm: Register::new(2),
+                    shift: Shift {
+                        kind: ShiftKind::Lsl,
+                        source: ShiftSource::Immediate(3),
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn dp_register_with_register_shift() {
+        // MOV r0, r1, LSL r2
+        let op = decode_arm(0xE1A0_0211).operation;
+        assert_eq!(
+            op,
+            ArmOperation::DataProcessing(DataProcessing {
+                opcode: DataProcessingOpcode::Mov,
+                set_flags: false,
+                rd: Register::new(0),
+                rn: Register::new(0),
+                operand2: Operand2::Register {
+                    rm: Register::new(1),
+                    shift: Shift {
+                        kind: ShiftKind::Lsl,
+                        source: ShiftSource::Register(Register::new(2)),
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn dp_comparison_keeps_set_flags_and_is_not_psr() {
+        // CMP r0, #1 — a real comparison (S set), not an MRS/MSR.
+        let op = decode_arm(0xE350_0001).operation;
+        assert_eq!(
+            op,
+            ArmOperation::DataProcessing(DataProcessing {
+                opcode: DataProcessingOpcode::Cmp,
+                set_flags: true,
+                rd: Register::new(0),
+                rn: Register::new(0),
+                operand2: Operand2::Immediate {
+                    value: 1,
+                    rotate: 0,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn mrs_reads_cpsr_and_spsr() {
+        // MRS r0, CPSR
+        assert_eq!(
+            decode_arm(0xE10F_0000).operation,
+            ArmOperation::Mrs(Mrs {
+                source_spsr: false,
+                rd: Register::new(0),
+            })
+        );
+        // MRS r0, SPSR
+        assert_eq!(
+            decode_arm(0xE14F_0000).operation,
+            ArmOperation::Mrs(Mrs {
+                source_spsr: true,
+                rd: Register::new(0),
+            })
+        );
+    }
+
+    #[test]
+    fn msr_register_all_fields() {
+        // MSR CPSR_fsxc, r0 — every field-mask bit set.
+        assert_eq!(
+            decode_arm(0xE12F_F000).operation,
+            ArmOperation::Msr(Msr {
+                dest_spsr: false,
+                write_flags: true,
+                write_status: true,
+                write_extension: true,
+                write_control: true,
+                source: MsrSource::Register(Register::new(0)),
+            })
+        );
+    }
+
+    #[test]
+    fn msr_immediate_flags_only() {
+        // MSR CPSR_f, #0xFF ROR 8  (field mask = flags byte only)
+        assert_eq!(
+            decode_arm(0xE328_F4FF).operation,
+            ArmOperation::Msr(Msr {
+                dest_spsr: false,
+                write_flags: true,
+                write_status: false,
+                write_extension: false,
+                write_control: false,
+                source: MsrSource::Immediate {
+                    value: 0xFF,
+                    rotate: 4,
+                },
+            })
+        );
+    }
+
+    #[test]
     fn coarse_classes_route_to_undefined_for_now() {
-        // Until the per-class decoders are implemented, every well-formed
-        // instruction still decodes without panicking and preserves its word.
+        // The classes whose decoders are still stubs decode without panicking
+        // and preserve their raw word.
         for raw in [
-            0xE281_1001u32, // ADD (data processing, imm)
-            0xE590_1000,    // LDR (single transfer)
+            0xE590_1000u32, // LDR (single transfer)
             0xE8BD_00FF,    // LDM (block transfer)
             0xEA00_0000,    // B (branch)
             0xEF12_3456,    // SWI
