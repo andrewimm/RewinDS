@@ -13,6 +13,7 @@
 //! The dispatch is complete; the per-format bodies that build each variant's
 //! fields are not yet implemented and currently preserve the raw halfword.
 
+use crate::condition::Condition;
 use crate::instruction::thumb::{
     AddSubOperand, LoadAddressSource, ThumbAluOp, ThumbHiRegOp, ThumbImmediateOp, ThumbInstruction,
     ThumbShiftOp, ThumbSignExtendOp,
@@ -332,20 +333,40 @@ fn decode_block_transfer(raw: u16) -> ThumbInstruction {
     }
 }
 
+/// Format 16 — conditional branch. The condition is bits 11..8 (the `SWI` and
+/// reserved conditions are filtered out by the dispatch). The 8-bit signed
+/// displacement is sign-extended and scaled to a byte offset.
 fn decode_conditional_branch(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::ConditionalBranch {
+        condition: Condition::decode(((raw >> 8) & 0xF) as u32),
+        offset: (raw as i8 as i32) << 1,
+    }
 }
 
+/// Format 17 — software interrupt. The comment is bits 7..0.
 fn decode_software_interrupt(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::SoftwareInterrupt {
+        comment: raw as u8,
+    }
 }
 
+/// Format 18 — unconditional branch. The 11-bit signed displacement is
+/// sign-extended and scaled to a byte offset. Shifting the halfword left by 5
+/// lands the sign bit in bit 15, so an arithmetic right shift by 4 does the
+/// extend-and-scale.
 fn decode_unconditional_branch(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::Branch {
+        offset: (((raw << 5) as i16) as i32) >> 4,
+    }
 }
 
+/// Format 19 — long branch with link. Bit 11 selects the half; the raw 11-bit
+/// field is kept for the interpreter to combine across the two halves.
 fn decode_long_branch_link(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::Undefined { raw }
+    ThumbInstruction::LongBranchLink {
+        second_half: raw & (1 << 11) != 0,
+        offset: raw & 0x7FF,
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +757,68 @@ mod tests {
                 load: true,
                 rb: Register::new(7),
                 register_list: 0x81,
+            }
+        );
+    }
+
+    #[test]
+    fn conditional_branch_decodes() {
+        // BEQ +32  (offset8 = 0x10)
+        assert_eq!(
+            decode_thumb(0xD010),
+            ThumbInstruction::ConditionalBranch {
+                condition: Condition::Eq,
+                offset: 32,
+            }
+        );
+        // BNE -10  (offset8 = 0xFB, sign-extended)
+        assert_eq!(
+            decode_thumb(0xD1FB),
+            ThumbInstruction::ConditionalBranch {
+                condition: Condition::Ne,
+                offset: -10,
+            }
+        );
+    }
+
+    #[test]
+    fn software_interrupt_decodes() {
+        assert_eq!(
+            decode_thumb(0xDFAB),
+            ThumbInstruction::SoftwareInterrupt { comment: 0xAB }
+        );
+    }
+
+    #[test]
+    fn unconditional_branch_decodes() {
+        // B +512  (offset11 = 0x100)
+        assert_eq!(
+            decode_thumb(0xE100),
+            ThumbInstruction::Branch { offset: 512 }
+        );
+        // B -2  (offset11 = 0x7FF, sign-extended)
+        assert_eq!(
+            decode_thumb(0xE7FF),
+            ThumbInstruction::Branch { offset: -2 }
+        );
+    }
+
+    #[test]
+    fn long_branch_link_decodes() {
+        // BL high half (H=0)
+        assert_eq!(
+            decode_thumb(0xF123),
+            ThumbInstruction::LongBranchLink {
+                second_half: false,
+                offset: 0x123,
+            }
+        );
+        // BL low half (H=1)
+        assert_eq!(
+            decode_thumb(0xFC56),
+            ThumbInstruction::LongBranchLink {
+                second_half: true,
+                offset: 0x456,
             }
         );
     }
