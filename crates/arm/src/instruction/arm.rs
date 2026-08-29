@@ -28,6 +28,7 @@ pub enum ArmOperation {
     SingleTransfer(SingleTransfer),
     HalfwordTransfer(HalfwordTransfer),
     BlockTransfer(BlockTransfer),
+    Swap(Swap),
 
     Branch(Branch),
     BranchExchange(BranchExchange),
@@ -237,6 +238,19 @@ pub struct BlockTransfer {
     pub rn: Register,
     /// One bit per register r0..r15.
     pub register_list: u16,
+}
+
+/// `SWP` / `SWPB` — atomic swap of a register with a memory word/byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Swap {
+    /// Byte (`SWPB`) vs word swap.
+    pub byte: bool,
+    /// Base register holding the address.
+    pub rn: Register,
+    /// Destination register (receives the old memory contents).
+    pub rd: Register,
+    /// Source register (written to memory).
+    pub rm: Register,
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,8 @@
 //! broader pattern that would also match it.
 
 use crate::condition::Condition;
-use crate::instruction::arm::{ArmInstruction, ArmOperation};
+use crate::instruction::arm::{ArmInstruction, ArmOperation, Swap};
+use crate::register::Register;
 
 /// Decode a 32-bit ARM instruction word.
 pub fn decode_arm(raw: u32) -> ArmInstruction {
@@ -124,10 +125,12 @@ fn decode_multiply_long(raw: u32) -> ArmOperation {
 }
 
 fn decode_swap(raw: u32) -> ArmOperation {
-    // NOTE: `ArmOperation` currently has no `Swap` variant, so this cannot be
-    // represented yet and preserves the raw word. Classifying it here still
-    // keeps it out of the data-processing decoder, which would misinterpret it.
-    ArmOperation::Undefined { raw }
+    ArmOperation::Swap(Swap {
+        byte: raw & (1 << 22) != 0,
+        rn: Register::new((raw >> 16) as u8),
+        rd: Register::new((raw >> 12) as u8),
+        rm: Register::new(raw as u8),
+    })
 }
 
 fn decode_branch(raw: u32) -> ArmOperation {
@@ -202,6 +205,26 @@ mod tests {
         assert!(matches_halfword_transfer(0xE1D1_00F0)); // LDRSH r0, [r1]
         // SWP has SH == 00 and must not be treated as a halfword transfer.
         assert!(!matches_halfword_transfer(0xE104_3092));
+    }
+
+    #[test]
+    fn swap_decodes() {
+        // SWP r3, r2, [r4]
+        let op = decode_arm(0xE104_3092).operation;
+        assert_eq!(
+            op,
+            ArmOperation::Swap(Swap {
+                byte: false,
+                rn: Register::new(4),
+                rd: Register::new(3),
+                rm: Register::new(2),
+            })
+        );
+        // SWPB sets the byte flag.
+        let ArmOperation::Swap(swapb) = decode_arm(0xE144_3092).operation else {
+            panic!("expected swap");
+        };
+        assert!(swapb.byte);
     }
 
     #[test]
