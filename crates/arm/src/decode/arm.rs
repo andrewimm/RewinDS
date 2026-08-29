@@ -17,9 +17,9 @@
 use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
-    ArmInstruction, ArmOperation, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
-    HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, SingleOffset,
-    SingleTransfer, SoftwareInterrupt, Swap,
+    ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
+    DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
+    Multiply, MultiplyLong, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -257,16 +257,45 @@ fn decode_halfword_kind(bits: u32) -> HalfwordKind {
     }
 }
 
+/// `LDM` / `STM` — block (multiple register) transfer. The 16-bit register list
+/// occupies bits 15..0, one bit per register.
 fn decode_block_transfer(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::BlockTransfer(BlockTransfer {
+        load: raw & (1 << 20) != 0,
+        pre_indexed: raw & (1 << 24) != 0,
+        add: raw & (1 << 23) != 0,
+        writeback: raw & (1 << 21) != 0,
+        psr_force_user: raw & (1 << 22) != 0,
+        rn: Register::new((raw >> 16) as u8),
+        register_list: raw as u16,
+    })
 }
 
+/// `MUL` / `MLA` — 32-bit multiply. Note the operand layout differs from the
+/// data-processing classes: `Rn` (the accumulator) is in bits 15..12, not 19..16.
 fn decode_multiply(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::Multiply(Multiply {
+        accumulate: raw & (1 << 21) != 0,
+        set_flags: raw & (1 << 20) != 0,
+        rd: Register::new((raw >> 16) as u8),
+        rn: Register::new((raw >> 12) as u8),
+        rs: Register::new((raw >> 8) as u8),
+        rm: Register::new(raw as u8),
+    })
 }
 
+/// `UMULL` / `UMLAL` / `SMULL` / `SMLAL` — 64-bit multiply. Bit 22 selects
+/// signed vs unsigned; the 64-bit result/accumulator spans `RdHi`:`RdLo`.
 fn decode_multiply_long(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    ArmOperation::MultiplyLong(MultiplyLong {
+        signed: raw & (1 << 22) != 0,
+        accumulate: raw & (1 << 21) != 0,
+        set_flags: raw & (1 << 20) != 0,
+        rd_hi: Register::new((raw >> 16) as u8),
+        rd_lo: Register::new((raw >> 12) as u8),
+        rs: Register::new((raw >> 8) as u8),
+        rm: Register::new(raw as u8),
+    })
 }
 
 fn decode_swap(raw: u32) -> ArmOperation {
@@ -668,11 +697,114 @@ mod tests {
     }
 
     #[test]
-    fn block_transfer_still_stubbed() {
-        // The one remaining unimplemented class preserves its raw word.
+    fn multiply_decodes() {
+        // MUL r1, r3, r2
         assert_eq!(
-            decode_arm(0xE8BD_00FF).operation,
-            ArmOperation::Undefined { raw: 0xE8BD_00FF }
+            decode_arm(0xE001_0293).operation,
+            ArmOperation::Multiply(Multiply {
+                accumulate: false,
+                set_flags: false,
+                rd: Register::new(1),
+                rn: Register::new(0),
+                rs: Register::new(2),
+                rm: Register::new(3),
+            })
         );
+        // MLA r1, r1, r2, r3 — accumulator Rn is r3 (bits 15..12).
+        assert_eq!(
+            decode_arm(0xE021_3291).operation,
+            ArmOperation::Multiply(Multiply {
+                accumulate: true,
+                set_flags: false,
+                rd: Register::new(1),
+                rn: Register::new(3),
+                rs: Register::new(2),
+                rm: Register::new(1),
+            })
+        );
+        // MULS r0, r1, r2 — S bit set.
+        let ArmOperation::Multiply(muls) = decode_arm(0xE010_0291).operation else {
+            panic!("expected multiply");
+        };
+        assert!(muls.set_flags);
+        assert!(!muls.accumulate);
+    }
+
+    #[test]
+    fn multiply_long_decodes() {
+        // UMULL r2, r1, r4, r3  (RdLo=r2, RdHi=r1)
+        assert_eq!(
+            decode_arm(0xE081_2394).operation,
+            ArmOperation::MultiplyLong(MultiplyLong {
+                signed: false,
+                accumulate: false,
+                set_flags: false,
+                rd_hi: Register::new(1),
+                rd_lo: Register::new(2),
+                rs: Register::new(3),
+                rm: Register::new(4),
+            })
+        );
+        // SMLALS r2, r1, r4, r3 — signed, accumulate, and set-flags all set.
+        assert_eq!(
+            decode_arm(0xE0F1_2394).operation,
+            ArmOperation::MultiplyLong(MultiplyLong {
+                signed: true,
+                accumulate: true,
+                set_flags: true,
+                rd_hi: Register::new(1),
+                rd_lo: Register::new(2),
+                rs: Register::new(3),
+                rm: Register::new(4),
+            })
+        );
+    }
+
+    #[test]
+    fn block_transfer_decodes() {
+        // LDMFD sp!, {pc}  (post-increment, writeback, load)
+        assert_eq!(
+            decode_arm(0xE8BD_8000).operation,
+            ArmOperation::BlockTransfer(BlockTransfer {
+                load: true,
+                pre_indexed: false,
+                add: true,
+                writeback: true,
+                psr_force_user: false,
+                rn: Register::SP,
+                register_list: 0x8000,
+            })
+        );
+        // STMFD sp!, {r0-r3, lr}  (pre-decrement, writeback, store)
+        assert_eq!(
+            decode_arm(0xE92D_400F).operation,
+            ArmOperation::BlockTransfer(BlockTransfer {
+                load: false,
+                pre_indexed: true,
+                add: false,
+                writeback: true,
+                psr_force_user: false,
+                rn: Register::SP,
+                register_list: 0x400F,
+            })
+        );
+    }
+
+    #[test]
+    fn block_transfer_s_bit_is_psr_force_user() {
+        // LDM r0, {r0, pc}^ — the S bit maps to psr_force_user.
+        let ArmOperation::BlockTransfer(t) = decode_arm(0xE8D0_8001).operation else {
+            panic!("expected block transfer");
+        };
+        assert!(t.psr_force_user);
+    }
+
+    #[test]
+    fn decoded_pc_loads_report_may_modify_pc() {
+        // Now that these classes decode, the classification helper sees through
+        // real encodings, not just hand-built values.
+        assert!(decode_arm(0xE8BD_8000).operation.may_modify_pc()); // LDMFD sp!, {pc}
+        assert!(decode_arm(0xE1A0_F00E).operation.may_modify_pc()); // MOV pc, lr
+        assert!(!decode_arm(0xE001_0293).operation.may_modify_pc()); // MUL — never PC
     }
 }
