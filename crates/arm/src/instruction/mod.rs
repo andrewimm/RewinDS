@@ -4,7 +4,7 @@ pub mod arm;
 pub mod thumb;
 
 pub use arm::*;
-pub use thumb::ThumbInstruction;
+pub use thumb::*;
 
 /// A decoded instruction from either instruction set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
