@@ -15,9 +15,10 @@
 //! broader pattern that would also match it.
 
 use crate::condition::Condition;
-use crate::decode::operand::decode_operand2;
+use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
-    ArmInstruction, ArmOperation, DataProcessing, DataProcessingOpcode, Mrs, Msr, MsrSource, Swap,
+    ArmInstruction, ArmOperation, DataProcessing, DataProcessingOpcode, HalfwordKind,
+    HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, SingleOffset, SingleTransfer, Swap,
 };
 use crate::register::Register;
 
@@ -183,12 +184,76 @@ fn decode_psr_transfer(raw: u32, immediate: bool) -> ArmOperation {
     }
 }
 
+/// `LDR` / `STR` — single word/byte transfer.
+///
+/// Note the `I` bit (bit 25) has the *opposite* sense to data processing here:
+/// set means a register offset, clear means an immediate offset.
 fn decode_single_transfer(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    let register_offset = raw & (1 << 25) != 0;
+
+    // The register-offset form only permits an immediate shift amount (bit 4
+    // clear). Bit 4 set is not a valid single transfer on this core, so it
+    // falls through to undefined rather than being decoded as a register shift.
+    if register_offset && raw & (1 << 4) != 0 {
+        return ArmOperation::Undefined { raw };
+    }
+
+    let offset = if register_offset {
+        SingleOffset::Register {
+            rm: Register::new(raw as u8),
+            shift: decode_shift(raw),
+        }
+    } else {
+        SingleOffset::Immediate((raw & 0xFFF) as u16)
+    };
+
+    ArmOperation::SingleTransfer(SingleTransfer {
+        load: raw & (1 << 20) != 0,
+        byte: raw & (1 << 22) != 0,
+        pre_indexed: raw & (1 << 24) != 0,
+        add: raw & (1 << 23) != 0,
+        writeback: raw & (1 << 21) != 0,
+        rn: Register::new((raw >> 16) as u8),
+        rd: Register::new((raw >> 12) as u8),
+        offset,
+    })
 }
 
+/// `LDRH` / `STRH` / `LDRSB` / `LDRSH` — halfword and signed-byte transfers.
+///
+/// The offset is a register (bit 22 clear) or an 8-bit immediate split across
+/// two nibbles (bit 22 set); the `SH` field (bits 6..5) names the access.
 fn decode_halfword_transfer(raw: u32) -> ArmOperation {
-    ArmOperation::Undefined { raw }
+    let immediate = raw & (1 << 22) != 0;
+    let offset = if immediate {
+        let hi = (raw >> 8) & 0xF;
+        let lo = raw & 0xF;
+        HalfwordOffset::Immediate(((hi << 4) | lo) as u8)
+    } else {
+        HalfwordOffset::Register(Register::new(raw as u8))
+    };
+
+    ArmOperation::HalfwordTransfer(HalfwordTransfer {
+        load: raw & (1 << 20) != 0,
+        pre_indexed: raw & (1 << 24) != 0,
+        add: raw & (1 << 23) != 0,
+        writeback: raw & (1 << 21) != 0,
+        kind: decode_halfword_kind(raw >> 5),
+        rn: Register::new((raw >> 16) as u8),
+        rd: Register::new((raw >> 12) as u8),
+        offset,
+    })
+}
+
+/// Decode the `SH` field (bits 6..5) of a halfword/signed transfer. `SH == 00`
+/// is the swap encoding and is matched before reaching here.
+fn decode_halfword_kind(bits: u32) -> HalfwordKind {
+    match bits & 0b11 {
+        0b01 => HalfwordKind::UnsignedHalfword,
+        0b10 => HalfwordKind::SignedByte,
+        0b11 => HalfwordKind::SignedHalfword,
+        _ => unreachable!(),
+    }
 }
 
 fn decode_block_transfer(raw: u32) -> ArmOperation {
@@ -238,7 +303,10 @@ fn decode_software_interrupt(raw: u32) -> ArmOperation {
 mod tests {
     use super::*;
     use crate::condition::Condition;
-    use crate::instruction::arm::{Operand2, Shift, ShiftKind, ShiftSource};
+    use crate::instruction::arm::{
+        HalfwordKind, HalfwordOffset, HalfwordTransfer, Operand2, Shift, ShiftKind, ShiftSource,
+        SingleOffset, SingleTransfer,
+    };
 
     #[test]
     fn extracts_condition() {
@@ -445,12 +513,109 @@ mod tests {
     }
 
     #[test]
+    fn single_transfer_immediate_offset() {
+        // LDR r1, [r0, #4]
+        assert_eq!(
+            decode_arm(0xE590_1004).operation,
+            ArmOperation::SingleTransfer(SingleTransfer {
+                load: true,
+                byte: false,
+                pre_indexed: true,
+                add: true,
+                writeback: false,
+                rn: Register::new(0),
+                rd: Register::new(1),
+                offset: SingleOffset::Immediate(4),
+            })
+        );
+    }
+
+    #[test]
+    fn single_transfer_register_offset_post_indexed() {
+        // STRB r2, [r3], -r4, LSL #2
+        assert_eq!(
+            decode_arm(0xE643_2104).operation,
+            ArmOperation::SingleTransfer(SingleTransfer {
+                load: false,
+                byte: true,
+                pre_indexed: false,
+                add: false,
+                writeback: false,
+                rn: Register::new(3),
+                rd: Register::new(2),
+                offset: SingleOffset::Register {
+                    rm: Register::new(4),
+                    shift: Shift {
+                        kind: ShiftKind::Lsl,
+                        source: ShiftSource::Immediate(2),
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn single_transfer_register_offset_with_bit4_is_undefined() {
+        // LDR r0, [r1, r2] with bit 4 set is not a valid single transfer.
+        assert_eq!(
+            decode_arm(0xE791_0012).operation,
+            ArmOperation::Undefined { raw: 0xE791_0012 }
+        );
+    }
+
+    #[test]
+    fn halfword_immediate_offset() {
+        // LDRH r1, [r0, #4]
+        assert_eq!(
+            decode_arm(0xE1D0_10B4).operation,
+            ArmOperation::HalfwordTransfer(HalfwordTransfer {
+                load: true,
+                pre_indexed: true,
+                add: true,
+                writeback: false,
+                kind: HalfwordKind::UnsignedHalfword,
+                rn: Register::new(0),
+                rd: Register::new(1),
+                offset: HalfwordOffset::Immediate(4),
+            })
+        );
+    }
+
+    #[test]
+    fn halfword_immediate_recombines_nibbles() {
+        // STRH r1, [r0, #0xB4] — offset high nibble 0xB, low nibble 0x4.
+        let ArmOperation::HalfwordTransfer(t) = decode_arm(0xE1C0_1BB4).operation else {
+            panic!("expected halfword transfer");
+        };
+        assert!(!t.load);
+        assert_eq!(t.kind, HalfwordKind::UnsignedHalfword);
+        assert_eq!(t.offset, HalfwordOffset::Immediate(0xB4));
+    }
+
+    #[test]
+    fn halfword_register_offset_signed_byte() {
+        // LDRSB r1, [r0, r2]
+        assert_eq!(
+            decode_arm(0xE190_10D2).operation,
+            ArmOperation::HalfwordTransfer(HalfwordTransfer {
+                load: true,
+                pre_indexed: true,
+                add: true,
+                writeback: false,
+                kind: HalfwordKind::SignedByte,
+                rn: Register::new(0),
+                rd: Register::new(1),
+                offset: HalfwordOffset::Register(Register::new(2)),
+            })
+        );
+    }
+
+    #[test]
     fn coarse_classes_route_to_undefined_for_now() {
         // The classes whose decoders are still stubs decode without panicking
         // and preserve their raw word.
         for raw in [
-            0xE590_1000u32, // LDR (single transfer)
-            0xE8BD_00FF,    // LDM (block transfer)
+            0xE8BD_00FFu32, // LDM (block transfer)
             0xEA00_0000,    // B (branch)
             0xEF12_3456,    // SWI
         ] {
