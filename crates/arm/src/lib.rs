@@ -7,10 +7,12 @@
 
 pub mod condition;
 pub mod decode;
+pub mod disasm;
 pub mod instruction;
 pub mod register;
 
 pub use condition::Condition;
 pub use decode::{decode_arm, decode_thumb};
+pub use disasm::{format_arm, format_thumb};
 pub use instruction::{ArmInstruction, ArmOperation, Instruction, ThumbInstruction};
 pub use register::Register;
