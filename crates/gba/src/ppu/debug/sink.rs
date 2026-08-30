@@ -122,9 +122,16 @@ impl ProvenanceSink for PixelRecorder {
     fn record_scanline(&mut self, f: impl FnOnce() -> ScanlineStateExplanation) {
         self.scanline = Some(f());
     }
-    fn record_candidate(&mut self, x: u16, _layer: LayerId, f: impl FnOnce() -> CandidateExplanation) {
+    fn record_candidate(&mut self, x: u16, layer: LayerId, f: impl FnOnce() -> CandidateExplanation) {
         if x == self.target_x {
-            self.candidates.push(f());
+            let candidate = f();
+            // Keep one candidate per layer: a later record (e.g. the OBJ pixel a
+            // higher-priority sprite displaced an earlier one with) replaces it.
+            if let Some(slot) = self.candidates.iter_mut().find(|c| c.candidate.layer == layer) {
+                *slot = candidate;
+            } else {
+                self.candidates.push(candidate);
+            }
         }
     }
     fn record_rejection(&mut self, x: u16, layer: LayerId, reason: RejectionReason) {

@@ -6,6 +6,7 @@
 //! priority. The heavyweight explanation types live in [`crate::ppu::debug`] and
 //! are only built when instrumentation is on.
 
+use super::debug::provenance::WindowRegion;
 use super::obj::evaluate::SpriteInstance;
 use super::registers::Registers;
 
@@ -157,12 +158,56 @@ impl ObjLine {
     }
 }
 
+/// Per-pixel visibility of each source layer and of color effects, after window
+/// resolution.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowMask {
+    /// Visibility of BG0..BG3.
+    pub bg: [bool; 4],
+    pub obj: bool,
+    pub effects: bool,
+}
+
+impl WindowMask {
+    /// Everything visible — the state when no window is active.
+    pub fn all_visible() -> Self {
+        WindowMask {
+            bg: [true; 4],
+            obj: true,
+            effects: true,
+        }
+    }
+}
+
+impl Default for WindowMask {
+    fn default() -> Self {
+        Self::all_visible()
+    }
+}
+
+/// The resolved window mask and region for every pixel of a scanline.
+#[derive(Clone, Debug)]
+pub struct WindowLine {
+    pub mask: [WindowMask; WIDTH],
+    pub region: [WindowRegion; WIDTH],
+}
+
+impl Default for WindowLine {
+    fn default() -> Self {
+        WindowLine {
+            mask: [WindowMask::all_visible(); WIDTH],
+            region: [WindowRegion::Outside; WIDTH],
+        }
+    }
+}
+
 /// Per-scanline scratch reused across lines so rendering allocates nothing on the
 /// hot path.
 #[derive(Clone, Debug, Default)]
 pub struct Scratch {
     pub bg: [LayerLine; 4],
     pub obj: ObjLine,
+    pub window: WindowLine,
     /// Sprites evaluated as visible on the current scanline (reused; the `Vec`
     /// keeps its capacity across lines).
     pub sprites: Vec<SpriteInstance>,
@@ -170,7 +215,8 @@ pub struct Scratch {
 
 impl Scratch {
     /// Reset every layer line, the OBJ line, and the sprite list for a fresh
-    /// scanline.
+    /// scanline. The window line is fully overwritten each scanline, so it needs
+    /// no clearing.
     pub fn clear(&mut self) {
         for line in &mut self.bg {
             line.clear();

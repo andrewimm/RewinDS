@@ -120,6 +120,24 @@ mod tests {
         assert_eq!(ppu.framebuffer()[0], Color15(0x03E0)); // sprite 0 wins
     }
 
+    /// A higher-priority sprite (lower priority value) wins over an overlapping
+    /// sprite with a lower OAM index but a worse priority.
+    #[test]
+    fn higher_priority_sprite_wins_over_lower_oam_index() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(OBJ_1D);
+        set_pal(&mut mem, 256 + 5, 0x03E0); // sprite 0 green
+        set_pal(&mut mem, 256 + 6, 0x001F); // sprite 1 red
+        set_oam(&mut mem, 0, 0, 0, 1 | (3 << 10)); // sprite 0, priority 3
+        set_oam(&mut mem, 1, 0, 0, 2); // sprite 1, priority 0
+        mem.vram[0x10020] = 0x05;
+        mem.vram[0x10040] = 0x06;
+
+        render0(&mut ppu, &mem);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x001F)); // sprite 1 (priority 0) wins
+    }
+
     /// OBJ priority competes with background priority.
     #[test]
     fn obj_priority_competes_with_background() {

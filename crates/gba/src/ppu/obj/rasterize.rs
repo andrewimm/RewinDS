@@ -140,9 +140,13 @@ pub fn rasterize<S: ProvenanceSink>(
                 continue;
             }
 
-            // First opaque sprite in OAM order wins the pixel.
-            if obj.pixels[sx].is_some() {
-                continue;
+            // Among overlapping sprites, the lowest priority value wins; ties go to
+            // the lower OAM index. Since sprites are processed in OAM order, an
+            // already-placed pixel is only displaced by a strictly better priority.
+            if let Some(existing) = obj.pixels[sx] {
+                if sprite.priority >= existing.priority {
+                    continue;
+                }
             }
 
             let entry = palette_entry(sprite, texel);

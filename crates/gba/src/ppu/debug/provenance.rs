@@ -168,11 +168,12 @@ pub enum SourceProvenance {
 }
 
 /// Which window region a screen position resolved to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WindowRegion {
     Win0,
     Win1,
     ObjWindow,
+    #[default]
     Outside,
 }
 
