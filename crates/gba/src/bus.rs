@@ -63,6 +63,15 @@ pub struct Bus {
     /// Guest cycles that DMA transfers have stalled the CPU for, awaiting the CPU
     /// to account for them.
     dma_stall_cycles: u64,
+    /// Optional debug hook: counts data reads by address (off by default). The
+    /// seed of the memory-watch debug primitive.
+    pub read_watch: Option<std::collections::HashMap<u32, u64>>,
+    /// Optional debug hook: counts data writes by address.
+    pub write_watch: Option<std::collections::HashMap<u32, u64>>,
+    /// Debug write breakpoint: when a data write hits this address, `write_hit` is
+    /// set so a stepping run loop can stop and report the writer.
+    pub break_write_addr: Option<u32>,
+    pub write_hit: bool,
 }
 
 impl Bus {
@@ -109,6 +118,11 @@ impl Bus {
 
     fn read(&mut self, addr: u32, width: AccessWidth, access: Access, scheduler: &mut Scheduler<EventKind>) -> BusResult<u32> {
         let addr = align(addr, width);
+        if let Some(watch) = self.read_watch.as_mut() {
+            if access.kind == AccessKind::Data {
+                *watch.entry(addr).or_insert(0) += 1;
+            }
+        }
         match addr >> 24 {
             0x00 if (addr as usize) < BIOS_SIZE => {
                 BusResult::plain(read_le(&self.memory.bios, addr as usize, width), 1)
@@ -176,6 +190,14 @@ impl Bus {
 
     fn write(&mut self, addr: u32, value: u32, width: AccessWidth, access: Access, scheduler: &mut Scheduler<EventKind>) -> BusResult<()> {
         let addr = align(addr, width);
+        if access.kind == AccessKind::Data {
+            if let Some(watch) = self.write_watch.as_mut() {
+                *watch.entry(addr).or_insert(0) += 1;
+            }
+            if self.break_write_addr == Some(addr) {
+                self.write_hit = true;
+            }
+        }
         match addr >> 24 {
             // BIOS and ROM are read-only; writes are dropped.
             0x00 => BusResult::plain((), 1),

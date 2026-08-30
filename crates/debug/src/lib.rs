@@ -27,6 +27,8 @@ use gba::{
     ScanlineExplanation, SpriteInstance, System,
 };
 
+pub mod server;
+
 // Re-exported so debug clients can name buttons without depending on `gba`.
 pub use gba::Key as Button;
 

@@ -13,6 +13,7 @@ use crate::event::EventKind;
 use crate::interrupt::{InterruptController, IrqSource};
 use crate::keypad::{Key, Keypad};
 use crate::ppu::Ppu;
+use crate::serial::Serial;
 use crate::timer::{TimerId, Timers};
 use emu_core::{AccessWidth, Scheduler, Timestamp};
 
@@ -106,6 +107,7 @@ pub struct Io {
     pub dma: Dma,
     pub video: Ppu,
     pub keypad: Keypad,
+    pub serial: Serial,
     /// Storage for mapped-but-unmodeled registers (see [`RawRegisters`]).
     raw: RawRegisters,
 }
@@ -205,6 +207,7 @@ impl Io {
                 self.timers.read_counter(timer_at(offset, 0x100), now)
             }
             0x102 | 0x106 | 0x10A | 0x10E => self.timers.read_control(timer_at(offset, 0x102)),
+            0x120 | 0x122 | 0x124 | 0x126 | 0x128 | 0x12A | 0x134 => self.serial.read16(offset),
             0x130 => self.keypad.read_input(),
             0x132 => self.keypad.read_control(),
             0x200 => self.irq.ie(),
@@ -256,6 +259,10 @@ impl Io {
                 self.timers.write_control(id, merged, scheduler.now(), scheduler);
                 // A timer control write can (re)schedule an overflow.
                 true
+            }
+            0x120 | 0x122 | 0x124 | 0x126 | 0x128 | 0x12A | 0x134 => {
+                self.serial.write16(offset, value, mask, &mut self.irq);
+                false
             }
             // 0x130 KEYINPUT is read-only.
             0x132 => {

@@ -1,0 +1,8 @@
+{
+  "name": "rewinds-debug",
+  "version": "0.1.0",
+  "description": "Node client for the RewinDS emulator debug socket",
+  "type": "module",
+  "main": "client.mjs",
+  "types": "client.d.ts"
+}

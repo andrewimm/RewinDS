@@ -1,0 +1,10 @@
+[package]
+name = "rewinds"
+version = "0.1.0"
+edition = "2021"
+description = "RewinDS emulator — desktop runner"
+
+[dependencies]
+gba = { path = "../gba" }
+debug = { path = "../debug" }
+minifb = "0.27"

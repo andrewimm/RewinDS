@@ -2,3 +2,13 @@ target/
 .claude/
 
 docs/
+
+# Images (screenshots, framebuffer dumps, etc.)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# One-off / local scripts (not part of any checked-in library)
+scratch/

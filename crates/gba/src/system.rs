@@ -25,7 +25,14 @@ pub struct System {
     trace: Option<Trace>,
     /// Which video instrumentation a running frame collects (off by default).
     video_debug: VideoInstrumentation,
+    /// Whether the continuous LCD scanline schedule has been started.
+    lcd_started: bool,
 }
+
+/// Cycles in one scanline (see [`crate::ppu::timing`]).
+const CYCLES_PER_LINE: Timestamp = 1232;
+/// Scanlines in one frame.
+const LINES_PER_FRAME: u32 = 228;
 
 /// Adapts the GBA [`Bus`] and [`Scheduler`] to the CPU's memory interface: it
 /// tags each access as a CPU instruction/data access, advances the timeline by
@@ -202,10 +209,34 @@ impl System {
         self.gba.bus.io.set_key(key, pressed);
     }
 
-    /// Begin LCD timing, starting the PPU's continuous scanline schedule.
+    /// Begin LCD timing, starting the PPU's continuous scanline schedule. On real
+    /// hardware the LCD runs from power-on; this is idempotent so callers can
+    /// ensure it without tracking whether it has started.
     pub fn start_lcd(&mut self) {
+        if self.lcd_started {
+            return;
+        }
+        self.lcd_started = true;
         let now = self.scheduler.now();
         self.gba.bus.io.video.start(now, &mut self.scheduler);
+    }
+
+    /// Run the machine until the PPU completes the current frame (its 160 visible
+    /// scanlines have all been drawn, at the start of the vertical blank). Starts
+    /// the LCD if it is not already running. After this returns, [`Self::framebuffer`]
+    /// holds the finished frame.
+    pub fn run_frame(&mut self) {
+        self.start_lcd();
+        let start = self.gba.bus.io.video.frame();
+        // Advance a scanline at a time until the frame counter ticks. The cap is a
+        // safety net against a stalled timeline (a hung CPU with no events).
+        for _ in 0..(LINES_PER_FRAME + 2) {
+            if self.gba.bus.io.video.frame() != start {
+                break;
+            }
+            let target = self.scheduler.now() + CYCLES_PER_LINE;
+            self.run_until(target);
+        }
     }
 
     /// Select which video instrumentation a running frame collects. Off by default
@@ -253,6 +284,44 @@ impl System {
         }
     }
 
+    /// Advance the machine by one step: execute a single CPU instruction, or —
+    /// when the timeline has reached the next event deadline, or the CPU is
+    /// halted — dispatch the due events (waking the CPU if that made an interrupt
+    /// pending). This is the single-step primitive the debugger drives.
+    pub fn step(&mut self) {
+        let can_run_cpu = !self.gba.is_low_power()
+            && self
+                .scheduler
+                .next_deadline()
+                .map_or(true, |d| self.scheduler.now() < d);
+        if can_run_cpu {
+            if self.gba.bus.io.irq.line_asserted() && self.cpu.irq_enabled() {
+                self.cpu.take_irq();
+            }
+            let mut memory = CpuBus {
+                bus: &mut self.gba.bus,
+                scheduler: &mut self.scheduler,
+                trace: self.trace.as_mut(),
+            };
+            self.cpu.step(&mut memory);
+        } else {
+            if self.gba.is_low_power() {
+                if let Some(deadline) = self.scheduler.next_deadline() {
+                    self.scheduler.set_now(deadline.max(self.scheduler.now()));
+                }
+            }
+            self.run_due_events();
+            let stall = self.gba.bus.take_dma_stall_cycles();
+            if stall > 0 {
+                let now = self.scheduler.now().saturating_add(stall);
+                self.scheduler.set_now(now);
+            }
+            if self.gba.is_low_power() && self.gba.should_wake() {
+                self.gba.wake();
+            }
+        }
+    }
+
     /// Run the machine until the guest timeline reaches `target`.
     ///
     /// Each iteration runs the CPU (or, when halted, idles) up to the next event
@@ -286,9 +355,13 @@ impl System {
                 self.cpu.step(&mut memory);
             } else {
                 // Reached the deadline (or halted): a halted CPU jumps straight
-                // to it, then the events due there are dispatched.
+                // to it, then the events due there are dispatched. Never move
+                // backward — the previous instruction may have overshot the
+                // deadline by a cycle before halting, in which case the event is
+                // already due and is simply dispatched at the current time.
                 if self.gba.is_low_power() {
-                    self.scheduler.set_now(deadline);
+                    let now = self.scheduler.now();
+                    self.scheduler.set_now(deadline.max(now));
                 }
                 self.run_due_events();
 
@@ -670,6 +743,89 @@ mod tests {
         let explanation = sys.explain_pixel(0, 2).unwrap();
         assert_eq!(explanation.final_color, Color15(0x7C00));
         assert_eq!(explanation.video_mode, 3);
+    }
+
+    /// Replays a real BIOS well past the intro (the point where an overshot-then-
+    /// halted deadline used to move time backward). Gated on `REWINDS_BIOS`, so it
+    /// is skipped unless a BIOS path is supplied.
+    #[test]
+    fn bios_runs_many_frames_without_moving_time_backward() {
+        let Ok(path) = std::env::var("REWINDS_BIOS") else {
+            return;
+        };
+        let bios = std::fs::read(path).expect("read BIOS");
+        let mut sys = System::new();
+        sys.gba.bus.load_bios(&bios);
+        sys.cpu.set_pc(0);
+        // Well past the intro handoff (~172 frames); this used to panic.
+        for _ in 0..300 {
+            sys.run_frame();
+        }
+    }
+
+    /// Diagnostic: boot a BIOS + ROM and report boot progress — handoff to ROM,
+    /// the first frame the game enables a background, and whether the framebuffer
+    /// gets content. Gated on `REWINDS_BIOS` + `REWINDS_ROM`; run with `--nocapture`.
+    #[test]
+    fn diagnose_rom_boot() {
+        let (Ok(bios), Ok(rom)) = (std::env::var("REWINDS_BIOS"), std::env::var("REWINDS_ROM"))
+        else {
+            return;
+        };
+        let mut sys = System::new();
+        sys.gba.bus.load_bios(&std::fs::read(bios).expect("bios"));
+        sys.gba.bus.load_rom(std::fs::read(rom).expect("rom"));
+        sys.cpu.set_pc(0);
+
+        let mut handoff = None;
+        let mut display_on = None;
+        let mut fb_content = None;
+        for frame in 0..800u32 {
+            sys.run_frame();
+            if handoff.is_none() && sys.cpu.register(15) >> 24 >= 0x08 {
+                handoff = Some(frame);
+            }
+            // Only look for game output *after* the BIOS hands off (the BIOS itself
+            // draws the logo, which we don't want to count as the game booting).
+            if handoff.is_none() {
+                continue;
+            }
+            let dispcnt = sys.gba.bus.io.video.read_dispcnt();
+            if display_on.is_none() && dispcnt & 0x0F00 != 0 && dispcnt & 0x80 == 0 {
+                display_on = Some((frame, dispcnt));
+            }
+            if fb_content.is_none() {
+                let fb = sys.framebuffer();
+                if fb.iter().any(|&c| c != fb[0]) {
+                    fb_content = Some(frame);
+                }
+            }
+        }
+        eprintln!("handoff to ROM at frame: {handoff:?}");
+        eprintln!("first background enabled at frame: {display_on:?}");
+        eprintln!("framebuffer gained content at frame: {fb_content:?}");
+        eprintln!(
+            "final pc={:#010x} (was stuck at 0x080008c0 before SIO)",
+            sys.cpu.register(15)
+        );
+    }
+
+    #[test]
+    fn run_frame_advances_one_frame_and_draws() {
+        use crate::ppu::Color15;
+        use emu_core::Access;
+        let mut sys = System::new();
+        // Mode 3, BG2, a green pixel. No program: the CPU streams NOPs (opcode 0
+        // is a condition-failed ANDEQ), which is enough to advance the timeline.
+        sys.gba
+            .bus
+            .write16(0x0400_0000, 0x0003 | (1 << 10), Access::cpu_data(), &mut sys.scheduler);
+        sys.gba.bus.memory.vram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes());
+
+        let before = sys.gba.bus.io.video.frame();
+        sys.run_frame();
+        assert_eq!(sys.gba.bus.io.video.frame(), before + 1);
+        assert_eq!(sys.framebuffer()[0], Color15(0x03E0));
     }
 
     #[test]
