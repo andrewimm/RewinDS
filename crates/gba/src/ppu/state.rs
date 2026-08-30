@@ -6,6 +6,7 @@
 //! priority. The heavyweight explanation types live in [`crate::ppu::debug`] and
 //! are only built when instrumentation is on.
 
+use super::obj::evaluate::SpriteInstance;
 use super::registers::Registers;
 
 /// Visible framebuffer width in pixels.
@@ -132,28 +133,50 @@ impl LayerLine {
     }
 }
 
-/// Per-scanline scratch reused across lines so rendering allocates nothing on the
-/// hot path.
+/// The OBJ (sprite) layer's candidate pixels for a scanline, plus the OBJ-window
+/// coverage mask that object-window sprites contribute (consumed by windowing).
 #[derive(Clone, Debug)]
-pub struct Scratch {
-    pub bg: [LayerLine; 4],
-    // OBJ line and window mask scratch join here once sprites and windows exist.
+pub struct ObjLine {
+    pub pixels: [Option<CandidatePixel>; WIDTH],
+    pub window: [bool; WIDTH],
 }
 
-impl Default for Scratch {
+impl Default for ObjLine {
     fn default() -> Self {
-        Scratch {
-            bg: std::array::from_fn(|_| LayerLine::default()),
+        ObjLine {
+            pixels: std::array::from_fn(|_| None),
+            window: [false; WIDTH],
         }
     }
 }
 
+impl ObjLine {
+    fn clear(&mut self) {
+        self.pixels.fill(None);
+        self.window.fill(false);
+    }
+}
+
+/// Per-scanline scratch reused across lines so rendering allocates nothing on the
+/// hot path.
+#[derive(Clone, Debug, Default)]
+pub struct Scratch {
+    pub bg: [LayerLine; 4],
+    pub obj: ObjLine,
+    /// Sprites evaluated as visible on the current scanline (reused; the `Vec`
+    /// keeps its capacity across lines).
+    pub sprites: Vec<SpriteInstance>,
+}
+
 impl Scratch {
-    /// Reset every layer line to fully transparent for a fresh scanline.
+    /// Reset every layer line, the OBJ line, and the sprite list for a fresh
+    /// scanline.
     pub fn clear(&mut self) {
         for line in &mut self.bg {
             line.clear();
         }
+        self.obj.clear();
+        self.sprites.clear();
     }
 }
 
@@ -209,6 +232,23 @@ impl LatchedState {
     /// Whether background `index` is enabled in `DISPCNT` (bits 8-11).
     pub fn bg_enabled(&self, index: usize) -> bool {
         self.regs.dispcnt & (1 << (8 + index)) != 0
+    }
+
+    /// Whether the OBJ layer is enabled in `DISPCNT` (bit 12).
+    pub fn obj_enabled(&self) -> bool {
+        self.regs.dispcnt & (1 << 12) != 0
+    }
+
+    /// Whether OBJ tile mapping is one-dimensional (`DISPCNT` bit 6). When clear,
+    /// sprite tiles are addressed as a 32×32 two-dimensional grid.
+    pub fn obj_one_dim_mapping(&self) -> bool {
+        self.regs.dispcnt & (1 << 6) != 0
+    }
+
+    /// Whether the OBJ per-scanline processing budget is the larger,
+    /// H-Blank-interval-free value (`DISPCNT` bit 5).
+    pub fn hblank_interval_free(&self) -> bool {
+        self.regs.dispcnt & (1 << 5) != 0
     }
 
     /// Whether the display is force-blanked (`DISPCNT` bit 7).

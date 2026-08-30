@@ -57,4 +57,10 @@ impl<'a> PpuMemoryView<'a> {
         let off = index * 2;
         Color15(u16::from_le_bytes([self.palette[off], self.palette[off + 1]]))
     }
+
+    /// Read a little-endian OAM halfword at byte offset `off`.
+    #[inline]
+    pub fn oam16(&self, off: usize) -> u16 {
+        u16::from_le_bytes([self.oam[off], self.oam[off + 1]])
+    }
 }

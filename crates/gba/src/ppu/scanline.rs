@@ -7,6 +7,7 @@
 
 use super::bg;
 use super::compositor;
+use super::obj;
 use super::debug::explain::{
     ExplainError, FrameId, PixelExplanation, ScanlineExplanation, ScanlineStateExplanation,
 };
@@ -53,6 +54,7 @@ impl Ppu {
 
         self.scratch.clear();
         bg::generate(y, &state, &self.affine, mem, &mut self.scratch, sink);
+        obj::generate(y, &state, mem, &mut self.scratch, sink);
 
         let backdrop = CandidatePixel::backdrop(mem.palette15(0));
         let row = y as usize * WIDTH;

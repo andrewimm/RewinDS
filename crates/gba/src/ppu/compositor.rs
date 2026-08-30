@@ -26,7 +26,9 @@ pub fn gather<S: ProvenanceSink>(
             set.push(scratch.bg[bg].pixels[x]);
         }
     }
-    // OBJ candidates will join here once sprites are implemented.
+    if mask.obj {
+        set.push(scratch.obj.pixels[x]);
+    }
 
     if sink.wants(x as u16) {
         sink.record_window(x as u16, || mask.explain());

@@ -14,6 +14,7 @@ pub mod debug;
 pub mod effects;
 pub mod latch;
 pub mod memory;
+pub mod obj;
 pub mod priority;
 pub mod registers;
 pub mod scanline;
