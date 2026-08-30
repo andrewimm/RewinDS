@@ -28,7 +28,7 @@ pub enum IrqSource {
 
 impl IrqSource {
     /// The single-bit mask this source occupies in `IE`/`IF`.
-    pub fn mask(self) -> u16 {
+    pub const fn mask(self) -> u16 {
         1 << (self as u16)
     }
 }
@@ -91,6 +91,12 @@ impl InterruptController {
     /// condition that wakes a halted CPU.
     pub fn pending(&self) -> bool {
         self.ie & self.iflags != 0
+    }
+
+    /// Whether an enabled interrupt within `mask` is pending. Used for Stop
+    /// mode, which only wakes on a subset of sources.
+    pub fn pending_within(&self, mask: u16) -> bool {
+        self.ie & self.iflags & mask != 0
     }
 
     /// Whether the CPU IRQ input line is asserted: an enabled request is pending

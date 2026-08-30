@@ -91,6 +91,7 @@ pub struct EventContext<'a, E> {
 }
 
 /// The deterministic event queue and its position on the guest timeline.
+#[derive(Clone, Debug)]
 pub struct Scheduler<E> {
     now: Timestamp,
     next_sequence: u64,

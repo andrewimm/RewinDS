@@ -7,20 +7,79 @@
 //! when a device schedules a follow-up event through the context.
 
 use crate::event::EventKind;
-use crate::interrupt::InterruptController;
+use crate::interrupt::{InterruptController, IrqSource};
 use crate::timer::Timers;
 use emu_core::{EventContext, EventHandler};
+
+/// The CPU power state, set via `HALTCNT`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PowerState {
+    /// Executing normally.
+    #[default]
+    Running,
+    /// Halt mode: paused until any enabled interrupt is pending (`IE & IF`).
+    Halted,
+    /// Stop mode: most hardware paused; woken only by keypad, gamepak, or
+    /// serial interrupts.
+    Stopped,
+}
+
+/// Interrupt sources that terminate Stop mode.
+const STOP_WAKE_MASK: u16 =
+    IrqSource::Keypad.mask() | IrqSource::GamePak.mask() | IrqSource::Serial.mask();
 
 /// The GBA's devices, sharing one timeline.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gba {
     pub timers: Timers,
     pub irq: InterruptController,
+    power: PowerState,
 }
 
 impl Gba {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The current power state.
+    pub fn power_state(&self) -> PowerState {
+        self.power
+    }
+
+    /// Whether the CPU is executing normally.
+    pub fn is_running(&self) -> bool {
+        self.power == PowerState::Running
+    }
+
+    /// Whether the CPU is paused in a low-power (Halt/Stop) state.
+    pub fn is_low_power(&self) -> bool {
+        self.power != PowerState::Running
+    }
+
+    /// Write `HALTCNT` (`4000301h`): bit 7 selects Halt (0) or Stop (1).
+    pub fn write_haltcnt(&mut self, value: u8) {
+        self.power = if value & 0x80 != 0 {
+            PowerState::Stopped
+        } else {
+            PowerState::Halted
+        };
+    }
+
+    /// Whether a currently pending interrupt should wake the CPU from its
+    /// low-power state. In Halt this is any enabled request (regardless of
+    /// `IME`); in Stop only the stop-wake sources qualify.
+    pub fn should_wake(&self) -> bool {
+        match self.power {
+            PowerState::Running => false,
+            PowerState::Halted => self.irq.pending(),
+            PowerState::Stopped => self.irq.pending_within(STOP_WAKE_MASK),
+        }
+    }
+
+    /// Resume normal execution. The pending interrupt is left set for the CPU to
+    /// accept when architecturally appropriate; waking is not acceptance.
+    pub fn wake(&mut self) {
+        self.power = PowerState::Running;
     }
 }
 

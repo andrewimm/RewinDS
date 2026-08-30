@@ -8,9 +8,11 @@
 pub mod event;
 pub mod interrupt;
 pub mod machine;
+pub mod system;
 pub mod timer;
 
 pub use event::{EventKind, TimerEvent};
 pub use interrupt::{InterruptController, IrqSource};
-pub use machine::Gba;
+pub use machine::{Gba, PowerState};
+pub use system::{HaltProgress, System};
 pub use timer::{TimerId, Timers};
