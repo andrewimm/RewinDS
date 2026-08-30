@@ -223,6 +223,90 @@ mod tests {
         }
     }
 
+    /// Mode 4 looks up an 8-bit index in the background palette; index 0 is
+    /// transparent and shows the backdrop.
+    #[test]
+    fn mode4_indexed_lookup_and_transparency() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0004 | (1 << 10));
+        mem.palette[0..2].copy_from_slice(&0x7C00u16.to_le_bytes()); // backdrop = blue
+        mem.palette[10..12].copy_from_slice(&0x03E0u16.to_le_bytes()); // index 5 = green
+        mem.vram[0] = 5; // pixel (0,0) -> index 5
+        mem.vram[1] = 0; // pixel (1,0) -> transparent
+        ppu.latch_for_scanline();
+
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
+        assert_eq!(ppu.framebuffer()[1], Color15(0x7C00)); // transparent -> backdrop
+    }
+
+    /// Mode 4's `DISPCNT` bit 4 selects the second VRAM page.
+    #[test]
+    fn mode4_frame_select_reads_second_page() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0004 | (1 << 10) | (1 << 4)); // frame 1
+        mem.palette[2..4].copy_from_slice(&0x001Fu16.to_le_bytes()); // index 1 = red
+        mem.vram[0xA000] = 1; // frame 1, pixel (0,0)
+        mem.vram[0] = 7; // frame 0 value, must be ignored
+        ppu.latch_for_scanline();
+
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x001F));
+    }
+
+    /// Mode 5 is direct color but only 160×128; outside those bounds is backdrop.
+    #[test]
+    fn mode5_direct_color_within_reduced_dimensions() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0005 | (1 << 10));
+        mem.palette[0..2].copy_from_slice(&0x7C00u16.to_le_bytes()); // backdrop = blue
+        mem.vram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes()); // pixel (0,0) = green
+        ppu.latch_for_scanline();
+
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
+        // x = 200 is beyond mode 5's 160-wide framebuffer -> backdrop.
+        assert_eq!(ppu.framebuffer()[200], Color15(0x7C00));
+
+        // A line beyond mode 5's 128-tall framebuffer is entirely backdrop.
+        ppu.render_scanline(130, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[130 * WIDTH], Color15(0x7C00));
+    }
+
+    /// Mode 4's explanation reports both the VRAM index address and the palette
+    /// entry it resolved through.
+    #[test]
+    fn explain_reports_mode4_palette_source() {
+        use crate::ppu::debug::provenance::BitmapSample;
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0004 | (1 << 10));
+        mem.palette[20..22].copy_from_slice(&0x7FFFu16.to_le_bytes()); // index 10 = white
+        let off = 3 * WIDTH + 4; // pixel (4, 3)
+        mem.vram[off] = 10;
+
+        let view = PpuMemoryView::new(&mem);
+        let explanation = ppu.explain_current_pixel(4, 3, &view).unwrap();
+        assert_eq!(explanation.final_color, Color15(0x7FFF));
+        assert_eq!(explanation.video_mode, 4);
+
+        let bg2 = explanation.candidate_for(LayerId::Bg2).expect("BG2 candidate");
+        match bg2.provenance {
+            SourceProvenance::BitmapBg(p) => {
+                assert_eq!(p.vram_address, VRAM_BASE + off as u32);
+                assert_eq!(p.palette_address, Some(PALETTE_BASE + 10 * 2));
+                assert!(matches!(p.raw, BitmapSample::Indexed(10)));
+            }
+            _ => panic!("expected bitmap provenance"),
+        }
+    }
+
     /// A pixel outside the visible framebuffer is an explicit error.
     #[test]
     fn explain_rejects_out_of_range_pixel() {

@@ -25,8 +25,8 @@ pub fn generate<S: ProvenanceSink>(
         // Modes 0-2 (text/affine tiled backgrounds) are not yet implemented.
         0..=2 => {}
         3 => bitmap::render_mode3(y, state, mem, scratch, sink),
-        // Modes 4/5 (indexed / paged bitmap) are not yet implemented.
-        4 | 5 => {}
+        4 => bitmap::render_mode4(y, state, mem, scratch, sink),
+        5 => bitmap::render_mode5(y, state, mem, scratch, sink),
         // Modes 6/7 are invalid; nothing is drawn.
         _ => {}
     }
