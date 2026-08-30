@@ -187,6 +187,21 @@ impl System {
             });
     }
 
+    /// Press a button (raising the keypad interrupt if `KEYCNT` is so configured).
+    pub fn press_key(&mut self, key: crate::keypad::Key) {
+        self.gba.bus.io.set_key(key, true);
+    }
+
+    /// Release a button.
+    pub fn release_key(&mut self, key: crate::keypad::Key) {
+        self.gba.bus.io.set_key(key, false);
+    }
+
+    /// Set a button's pressed state directly.
+    pub fn set_key(&mut self, key: crate::keypad::Key, pressed: bool) {
+        self.gba.bus.io.set_key(key, pressed);
+    }
+
     /// Begin LCD timing, starting the PPU's continuous scanline schedule.
     pub fn start_lcd(&mut self) {
         let now = self.scheduler.now();

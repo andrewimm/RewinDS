@@ -10,6 +10,7 @@ pub mod dma;
 pub mod event;
 pub mod interrupt;
 pub mod io;
+pub mod keypad;
 pub mod machine;
 pub mod ppu;
 pub mod prefetch;
@@ -23,6 +24,7 @@ pub use prefetch::Prefetch;
 pub use event::{EventKind, PpuEvent, TimerEvent};
 pub use interrupt::{InterruptController, IrqSource};
 pub use io::{Io, PowerState, SystemControl};
+pub use keypad::{Key, Keypad};
 pub use machine::Gba;
 pub use ppu::debug::{
     ExplainError, PixelExplanation, ScanlineExplanation, SourceProvenance, VideoInstrumentation,

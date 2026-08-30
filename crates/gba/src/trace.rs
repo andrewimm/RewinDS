@@ -85,6 +85,8 @@ pub(crate) fn io_register_name(address: u32) -> String {
         0x10A => "TM2CNT_H",
         0x10C => "TM3CNT_L",
         0x10E => "TM3CNT_H",
+        0x130 => "KEYINPUT",
+        0x132 => "KEYCNT",
         0x200 => "IE",
         0x202 => "IF",
         0x204 => "WAITCNT",

@@ -23,9 +23,12 @@ use gba::ppu::debug::explain::WindowExplanation;
 use gba::ppu::debug::provenance::{BackgroundId, ObjProvenance};
 use gba::ppu::state::CandidatePixel;
 use gba::{
-    Access, BackgroundSummary, Color15, EventKind, ExplainError, PixelExplanation,
+    Access, BackgroundSummary, Color15, EventKind, ExplainError, Key, PixelExplanation,
     ScanlineExplanation, SpriteInstance, System,
 };
+
+// Re-exported so debug clients can name buttons without depending on `gba`.
+pub use gba::Key as Button;
 
 /// A borrowed, structured debug view of a system.
 pub struct Debugger<'a> {
@@ -68,6 +71,12 @@ impl<'a> Debugger<'a> {
 
     pub fn interrupts(&mut self) -> Interrupts<'_> {
         Interrupts {
+            system: &mut *self.system,
+        }
+    }
+
+    pub fn input(&mut self) -> Input<'_> {
+        Input {
             system: &mut *self.system,
         }
     }
@@ -284,6 +293,64 @@ impl Interrupts<'_> {
     // `history()` awaits an interrupt event log.
 }
 
+/// `emu.input.*` — keypad input injection.
+pub struct Input<'a> {
+    system: &'a mut System,
+}
+
+impl Input<'_> {
+    /// Press a button.
+    pub fn press(&mut self, key: Key) {
+        self.system.press_key(key);
+    }
+
+    /// Release a button.
+    pub fn release(&mut self, key: Key) {
+        self.system.release_key(key);
+    }
+
+    /// Set a button's pressed state.
+    pub fn set(&mut self, key: Key, pressed: bool) {
+        self.system.set_key(key, pressed);
+    }
+
+    /// Press a button named as a string (e.g. `"A"`, `"Right"`); returns `false`
+    /// for an unknown name. The shape a string-keyed protocol drives.
+    pub fn press_name(&mut self, name: &str) -> bool {
+        match Key::from_name(name) {
+            Some(key) => {
+                self.system.press_key(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Release a button named as a string; returns `false` for an unknown name.
+    pub fn release_name(&mut self, name: &str) -> bool {
+        match Key::from_name(name) {
+            Some(key) => {
+                self.system.release_key(key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a button is currently pressed.
+    pub fn is_pressed(&self, key: Key) -> bool {
+        self.system.gba.bus.io.keypad.is_pressed(key)
+    }
+
+    /// The raw `KEYINPUT` value (active-low).
+    pub fn keyinput(&self) -> u16 {
+        self.system.gba.bus.io.keypad.read_input()
+    }
+
+    // `hold(key, frames)` and DS `touch(x, y)` are driver-level conveniences to
+    // come once a frame-stepping run loop and the DS exist.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +386,30 @@ mod tests {
         assert!(dbg.scheduler().next_deadline().is_some());
         assert_eq!(dbg.interrupts().enabled(), IrqSource::Timer0.mask());
         assert!(dbg.interrupts().master_enable());
+    }
+
+    #[test]
+    fn input_namespace_presses_and_raises_irq() {
+        let mut system = System::new();
+        // Enable the keypad interrupt on A (OR condition).
+        system.gba.bus.io.irq.set_ie(IrqSource::Keypad.mask());
+        system.gba.bus.io.irq.set_ime(true);
+        system
+            .gba
+            .bus
+            .write16(0x0400_0132, (1 << 14) | Button::A.bit(), Access::cpu_data(), &mut system.scheduler);
+
+        let mut dbg = Debugger::new(&mut system);
+        assert!(!dbg.input().is_pressed(Button::A));
+        dbg.input().press(Button::A);
+        assert!(dbg.input().is_pressed(Button::A));
+        // KEYINPUT is active-low: pressing A clears bit 0.
+        assert_eq!(dbg.input().keyinput() & 1, 0);
+        // The press raised the keypad interrupt.
+        assert!(dbg.interrupts().line_asserted());
+
+        assert!(dbg.input().press_name("start"));
+        assert!(!dbg.input().press_name("nonsense"));
     }
 
     #[test]

@@ -656,6 +656,22 @@ mod tests {
     }
 
     #[test]
+    fn keypad_mmio_reads_active_low_and_keycnt_round_trips() {
+        use crate::keypad::Key;
+        let (mut b, mut s) = bus();
+        // KEYINPUT defaults to all-released (0x03FF), active-low.
+        assert_eq!(b.read16(0x0400_0130, CPU, &mut s).value, 0x03FF);
+        b.io.set_key(Key::A, true);
+        assert_eq!(b.read16(0x0400_0130, CPU, &mut s).value, 0x03FF & !1);
+        // KEYINPUT is read-only.
+        b.write16(0x0400_0130, 0, CPU, &mut s);
+        assert_eq!(b.read16(0x0400_0130, CPU, &mut s).value, 0x03FF & !1);
+        // KEYCNT round-trips through MMIO.
+        b.write16(0x0400_0132, 0xC003, CPU, &mut s);
+        assert_eq!(b.read16(0x0400_0132, CPU, &mut s).value, 0xC003);
+    }
+
+    #[test]
     fn mmio_vcount_is_read_only() {
         let (mut b, mut s) = bus();
         b.write16(0x0400_0006, 0x00FF, CPU, &mut s); // VCOUNT

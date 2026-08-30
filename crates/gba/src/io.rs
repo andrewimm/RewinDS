@@ -11,6 +11,7 @@
 use crate::dma::Dma;
 use crate::event::EventKind;
 use crate::interrupt::{InterruptController, IrqSource};
+use crate::keypad::{Key, Keypad};
 use crate::ppu::Ppu;
 use crate::timer::{TimerId, Timers};
 use emu_core::{AccessWidth, Scheduler, Timestamp};
@@ -71,6 +72,7 @@ pub struct Io {
     pub timers: Timers,
     pub dma: Dma,
     pub video: Ppu,
+    pub keypad: Keypad,
 }
 
 impl Io {
@@ -99,6 +101,18 @@ impl Io {
 
     pub fn wake(&mut self) {
         self.control.wake();
+    }
+
+    // --- keypad input ---
+
+    /// Set a button's pressed state, raising the keypad interrupt if the change
+    /// newly satisfies the `KEYCNT` condition.
+    pub fn set_key(&mut self, key: Key, pressed: bool) {
+        let was_met = self.keypad.irq_condition_met();
+        self.keypad.set_key(key, pressed);
+        if !was_met && self.keypad.irq_condition_met() {
+            self.irq.request(IrqSource::Keypad);
+        }
     }
 
     // --- MMIO access, composed from 16-bit registers ---
@@ -156,6 +170,8 @@ impl Io {
                 self.timers.read_counter(timer_at(offset, 0x100), now)
             }
             0x102 | 0x106 | 0x10A | 0x10E => self.timers.read_control(timer_at(offset, 0x102)),
+            0x130 => self.keypad.read_input(),
+            0x132 => self.keypad.read_control(),
             0x200 => self.irq.ie(),
             0x202 => self.irq.iflags(),
             0x204 => self.control.waitcnt(),
@@ -204,6 +220,12 @@ impl Io {
                 self.timers.write_control(id, merged, scheduler.now(), scheduler);
                 // A timer control write can (re)schedule an overflow.
                 true
+            }
+            // 0x130 KEYINPUT is read-only.
+            0x132 => {
+                let merged = merge(self.keypad.read_control(), value, mask);
+                self.keypad.write_control(merged);
+                false
             }
             0x200 => {
                 self.irq.set_ie(merge(self.irq.ie(), value, mask));
