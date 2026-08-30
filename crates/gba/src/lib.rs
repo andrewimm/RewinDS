@@ -15,6 +15,7 @@ pub mod ppu;
 pub mod prefetch;
 pub mod system;
 pub mod timer;
+pub mod trace;
 
 pub use bus::{Bus, Memory};
 pub use dma::{Dma, DmaChannel, DmaTiming};
@@ -26,6 +27,7 @@ pub use machine::Gba;
 pub use ppu::Ppu;
 pub use system::{HaltProgress, System};
 pub use timer::{TimerId, Timers};
+pub use trace::{Trace, TraceRecord};
 
 // Re-export the shared bus vocabulary so callers of this crate's bus don't need
 // to depend on emu-core directly.

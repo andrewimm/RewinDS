@@ -9,6 +9,7 @@
 use crate::bus::Bus;
 use crate::event::EventKind;
 use crate::machine::Gba;
+use crate::trace::{describe_event, io_register_name, Trace};
 use arm::cpu::{Bus as CpuMemory, Cpu, Timed};
 use emu_core::{Access, AccessKind, AccessSequence, Scheduler, Timestamp};
 
@@ -18,6 +19,8 @@ pub struct System {
     pub cpu: Cpu,
     pub scheduler: Scheduler<EventKind>,
     pub gba: Gba,
+    /// Optional event trace (off by default; see [`System::enable_trace`]).
+    trace: Option<Trace>,
 }
 
 /// Adapts the GBA [`Bus`] and [`Scheduler`] to the CPU's memory interface: it
@@ -27,12 +30,34 @@ pub struct System {
 struct CpuBus<'a> {
     bus: &'a mut Bus,
     scheduler: &'a mut Scheduler<EventKind>,
+    trace: Option<&'a mut Trace>,
 }
 
 impl CpuBus<'_> {
     fn advance(&mut self, cycles: u32) {
         let now = self.scheduler.now().saturating_add(cycles as u64);
         self.scheduler.set_now(now);
+    }
+
+    /// Record an MMIO write (and any event it (re)scheduled) into the trace.
+    fn trace_write(&mut self, address: u32, value: u32, scheduling_changed: bool) {
+        // Only the I/O region is interesting, and only when tracing is on.
+        if !(0x0400_0000..0x0500_0000).contains(&address) {
+            return;
+        }
+        let now = self.scheduler.now();
+        let deadline = self.scheduler.next_deadline();
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.record(
+                now,
+                format!("CPU write {} = {value:#06x}", io_register_name(address)),
+            );
+            if scheduling_changed {
+                if let Some(at) = deadline {
+                    trace.record(now, format!("scheduled next event @ {at}"));
+                }
+            }
+        }
     }
 }
 
@@ -85,6 +110,7 @@ impl CpuMemory for CpuBus<'_> {
         let write = self
             .bus
             .write32(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.trace_write(address, value, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
         self.advance(cycles);
         cycles
@@ -93,6 +119,7 @@ impl CpuMemory for CpuBus<'_> {
         let write = self
             .bus
             .write16(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.trace_write(address, value as u32, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
         self.advance(cycles);
         cycles
@@ -101,6 +128,7 @@ impl CpuMemory for CpuBus<'_> {
         let write = self
             .bus
             .write8(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.trace_write(address, value as u32, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
         self.advance(cycles);
         cycles
@@ -128,9 +156,31 @@ impl System {
         Self::default()
     }
 
-    /// Dispatch every event due at the current time into the machine.
+    /// Turn on event tracing (see [`crate::trace::Trace`]). Off by default.
+    pub fn enable_trace(&mut self) {
+        self.trace = Some(Trace::new());
+    }
+
+    /// The collected trace, if tracing is enabled.
+    pub fn trace(&self) -> Option<&Trace> {
+        self.trace.as_ref()
+    }
+
+    /// Take ownership of the collected trace, leaving tracing enabled but empty.
+    pub fn take_trace(&mut self) -> Option<Trace> {
+        self.trace.as_mut().map(std::mem::take)
+    }
+
+    /// Dispatch every event due at the current time into the machine, tracing
+    /// each as it fires.
     pub fn run_due_events(&mut self) {
-        self.scheduler.run_due_events(&mut self.gba);
+        let trace = &mut self.trace;
+        self.scheduler
+            .run_due_events_traced(&mut self.gba, |now, kind| {
+                if let Some(trace) = trace.as_mut() {
+                    trace.record(now, describe_event(kind));
+                }
+            });
     }
 
     /// Begin LCD timing, starting the PPU's continuous scanline schedule.
@@ -167,40 +217,46 @@ impl System {
     /// boundaries.
     pub fn run_until(&mut self, target: Timestamp) {
         while self.scheduler.now() < target {
+            // Recompute the deadline every instruction: an MMIO write can
+            // schedule an earlier event, and the CPU must side-exit to it.
             let deadline = self
                 .scheduler
                 .next_deadline()
                 .map_or(target, |d| d.min(target));
 
-            if self.gba.is_low_power() {
-                // The CPU executes nothing; jump straight to the deadline.
-                self.scheduler.set_now(deadline);
-            } else {
-                while self.scheduler.now() < deadline && !self.gba.is_low_power() {
-                    // Accept a pending interrupt at this instruction boundary.
-                    if self.gba.bus.io.irq.line_asserted() && self.cpu.irq_enabled() {
-                        self.cpu.take_irq();
+            if self.scheduler.now() < deadline && !self.gba.is_low_power() {
+                // Accept a pending interrupt at this instruction boundary, then
+                // execute one instruction.
+                if self.gba.bus.io.irq.line_asserted() && self.cpu.irq_enabled() {
+                    if let Some(trace) = self.trace.as_mut() {
+                        trace.record(self.scheduler.now(), "CPU accepts IRQ");
                     }
-                    let mut memory = CpuBus {
-                        bus: &mut self.gba.bus,
-                        scheduler: &mut self.scheduler,
-                    };
-                    self.cpu.step(&mut memory);
+                    self.cpu.take_irq();
                 }
-            }
+                let mut memory = CpuBus {
+                    bus: &mut self.gba.bus,
+                    scheduler: &mut self.scheduler,
+                    trace: self.trace.as_mut(),
+                };
+                self.cpu.step(&mut memory);
+            } else {
+                // Reached the deadline (or halted): a halted CPU jumps straight
+                // to it, then the events due there are dispatched.
+                if self.gba.is_low_power() {
+                    self.scheduler.set_now(deadline);
+                }
+                self.run_due_events();
 
-            self.scheduler.run_due_events(&mut self.gba);
+                // A blank-triggered DMA during dispatch also stalls the CPU.
+                let stall = self.gba.bus.take_dma_stall_cycles();
+                if stall > 0 {
+                    let now = self.scheduler.now().saturating_add(stall);
+                    self.scheduler.set_now(now);
+                }
 
-            // A blank-triggered DMA during event dispatch also stalls the CPU.
-            let stall = self.gba.bus.take_dma_stall_cycles();
-            if stall > 0 {
-                let now = self.scheduler.now().saturating_add(stall);
-                self.scheduler.set_now(now);
-            }
-
-            // Wake from a low-power state once an interrupt is pending.
-            if self.gba.is_low_power() && self.gba.should_wake() {
-                self.gba.wake();
+                if self.gba.is_low_power() && self.gba.should_wake() {
+                    self.gba.wake();
+                }
             }
         }
     }
@@ -363,6 +419,43 @@ mod tests {
         // IRQ mode, executing from the exception vector.
         assert_eq!(sys.cpu.mode(), Some(Mode::Irq));
         assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::Timer0.mask(), 0);
+    }
+
+    #[test]
+    fn trace_captures_the_timer_interrupt_causal_chain() {
+        let mut sys = System::new();
+        sys.enable_trace();
+        // A program that configures Timer0's interrupt entirely through MMIO,
+        // then spins: enable IE/IME, then write reload+control in one 32-bit
+        // store to the timer register block.
+        load_iwram(
+            &mut sys,
+            &[
+                0xE3A0_1301, // mov r1, #0x04000000   (I/O base)
+                0xE3A0_0008, // mov r0, #8            (Timer0 IRQ bit)
+                0xE581_0200, // str r0, [r1, #0x200]  ; IE
+                0xE3A0_0001, // mov r0, #1
+                0xE581_0208, // str r0, [r1, #0x208]  ; IME
+                0xE3A0_0CFF, // mov r0, #0xFF00       (reload -> overflow in 256)
+                0xE380_08C0, // orr r0, r0, #0xC00000 (control = start|IRQ, in the high half)
+                0xE581_0100, // str r0, [r1, #0x100]  ; TM0CNT_L + TM0CNT_H
+                0xEAFF_FFFE, // b .
+            ],
+        );
+        sys.cpu.set_pc(0x0300_0000);
+        sys.run_until(1000);
+
+        let text = sys.trace().unwrap().to_text();
+        for expected in [
+            "CPU write IE",
+            "CPU write IME",
+            "CPU write TM0CNT_L",
+            "scheduled next event",
+            "Timer0 overflow",
+            "CPU accepts IRQ",
+        ] {
+            assert!(text.contains(expected), "trace missing {expected:?}:\n{text}");
+        }
     }
 
     #[test]

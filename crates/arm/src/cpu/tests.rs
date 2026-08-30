@@ -23,6 +23,15 @@ impl TestBus {
         }
     }
 
+    /// Load a program of little-endian Thumb halfwords at `address`.
+    fn load_thumb(&mut self, address: u32, program: &[u16]) {
+        let mut offset = address as usize;
+        for halfword in program {
+            self.memory[offset..offset + 2].copy_from_slice(&halfword.to_le_bytes());
+            offset += 2;
+        }
+    }
+
     fn read(&self, address: u32, bytes: usize) -> u32 {
         let mut value = 0u32;
         for i in 0..bytes {
@@ -339,6 +348,82 @@ fn register_banking_preserves_the_callers_stack_pointer() {
     // The handler wrote the Supervisor sp; the System sp is untouched.
     assert_eq!(cpu.mode(), Some(Mode::System));
     assert_eq!(cpu.register(13), 0xAAAA);
+}
+
+#[test]
+fn arm_thumb_interworking_round_trip() {
+    // tests/fixtures/interwork.s, assembled by clang: ARM sets r0 = 2, BXes into
+    // Thumb (lsls r0, #2 -> 8), then BXes back to ARM (add #1 -> 9).
+    let mut bus = TestBus::new(0x100);
+    bus.load(
+        0,
+        &[
+            0xE3A0_0002, // mov r0, #2
+            0xE28F_E008, // adr lr, back
+            0xE28F_100C, // adr r1, tfunc
+            0xE381_1001, // orr r1, r1, #1
+            0xE12F_FF11, // bx r1        -> Thumb
+            0xE280_0001, // back: add r0, r0, #1
+            0xEAFF_FFFE, // b .          (spin)
+        ],
+    );
+    bus.load_thumb(0x1C, &[0x0080, 0x4770]); // tfunc: lsls r0, r0, #2 ; bx lr
+    let mut cpu = Cpu::new();
+    for _ in 0..12 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(0), 9);
+    assert!(!cpu.cpsr().thumb()); // came back to ARM state
+}
+
+#[test]
+fn thumb_alu_and_shift_flags() {
+    let mut bus = TestBus::new(0x100);
+    // bx r0 (enter Thumb at 0x08)
+    bus.load(0, &[0xE12F_FF10]);
+    // movs r1, #1 ; lsls r1, r1, ... no: use format-4 shift.
+    // movs r0, #0x80 ; asrs r0, r1 won't be simple. Keep it: movs r1, #1 ; movs r0, #0 ; adds r0, r0, r1
+    bus.load_thumb(0x08, &[0x2101, 0x2000, 0x1840]);
+    let mut cpu = Cpu::new();
+    cpu.set_register(0, 0x08 | 1); // Thumb target
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(0), 1); // 0 + 1
+    assert_eq!(cpu.register(1), 1);
+}
+
+#[test]
+fn thumb_program_via_interworking() {
+    // The exact bytes clang produced for tests/fixtures/thumb_program.s, entered
+    // from ARM via `bx`. It pushes, computes, calls a subroutine via BL, and
+    // returns through pop.
+    let mut bus = TestBus::new(0x300);
+    bus.load(0, &[0xE12F_FF10]); // bx r0
+    bus.load_thumb(
+        0x08,
+        &[
+            0xB510, // push {r4, lr}
+            0x200A, // movs r0, #10
+            0x0081, // lsls r1, r0, #2
+            0xAC02, // add r4, sp, #8
+            0x6822, // ldr r2, [r4]
+            0xF000, // bl target (high)
+            0xF801, // bl target (low)
+            0xBD10, // pop {r4, pc}
+            0x1C40, // adds r0, r0, #1
+            0x4770, // bx lr
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.set_register(0, 0x08 | 1); // Thumb entry
+    cpu.set_register(13, 0x0100); // sp
+    cpu.set_register(14, 0x0200); // lr sentinel
+    for _ in 0..12 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(1), 40); // 10 << 2
+    assert_eq!(cpu.register(0), 11); // 10, then +1 in the subroutine
 }
 
 #[test]

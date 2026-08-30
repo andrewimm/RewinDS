@@ -10,11 +10,12 @@
 //! execution; otherwise the fetch advances by one instruction.
 
 mod bus;
+mod thumb;
 
 pub use bus::{Bus, Timed};
 
 use crate::condition::Condition;
-use crate::decode::decode_arm;
+use crate::decode::{decode_arm, decode_thumb};
 use crate::instruction::arm::{
     ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
     HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
@@ -312,10 +313,22 @@ impl Cpu {
         }
     }
 
-    fn step_thumb<B: Bus>(&mut self, _bus: &mut B) {
-        // Thumb execution is not yet implemented.
-        self.r[15] = (self.r[15] & !1).wrapping_add(2);
-        self.sequential = true;
+    fn step_thumb<B: Bus>(&mut self, bus: &mut B) {
+        let pc = self.r[15] & !1;
+        self.r[15] = pc;
+        self.data_access = false;
+        let fetched = bus.fetch16(pc, self.sequential);
+        self.cycles += fetched.cycles as u64;
+
+        let instruction = decode_thumb(fetched.value);
+        self.execute_thumb(instruction, bus);
+
+        if self.branched {
+            self.sequential = false;
+        } else {
+            self.r[15] = pc.wrapping_add(2);
+            self.sequential = !self.data_access;
+        }
     }
 
     fn execute_arm<B: Bus>(&mut self, operation: ArmOperation, bus: &mut B) {

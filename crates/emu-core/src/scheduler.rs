@@ -185,6 +185,16 @@ impl<E> Scheduler<E> {
     /// is what makes same-cycle cascades (e.g. one timer overflow driving
     /// another) complete deterministically before the CPU resumes.
     pub fn run_due_events<H: EventHandler<E>>(&mut self, handler: &mut H) {
+        self.run_due_events_traced(handler, |_, _| {});
+    }
+
+    /// Like [`Scheduler::run_due_events`], but calls `on_fire(now, &event)` for
+    /// each event just before it is dispatched — a hook for tracing.
+    pub fn run_due_events_traced<H, F>(&mut self, handler: &mut H, mut on_fire: F)
+    where
+        H: EventHandler<E>,
+        F: FnMut(Timestamp, &E),
+    {
         loop {
             match self.events.peek() {
                 Some(Reverse(event)) if event.at <= self.now => {}
@@ -192,6 +202,7 @@ impl<E> Scheduler<E> {
             }
             let Reverse(event) = self.events.pop().expect("peek just succeeded");
             let now = self.now;
+            on_fire(now, &event.kind);
             handler.handle(
                 event.kind,
                 &mut EventContext {
