@@ -12,11 +12,13 @@ pub mod interrupt;
 pub mod io;
 pub mod machine;
 pub mod ppu;
+pub mod prefetch;
 pub mod system;
 pub mod timer;
 
 pub use bus::{Bus, Memory};
 pub use dma::{Dma, DmaChannel, DmaTiming};
+pub use prefetch::Prefetch;
 pub use event::{EventKind, PpuEvent, TimerEvent};
 pub use interrupt::{InterruptController, IrqSource};
 pub use io::{Io, PowerState, SystemControl};

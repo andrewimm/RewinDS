@@ -10,6 +10,7 @@ use crate::dma::DmaTiming;
 use crate::event::EventKind;
 use crate::interrupt::IrqSource;
 use crate::io::Io;
+use crate::prefetch::Prefetch;
 use emu_core::{
     Access, AccessKind, AccessMaster, AccessSequence, AccessWidth, BusResult, Scheduler,
 };
@@ -56,6 +57,10 @@ impl Default for Memory {
 pub struct Bus {
     pub memory: Memory,
     pub io: Io,
+    prefetch: Prefetch,
+    /// Guest cycles that DMA transfers have stalled the CPU for, awaiting the CPU
+    /// to account for them.
+    dma_stall_cycles: u64,
 }
 
 impl Bus {
@@ -132,7 +137,14 @@ impl Bus {
                 BusResult::plain(read_le(&self.memory.oam, off, width), 1)
             }
             0x08..=0x0D => {
-                let cycles = self.rom_cycles(addr >> 24, width, access.sequence);
+                // Instruction fetches go through the prefetch buffer when it is
+                // enabled; data reads (and all reads when disabled) pay the raw
+                // wait-stated ROM timing.
+                let cycles = if access.kind == AccessKind::Instruction && self.prefetch.enabled() {
+                    self.prefetch_code_cost(addr >> 24, width, access.sequence)
+                } else {
+                    self.rom_cycles(addr >> 24, width, access.sequence)
+                };
                 if !rom_accessible(access.master) {
                     return BusResult::plain(OPEN_BUS, cycles);
                 }
@@ -177,6 +189,9 @@ impl Bus {
                 } else {
                     false
                 };
+                // Keep the prefetcher's enable in sync with WAITCNT bit 14.
+                self.prefetch
+                    .set_enabled(self.io.control.waitcnt() & (1 << 14) != 0);
                 // A write that enabled an immediate-timing DMA runs it now.
                 let dma_ran = self.run_pending_dmas(scheduler);
                 BusResult {
@@ -219,18 +234,48 @@ impl Bus {
 
     /// Wait-state cycles for a gamepak ROM access.
     fn rom_cycles(&self, region: u32, width: AccessWidth, sequence: AccessSequence) -> u32 {
-        let waitstate = match region {
-            0x08 | 0x09 => 0,
-            0x0A | 0x0B => 1,
-            _ => 2,
-        };
-        let (nonseq, seq) = self.ws_waits(waitstate);
+        let (nonseq, seq) = self.ws_waits(ws_index(region));
         let first = 1 + if sequence == AccessSequence::Sequential { seq } else { nonseq };
         match width {
             // A 32-bit access is two 16-bit accesses; the second is sequential.
             AccessWidth::Word => first + (1 + seq),
             _ => first,
         }
+    }
+
+    /// Cycles for a prefetched instruction fetch from ROM. A 32-bit ARM opcode is
+    /// two halfwords; the second is always sequential.
+    fn prefetch_code_cost(
+        &mut self,
+        region: u32,
+        width: AccessWidth,
+        sequence: AccessSequence,
+    ) -> u32 {
+        let (nonseq, seq) = self.ws_waits(ws_index(region));
+        let halfword_cost = 1 + seq;
+        let mut first = if sequence == AccessSequence::Sequential {
+            self.prefetch.fetch_sequential()
+        } else {
+            // A branch flushes the buffer; the fetched opcode pays the full
+            // non-sequential access while the prefetcher restarts.
+            self.prefetch.restart(halfword_cost);
+            1 + nonseq
+        };
+        if width == AccessWidth::Word {
+            first += self.prefetch.fetch_sequential();
+        }
+        first
+    }
+
+    /// Advance the ROM prefetcher during `idle` guest cycles the CPU is not using
+    /// the cartridge bus.
+    pub fn step_prefetch(&mut self, idle: u32) {
+        self.prefetch.step(idle);
+    }
+
+    /// Take (and clear) the guest cycles DMA has stalled the CPU for.
+    pub fn take_dma_stall_cycles(&mut self) -> u64 {
+        std::mem::take(&mut self.dma_stall_cycles)
     }
 
     /// The (non-sequential, sequential) wait cycles for a gamepak wait-state
@@ -289,19 +334,29 @@ impl Bus {
         let mut dest = channel.internal_dest;
         let mut sequence = AccessSequence::NonSequential;
 
+        // Accumulate the transfer's read+write cycles (2N + 2(n-1)S).
+        let both_gamepak = is_gamepak(channel.internal_source) && is_gamepak(channel.internal_dest);
+        let mut transfer_cycles: u64 = 0;
+
         for _ in 0..channel.internal_count {
             let access = Access::dma(i as u8, AccessKind::Data, sequence);
             if is_32bit {
-                let value = self.read32(source, access, scheduler).value;
-                self.write32(dest, value, access, scheduler);
+                let read = self.read32(source, access, scheduler);
+                let write = self.write32(dest, read.value, access, scheduler);
+                transfer_cycles += (read.cycles + write.cycles) as u64;
             } else {
-                let value = self.read16(source, access, scheduler).value;
-                self.write16(dest, value, access, scheduler);
+                let read = self.read16(source, access, scheduler);
+                let write = self.write16(dest, read.value, access, scheduler);
+                transfer_cycles += (read.cycles + write.cycles) as u64;
             }
             source = source.wrapping_add(source_step);
             dest = dest.wrapping_add(dest_step);
             sequence = AccessSequence::Sequential;
         }
+
+        // Plus the DMA's internal processing: 2I, or 4I if both ends are gamepak.
+        transfer_cycles += if both_gamepak { 4 } else { 2 };
+        self.dma_stall_cycles += transfer_cycles;
 
         // Update internal pointers and handle repeat / auto-disable.
         let channel = &mut self.io.dma.channels[i];
@@ -338,6 +393,21 @@ fn dma_irq_source(i: usize) -> IrqSource {
 /// Value returned for reads of unmapped addresses. Real open-bus returns the
 /// last value on the bus; this is a placeholder until that is tracked.
 const OPEN_BUS: u32 = 0;
+
+/// The gamepak wait-state region (0/1/2) for a ROM address region.
+fn ws_index(region: u32) -> u32 {
+    match region {
+        0x08 | 0x09 => 0,
+        0x0A | 0x0B => 1,
+        _ => 2,
+    }
+}
+
+/// Whether an address is in gamepak memory (ROM or SRAM), for DMA internal-cycle
+/// accounting.
+fn is_gamepak(addr: u32) -> bool {
+    (0x08..=0x0F).contains(&(addr >> 24))
+}
 
 /// Only the CPU and DMA3 may access GamePak ROM.
 fn rom_accessible(master: AccessMaster) -> bool {
@@ -606,6 +676,70 @@ mod tests {
         for i in 0..4 {
             assert_eq!(b.read16(0x0300_0000 + i * 2, CPU, &mut s).value, 0xBEEF);
         }
+    }
+
+    #[test]
+    fn dma_charges_transfer_cycles() {
+        let (mut b, mut s) = bus();
+        // 2 words IWRAM -> IWRAM: reads 1+1, writes 1+1, plus 2I = 6.
+        b.write32(0x0400_00B0, 0x0300_0000, CPU, &mut s); // SAD
+        b.write32(0x0400_00B4, 0x0300_0100, CPU, &mut s); // DAD
+        b.write16(0x0400_00B8, 2, CPU, &mut s); // count
+        b.write16(0x0400_00BA, (1 << 15) | (1 << 10), CPU, &mut s); // enable, 32-bit, immediate
+        assert_eq!(b.take_dma_stall_cycles(), 6);
+        // Taking it clears the accumulator.
+        assert_eq!(b.take_dma_stall_cycles(), 0);
+    }
+
+    #[test]
+    fn dma_from_rom_uses_waitstates_and_extra_internal_cycles() {
+        let (mut b, mut s) = bus();
+        b.load_rom(vec![0; 64]);
+        // 4 halfwords ROM -> ROM: reads 5+3+3+3 = 14, writes 5+3+3+3 = 14,
+        // and both ends gamepak so 4I. Total 32. (DMA3 may source ROM.)
+        b.write32(0x0400_00D4, 0x0800_0000, CPU, &mut s); // DMA3 SAD
+        b.write32(0x0400_00D8, 0x0800_0100, CPU, &mut s); // DMA3 DAD
+        b.write16(0x0400_00DC, 4, CPU, &mut s); // count
+        b.write16(0x0400_00DE, 1 << 15, CPU, &mut s); // enable, 16-bit, immediate
+        assert_eq!(b.take_dma_stall_cycles(), 14 + 14 + 4);
+    }
+
+    #[test]
+    fn prefetch_speeds_sequential_opcode_fetches() {
+        let (mut b, mut s) = bus();
+        b.load_rom(vec![0; 64]);
+        b.write16(0x0400_0204, 1 << 14, CPU, &mut s); // WAITCNT: enable prefetch
+        let branch = Access::cpu(AccessKind::Instruction, AccessSequence::NonSequential);
+        let seq = Access::cpu(AccessKind::Instruction, AccessSequence::Sequential);
+
+        // A branch target pays the full non-sequential access and restarts the
+        // prefetcher.
+        assert_eq!(b.read16(0x0800_0000, branch, &mut s).cycles, 5);
+        // Give the prefetcher idle cycles to fill the buffer.
+        b.step_prefetch(20);
+        // Sequential fetches now hit the buffer at one cycle each.
+        assert_eq!(b.read16(0x0800_0002, seq, &mut s).cycles, 1);
+        assert_eq!(b.read16(0x0800_0004, seq, &mut s).cycles, 1);
+    }
+
+    #[test]
+    fn prefetch_only_helps_instruction_fetches() {
+        let (mut b, mut s) = bus();
+        b.load_rom(vec![0; 64]);
+        b.write16(0x0400_0204, 1 << 14, CPU, &mut s); // prefetch enabled
+        b.step_prefetch(50); // fill the buffer
+        // A data read from ROM ignores the prefetcher: full sequential wait.
+        let data_seq = Access::cpu(AccessKind::Data, AccessSequence::Sequential);
+        assert_eq!(b.read16(0x0800_0000, data_seq, &mut s).cycles, 3);
+    }
+
+    #[test]
+    fn prefetch_disabled_pays_full_sequential_waits() {
+        let (mut b, mut s) = bus();
+        b.load_rom(vec![0; 64]);
+        // Prefetch left disabled: sequential opcode fetch pays S (= 3 default).
+        let seq = Access::cpu(AccessKind::Instruction, AccessSequence::Sequential);
+        assert_eq!(b.read16(0x0800_0000, seq, &mut s).cycles, 3);
     }
 
     #[test]
