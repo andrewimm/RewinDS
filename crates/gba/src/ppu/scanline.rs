@@ -50,25 +50,45 @@ impl Ppu {
         mem: &PpuMemoryView<'_>,
         sink: &mut S,
     ) {
-        let state = self.latched;
-        sink.record_scanline(|| scanline_state_explanation(&state, y));
-
-        self.scratch.clear();
-        bg::generate(y, &state, &self.affine, mem, &mut self.scratch, sink);
-        obj::generate(y, &state, mem, &mut self.scratch, sink);
-        window::compute_line(y, &state, &self.scratch.obj, &mut self.scratch.window);
+        if self.segments.is_empty() {
+            self.latch_for_scanline();
+        }
+        let first_state = self.segments[0].state;
+        sink.record_scanline(|| scanline_state_explanation(&first_state, y));
 
         let backdrop = CandidatePixel::backdrop(mem.palette15(0));
         let row = y as usize * WIDTH;
-        for x in 0..WIDTH {
-            let set = compositor::gather(x, &self.scratch, backdrop, sink);
-            let resolved = priority::resolve(&set);
-            let effects_enabled = self.scratch.window.mask[x].effects;
-            let effect = effects::apply(resolved.top, resolved.second, &state.regs, effects_enabled);
-            self.framebuffer.pixels[row + x] = effect.color;
-            if sink.wants(x as u16) {
-                sink.record_resolved(x as u16, || resolved.explain());
-                sink.record_effect(x as u16, || effect.explain());
+        let count = self.segments.len();
+        // Render each span with the register state in effect across it. A line with
+        // no mid-line writes is a single full-width span, matching a plain latch.
+        for i in 0..count {
+            let seg = self.segments[i];
+            let x_start = seg.x_start as usize;
+            let x_end = if i + 1 < count {
+                self.segments[i + 1].x_start as usize
+            } else {
+                WIDTH
+            };
+            if x_start >= x_end {
+                continue;
+            }
+
+            self.scratch.clear();
+            bg::generate(y, &seg.state, &seg.affine, mem, &mut self.scratch, sink);
+            obj::generate(y, &seg.state, mem, &mut self.scratch, sink);
+            window::compute_line(y, &seg.state, &self.scratch.obj, &mut self.scratch.window);
+
+            for x in x_start..x_end {
+                let set = compositor::gather(x, &self.scratch, backdrop, sink);
+                let resolved = priority::resolve(&set);
+                let effects_enabled = self.scratch.window.mask[x].effects;
+                let effect =
+                    effects::apply(resolved.top, resolved.second, &seg.state.regs, effects_enabled);
+                self.framebuffer.pixels[row + x] = effect.color;
+                if sink.wants(x as u16) {
+                    sink.record_resolved(x as u16, || resolved.explain());
+                    sink.record_effect(x as u16, || effect.explain());
+                }
             }
         }
     }
@@ -93,9 +113,11 @@ impl Ppu {
         if x as usize >= WIDTH || y as usize >= HEIGHT {
             return Err(ExplainError::PixelOutsideFramebuffer { x, y });
         }
-        self.latch_for_scanline();
+        // Set the affine reference for line `y` before latching, so the single
+        // reconstructed segment captures it.
         self.affine.bg2 = self.affine_reference_for_line(0, y);
         self.affine.bg3 = self.affine_reference_for_line(1, y);
+        self.latch_for_scanline();
         let mut recorder = PixelRecorder::new(x);
         self.render_scanline(y, mem, &mut recorder);
         Ok(recorder.finish(self.frame_counter, y))
@@ -122,9 +144,9 @@ impl Ppu {
     /// A whole-scanline summary — the latched state plus the final line of pixels.
     pub fn inspect_scanline(&mut self, y: u16, mem: &PpuMemoryView<'_>) -> ScanlineExplanation {
         let y = y.min(HEIGHT as u16 - 1);
-        self.latch_for_scanline();
         self.affine.bg2 = self.affine_reference_for_line(0, y);
         self.affine.bg3 = self.affine_reference_for_line(1, y);
+        self.latch_for_scanline();
         let mut recorder = ScanlineRecorder::new();
         self.render_scanline(y, mem, &mut recorder);
         let state = recorder

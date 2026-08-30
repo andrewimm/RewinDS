@@ -658,6 +658,43 @@ mod tests {
     }
 
     #[test]
+    fn midscanline_register_write_splits_the_line() {
+        use crate::ppu::Color15;
+        use emu_core::Access;
+        let mut sys = System::new();
+        let cpu = Access::cpu_data();
+
+        // Mode 3, BG2 on; fill line 0 with green and set a blue backdrop.
+        sys.gba
+            .bus
+            .write16(0x0400_0000, 0x0003 | (1 << 10), cpu, &mut sys.scheduler);
+        for x in 0..240 {
+            let off = x * 2;
+            sys.gba.bus.memory.vram[off..off + 2].copy_from_slice(&0x03E0u16.to_le_bytes());
+        }
+        sys.gba.bus.memory.palette[0..2].copy_from_slice(&0x7C00u16.to_le_bytes());
+        sys.start_lcd();
+
+        // Partway through line 0's draw (pixel 120 = cycle 480), force-blank the
+        // display via a DISPCNT write.
+        sys.advance_time(480);
+        sys.gba.bus.write16(
+            0x0400_0000,
+            0x0003 | (1 << 10) | (1 << 7),
+            cpu,
+            &mut sys.scheduler,
+        );
+        // Render line 0 at its HBlank.
+        sys.advance_time(1006);
+
+        // Left of the split still shows BG2; right of it is force-blanked (backdrop).
+        assert_eq!(sys.framebuffer()[0], Color15(0x03E0));
+        assert_eq!(sys.framebuffer()[119], Color15(0x03E0));
+        assert_eq!(sys.framebuffer()[120], Color15(0x7C00));
+        assert_eq!(sys.framebuffer()[239], Color15(0x7C00));
+    }
+
+    #[test]
     fn stop_wakes_only_on_stop_sources() {
         let mut sys = System::new();
         sys.gba.bus.io.irq.set_ie(0xFFFF);

@@ -173,6 +173,7 @@ impl Io {
             0x000 => {
                 let merged = merge(self.video.read_dispcnt(), value, mask);
                 self.video.write_dispcnt(merged);
+                self.video.split_segment(scheduler.now());
                 false
             }
             0x004 => {
@@ -183,6 +184,7 @@ impl Io {
             // 0x006 VCOUNT is read-only.
             0x008..=0x054 => {
                 self.video.write_video_register(offset, value, mask);
+                self.video.split_segment(scheduler.now());
                 false
             }
             0x0B0..=0x0DF => {

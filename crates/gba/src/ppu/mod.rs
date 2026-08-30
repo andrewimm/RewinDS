@@ -38,6 +38,12 @@ pub struct Ppu {
     pub affine: state::AffineInternalState,
     pub framebuffer: state::Framebuffer,
     scratch: state::Scratch,
+    /// The current scanline split into spans of constant state (one span unless a
+    /// register is written mid-line).
+    segments: Vec<state::ScanlineSegment>,
+    /// Guest time at which the current scanline began, for mapping a mid-line
+    /// register write to the pixel it takes effect at.
+    line_start_time: Timestamp,
     frame_counter: u64,
 }
 
@@ -142,6 +148,7 @@ impl Ppu {
     /// Begin LCD timing at `now`, latching scanline 0's registers.
     pub fn start(&mut self, now: Timestamp, scheduler: &mut Scheduler<EventKind>) {
         self.timing.start(now, scheduler);
+        self.line_start_time = now;
         self.reload_affine_references();
         self.latch_for_scanline();
     }
@@ -157,6 +164,7 @@ impl Ppu {
     ) {
         self.timing.handle_event(event, irq, ctx);
         if matches!(event, PpuEvent::LineStart) {
+            self.line_start_time = ctx.now;
             let line = self.vcount() as usize;
             if line == 0 {
                 self.reload_affine_references();

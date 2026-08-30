@@ -266,6 +266,18 @@ pub struct LatchedState {
     pub mode: u8,
 }
 
+/// A horizontal span of a scanline governed by a single latched state. A scanline
+/// is one segment unless a video register is written partway across it, which
+/// splits it so the change takes effect from that pixel onward.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanlineSegment {
+    /// First screen column this segment covers; it runs to the next segment's
+    /// start (or the end of the line).
+    pub x_start: u16,
+    pub state: LatchedState,
+    pub affine: AffineInternalState,
+}
+
 impl LatchedState {
     /// Snapshot the live register block for a scanline.
     pub fn from_registers(regs: &Registers) -> LatchedState {
