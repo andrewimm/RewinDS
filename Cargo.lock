@@ -9,3 +9,10 @@ version = "0.1.0"
 [[package]]
 name = "emu-core"
 version = "0.1.0"
+
+[[package]]
+name = "gba"
+version = "0.1.0"
+dependencies = [
+ "emu-core",
+]
