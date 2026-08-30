@@ -37,6 +37,20 @@ impl<'a> PpuMemoryView<'a> {
         u16::from_le_bytes([self.vram[off], self.vram[off + 1]])
     }
 
+    /// Read a VRAM byte, returning 0 past the end of the region. Tiled backgrounds
+    /// can compute addresses beyond VRAM when misconfigured; this keeps that from
+    /// panicking (hardware would read stale/other memory).
+    #[inline]
+    pub fn vram_u8(&self, off: usize) -> u8 {
+        self.vram.get(off).copied().unwrap_or(0)
+    }
+
+    /// Read a little-endian VRAM halfword, guarded like [`Self::vram_u8`].
+    #[inline]
+    pub fn vram_u16(&self, off: usize) -> u16 {
+        u16::from_le_bytes([self.vram_u8(off), self.vram_u8(off + 1)])
+    }
+
     /// Read palette entry `index` as a 15-bit color (each entry is 2 bytes).
     #[inline]
     pub fn palette15(&self, index: usize) -> Color15 {

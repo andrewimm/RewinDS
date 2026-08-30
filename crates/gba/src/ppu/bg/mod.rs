@@ -2,6 +2,7 @@
 //! affine, or bitmap sampler, filling the per-layer scratch lines.
 
 pub mod bitmap;
+pub mod text;
 
 use super::debug::sink::ProvenanceSink;
 use super::memory::PpuMemoryView;
@@ -22,8 +23,20 @@ pub fn generate<S: ProvenanceSink>(
         return;
     }
     match state.mode {
-        // Modes 0-2 (text/affine tiled backgrounds) are not yet implemented.
-        0..=2 => {}
+        // Mode 0: four text backgrounds.
+        0 => {
+            for bg in 0..4 {
+                text::render_text_scanline(bg, y, state, mem, scratch, sink);
+            }
+        }
+        // Mode 1: BG0/BG1 text, BG2 affine (affine backgrounds not yet implemented).
+        1 => {
+            for bg in 0..2 {
+                text::render_text_scanline(bg, y, state, mem, scratch, sink);
+            }
+        }
+        // Mode 2: BG2/BG3 affine (not yet implemented).
+        2 => {}
         3 => bitmap::render_mode3(y, state, mem, scratch, sink),
         4 => bitmap::render_mode4(y, state, mem, scratch, sink),
         5 => bitmap::render_mode5(y, state, mem, scratch, sink),
