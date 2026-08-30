@@ -16,8 +16,9 @@ pub use bus::{Bus, Timed};
 use crate::condition::Condition;
 use crate::decode::decode_arm;
 use crate::instruction::arm::{
-    ArmOperation, Branch, BranchExchange, DataProcessing, DataProcessingOpcode, Operand2, ShiftKind,
-    ShiftSource,
+    ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
+    HalfwordKind, HalfwordOffset, HalfwordTransfer, Multiply, MultiplyLong, Operand2, ShiftKind,
+    ShiftSource, SingleOffset, SingleTransfer, Swap,
 };
 use crate::register::Register;
 
@@ -175,6 +176,9 @@ pub struct Cpu {
     branched: bool,
     /// Whether the next fetch is sequential with the previous access.
     sequential: bool,
+    /// Whether the current instruction performed a data access (which breaks the
+    /// fetch sequence for the next opcode).
+    data_access: bool,
 }
 
 impl Default for Cpu {
@@ -193,6 +197,7 @@ impl Cpu {
             cycles: 0,
             branched: false,
             sequential: false,
+            data_access: false,
         }
     }
 
@@ -210,10 +215,17 @@ impl Cpu {
         self.r[index]
     }
 
+    /// Set a register's raw value.
+    pub fn set_register(&mut self, index: usize, value: u32) {
+        self.r[index] = value;
+        if index == 15 {
+            self.sequential = false;
+        }
+    }
+
     /// Set the program counter and begin fetching from there.
     pub fn set_pc(&mut self, address: u32) {
-        self.r[15] = address;
-        self.sequential = false;
+        self.set_register(15, address);
     }
 
     /// The pipeline offset applied to `r15` when it is read as an operand.
@@ -257,6 +269,7 @@ impl Cpu {
     fn step_arm<B: Bus>(&mut self, bus: &mut B) {
         let pc = self.r[15] & !3;
         self.r[15] = pc;
+        self.data_access = false;
         let fetched = bus.fetch32(pc, self.sequential);
         self.cycles += fetched.cycles as u64;
 
@@ -269,7 +282,8 @@ impl Cpu {
             self.sequential = false;
         } else {
             self.r[15] = pc.wrapping_add(4);
-            self.sequential = true;
+            // A data access breaks the sequential fetch stream.
+            self.sequential = !self.data_access;
         }
     }
 
@@ -279,13 +293,252 @@ impl Cpu {
         self.sequential = true;
     }
 
-    fn execute_arm<B: Bus>(&mut self, operation: ArmOperation, _bus: &mut B) {
+    fn execute_arm<B: Bus>(&mut self, operation: ArmOperation, bus: &mut B) {
         match operation {
             ArmOperation::DataProcessing(op) => self.execute_data_processing(op),
             ArmOperation::Branch(op) => self.execute_branch(op),
             ArmOperation::BranchExchange(op) => self.execute_branch_exchange(op),
-            // Remaining classes are implemented in later phases.
+            ArmOperation::SingleTransfer(op) => self.execute_single_transfer(op, bus),
+            ArmOperation::HalfwordTransfer(op) => self.execute_halfword_transfer(op, bus),
+            ArmOperation::BlockTransfer(op) => self.execute_block_transfer(op, bus),
+            ArmOperation::Swap(op) => self.execute_swap(op, bus),
+            ArmOperation::Multiply(op) => self.execute_multiply(op, bus),
+            ArmOperation::MultiplyLong(op) => self.execute_multiply_long(op, bus),
+            // Mrs/Msr/SoftwareInterrupt/Undefined are implemented in later phases.
             _ => {}
+        }
+    }
+
+    /// Consume `count` internal cycles, advancing time and any ROM prefetcher.
+    fn internal_cycles<B: Bus>(&mut self, bus: &mut B, count: u32) {
+        self.cycles += count as u64;
+        bus.internal(count);
+    }
+
+    /// Apply the base-register writeback for a single/halfword transfer.
+    /// Post-indexed always writes back; pre-indexed writes back only with `W`.
+    fn apply_writeback(&mut self, pre_indexed: bool, writeback: bool, rn: Register, value: u32) {
+        if !pre_indexed || writeback {
+            self.set_reg(rn, value);
+        }
+    }
+
+    fn execute_single_transfer<B: Bus>(&mut self, op: SingleTransfer, bus: &mut B) {
+        self.data_access = true;
+        let base = self.reg(op.rn);
+        let offset = self.single_offset(&op.offset);
+        let offset_addr = if op.add {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+        let address = if op.pre_indexed { offset_addr } else { base };
+
+        if op.load {
+            let value = if op.byte {
+                let read = bus.load8(address, false);
+                self.cycles += read.cycles as u64;
+                read.value as u32
+            } else {
+                let read = bus.load32(address & !3, false);
+                self.cycles += read.cycles as u64;
+                // An unaligned word load rotates the aligned word into place.
+                read.value.rotate_right((address & 3) * 8)
+            };
+            self.internal_cycles(bus, 1); // the load-use internal cycle
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+            self.set_reg(op.rd, value); // rd after writeback, so it wins if rn == rd
+        } else {
+            // Storing r15 stores the address of this instruction plus 12.
+            let mut value = self.reg(op.rd);
+            if op.rd.is_pc() {
+                value = value.wrapping_add(4);
+            }
+            let cycles = if op.byte {
+                bus.store8(address, value as u8, false)
+            } else {
+                bus.store32(address & !3, value, false)
+            };
+            self.cycles += cycles as u64;
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+        }
+    }
+
+    fn execute_halfword_transfer<B: Bus>(&mut self, op: HalfwordTransfer, bus: &mut B) {
+        self.data_access = true;
+        let base = self.reg(op.rn);
+        let offset = match op.offset {
+            HalfwordOffset::Immediate(imm) => imm as u32,
+            HalfwordOffset::Register(rm) => self.reg(rm),
+        };
+        let offset_addr = if op.add {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+        let address = if op.pre_indexed { offset_addr } else { base };
+
+        if op.load {
+            let value = match op.kind {
+                HalfwordKind::UnsignedHalfword => {
+                    let read = bus.load16(address & !1, false);
+                    self.cycles += read.cycles as u64;
+                    let value = read.value as u32;
+                    if address & 1 != 0 {
+                        value.rotate_right(8)
+                    } else {
+                        value
+                    }
+                }
+                HalfwordKind::SignedByte => {
+                    let read = bus.load8(address, false);
+                    self.cycles += read.cycles as u64;
+                    read.value as i8 as i32 as u32
+                }
+                HalfwordKind::SignedHalfword => {
+                    let read = bus.load16(address & !1, false);
+                    self.cycles += read.cycles as u64;
+                    read.value as i16 as i32 as u32
+                }
+            };
+            self.internal_cycles(bus, 1);
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+            self.set_reg(op.rd, value);
+        } else {
+            // Only STRH stores; the signed kinds are load-only.
+            let cycles = bus.store16(address & !1, self.reg(op.rd) as u16, false);
+            self.cycles += cycles as u64;
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+        }
+    }
+
+    fn execute_block_transfer<B: Bus>(&mut self, op: BlockTransfer, bus: &mut B) {
+        self.data_access = true;
+        // An empty register list is an ARM7 edge case, not modeled yet.
+        let count = op.register_list.count_ones();
+        if count == 0 {
+            return;
+        }
+
+        let base = self.reg(op.rn);
+        // Registers always transfer lowest-first at the lowest address; the
+        // base and direction set where that block sits.
+        let (mut address, writeback_value) = if op.add {
+            let start = if op.pre_indexed { base.wrapping_add(4) } else { base };
+            (start, base.wrapping_add(count * 4))
+        } else {
+            let low = base.wrapping_sub(count * 4);
+            let start = if op.pre_indexed { low } else { low.wrapping_add(4) };
+            (start, low)
+        };
+
+        let mut sequential = false;
+        for i in 0..16 {
+            if op.register_list & (1 << i) == 0 {
+                continue;
+            }
+            let register = Register::new(i as u8);
+            if op.load {
+                let read = bus.load32(address, sequential);
+                self.cycles += read.cycles as u64;
+                self.set_reg(register, read.value);
+            } else {
+                // STM stores r15 as this instruction's address plus 12, and
+                // stores the base's old value (writeback happens afterwards).
+                let mut value = self.reg(register);
+                if register.is_pc() {
+                    value = value.wrapping_add(4);
+                }
+                self.cycles += bus.store32(address, value, sequential) as u64;
+            }
+            address = address.wrapping_add(4);
+            sequential = true;
+        }
+
+        if op.load {
+            self.internal_cycles(bus, 1);
+        }
+        if op.writeback {
+            // For LDM, a base loaded from memory keeps the loaded value.
+            let base_loaded = op.load && op.register_list & (1 << op.rn.index()) != 0;
+            if !base_loaded {
+                self.set_reg(op.rn, writeback_value);
+            }
+        }
+    }
+
+    fn execute_swap<B: Bus>(&mut self, op: Swap, bus: &mut B) {
+        self.data_access = true;
+        let address = self.reg(op.rn);
+        let loaded = if op.byte {
+            let read = bus.load8(address, false);
+            self.cycles += read.cycles as u64;
+            let stored = self.reg(op.rm) as u8;
+            self.cycles += bus.store8(address, stored, false) as u64;
+            read.value as u32
+        } else {
+            let read = bus.load32(address & !3, false);
+            self.cycles += read.cycles as u64;
+            let stored = self.reg(op.rm);
+            self.cycles += bus.store32(address & !3, stored, false) as u64;
+            read.value.rotate_right((address & 3) * 8)
+        };
+        self.internal_cycles(bus, 1);
+        self.set_reg(op.rd, loaded);
+    }
+
+    fn execute_multiply<B: Bus>(&mut self, op: Multiply, bus: &mut B) {
+        let rs = self.reg(op.rs);
+        let mut result = self.reg(op.rm).wrapping_mul(rs);
+        if op.accumulate {
+            result = result.wrapping_add(self.reg(op.rn));
+        }
+        self.set_reg(op.rd, result);
+        if op.set_flags {
+            self.cpsr.set_n(result & (1 << 31) != 0);
+            self.cpsr.set_z(result == 0);
+            // C is left unpredictable (unchanged here); V is unaffected.
+        }
+        let extra = if op.accumulate { 1 } else { 0 };
+        self.internal_cycles(bus, multiply_cycles(rs) + extra);
+    }
+
+    fn execute_multiply_long<B: Bus>(&mut self, op: MultiplyLong, bus: &mut B) {
+        let rm = self.reg(op.rm);
+        let rs = self.reg(op.rs);
+        let mut result = if op.signed {
+            ((rm as i32 as i64).wrapping_mul(rs as i32 as i64)) as u64
+        } else {
+            (rm as u64).wrapping_mul(rs as u64)
+        };
+        if op.accumulate {
+            let acc = ((self.reg(op.rd_hi) as u64) << 32) | self.reg(op.rd_lo) as u64;
+            result = result.wrapping_add(acc);
+        }
+        self.set_reg(op.rd_lo, result as u32);
+        self.set_reg(op.rd_hi, (result >> 32) as u32);
+        if op.set_flags {
+            self.cpsr.set_n(result & (1 << 63) != 0);
+            self.cpsr.set_z(result == 0);
+        }
+        let extra = 1 + if op.accumulate { 1 } else { 0 };
+        self.internal_cycles(bus, multiply_cycles(rs) + extra);
+    }
+
+    /// The offset for a single data transfer: an immediate, or a register with an
+    /// immediate barrel shift (this class cannot use a register shift amount).
+    fn single_offset(&self, offset: &SingleOffset) -> u32 {
+        match offset {
+            SingleOffset::Immediate(imm) => *imm as u32,
+            SingleOffset::Register { rm, shift } => {
+                let value = self.reg(*rm);
+                match shift.source {
+                    ShiftSource::Immediate(amount) => {
+                        shift_by_immediate(shift.kind, value, amount, self.cpsr.c()).0
+                    }
+                    ShiftSource::Register(_) => value,
+                }
+            }
         }
     }
 
@@ -496,6 +749,20 @@ fn ror(value: u32, amount: u32) -> (u32, bool) {
     let result = value.rotate_right(amount);
     let carry = result & (1 << 31) != 0;
     (result, carry)
+}
+
+/// The `m` internal cycles a multiply takes, from how many high bytes of the
+/// `rs` operand are all-zero or all-one.
+fn multiply_cycles(rs: u32) -> u32 {
+    if rs & 0xFFFF_FF00 == 0 || rs & 0xFFFF_FF00 == 0xFFFF_FF00 {
+        1
+    } else if rs & 0xFFFF_0000 == 0 || rs & 0xFFFF_0000 == 0xFFFF_0000 {
+        2
+    } else if rs & 0xFF00_0000 == 0 || rs & 0xFF00_0000 == 0xFF00_0000 {
+        3
+    } else {
+        4
+    }
 }
 
 #[cfg(test)]

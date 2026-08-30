@@ -145,6 +145,135 @@ fn branch_and_link_sets_return_address() {
 }
 
 #[test]
+fn store_then_load_word() {
+    let mut bus = TestBus::new(0x100);
+    // mov r0, #0x40 ; mov r1, #0xAB ; str r1, [r0] ; ldr r2, [r0]
+    bus.load(
+        0,
+        &[0xE3A0_0040, 0xE3A0_10AB, 0xE580_1000, 0xE590_2000],
+    );
+    let mut cpu = Cpu::new();
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(2), 0xAB);
+    assert_eq!(bus.read(0x40, 4), 0xAB);
+}
+
+#[test]
+fn push_and_pop_via_block_transfer() {
+    let mut bus = TestBus::new(0x100);
+    // mov r0, #0x80 (sp) ; mov r1, #0x11 ; mov r2, #0x22
+    // stmdb r0!, {r1, r2}   (push)
+    // mov r1, #0 ; mov r2, #0
+    // ldmia r0!, {r1, r2}   (pop)
+    bus.load(
+        0,
+        &[
+            0xE3A0_0080,
+            0xE3A0_1011,
+            0xE3A0_2022,
+            0xE920_0006, // stmdb r0!, {r1, r2}
+            0xE3A0_1000,
+            0xE3A0_2000,
+            0xE8B0_0006, // ldmia r0!, {r1, r2}
+        ],
+    );
+    let mut cpu = Cpu::new();
+    for _ in 0..7 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(1), 0x11);
+    assert_eq!(cpu.register(2), 0x22);
+    assert_eq!(cpu.register(0), 0x80); // pushed two, popped two
+}
+
+#[test]
+fn multiply_and_accumulate() {
+    let mut bus = TestBus::new(0x100);
+    // mov r1, #6 ; mov r2, #7 ; mul r0, r1, r2 ; mov r3, #1 ; mla r4, r1, r2, r3
+    bus.load(
+        0,
+        &[
+            0xE3A0_1006,
+            0xE3A0_2007,
+            0xE000_0291, // mul r0, r1, r2
+            0xE3A0_3001,
+            0xE024_3192, // mla r4, r2, r1, r3
+        ],
+    );
+    let mut cpu = Cpu::new();
+    for _ in 0..5 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(0), 42);
+    assert_eq!(cpu.register(4), 43); // 6*7 + 1
+}
+
+#[test]
+fn halfword_and_signed_loads() {
+    let mut bus = TestBus::new(0x100);
+    bus.write(0x40, 0x8123, 2); // a halfword with the sign bit set
+    // mov r0, #0x40 ; ldrh r1, [r0] ; ldrsh r2, [r0] ; ldrsb r3, [r0]
+    bus.load(
+        0,
+        &[0xE3A0_0040, 0xE1D0_10B0, 0xE1D0_20F0, 0xE1D0_30D0],
+    );
+    let mut cpu = Cpu::new();
+    for _ in 0..4 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(1), 0x8123); // zero-extended halfword
+    assert_eq!(cpu.register(2), 0xFFFF_8123); // sign-extended halfword
+    assert_eq!(cpu.register(3), 0x0000_0023); // low byte, sign of 0x23 is clear
+}
+
+#[test]
+fn swap_word() {
+    let mut bus = TestBus::new(0x100);
+    bus.write(0x40, 0xCAFE, 4);
+    // mov r0, #0x40 ; mov r1, #0x99 ; swp r2, r1, [r0]
+    bus.load(0, &[0xE3A0_0040, 0xE3A0_1099, 0xE100_2091]);
+    let mut cpu = Cpu::new();
+    for _ in 0..3 {
+        cpu.step(&mut bus);
+    }
+    assert_eq!(cpu.register(2), 0xCAFE); // old memory into rd
+    assert_eq!(bus.read(0x40, 4), 0x99); // rm into memory
+}
+
+#[test]
+fn sum_array_program() {
+    // The exact bytes clang produced for crates/arm/tests/fixtures/sum_array.s.
+    let mut bus = TestBus::new(0x200);
+    bus.load(
+        0,
+        &[
+            0xE3A0_2000,
+            0xE351_0000,
+            0x0A00_0003,
+            0xE490_3004,
+            0xE082_2003,
+            0xE251_1001,
+            0x1AFF_FFFB,
+            0xE1A0_0002,
+            0xE12F_FF1E,
+        ],
+    );
+    // An array of three words at 0x40.
+    bus.write(0x40, 10, 4);
+    bus.write(0x44, 20, 4);
+    bus.write(0x48, 30, 4);
+
+    let mut cpu = Cpu::new();
+    cpu.set_register(0, 0x40); // ptr
+    cpu.set_register(1, 3); // count
+    cpu.set_register(14, 0x1000); // return address sentinel
+    run_to(&mut cpu, &mut bus, 0x1000, 200);
+    assert_eq!(cpu.register(0), 60); // 10 + 20 + 30
+}
+
+#[test]
 fn sum_loop() {
     let mut bus = TestBus::new(0x100);
     // mov r0, #0        ; sum = 0
