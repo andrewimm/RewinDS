@@ -35,7 +35,7 @@ impl TimerId {
         self as usize
     }
 
-    fn from_index(index: usize) -> TimerId {
+    pub fn from_index(index: usize) -> TimerId {
         match index {
             0 => TimerId::Timer0,
             1 => TimerId::Timer1,
@@ -167,6 +167,27 @@ impl Timers {
     /// Read `TMxCNT_L`: the current counter value at `now`.
     pub fn read_counter(&self, id: TimerId, now: Timestamp) -> u16 {
         self.timers[id.index()].live_counter(now)
+    }
+
+    /// The reload value written to `TMxCNT_L` (as opposed to the live counter a
+    /// read of that address returns). Used to merge partial-width writes.
+    pub fn read_reload(&self, id: TimerId) -> u16 {
+        self.timers[id.index()].reload
+    }
+
+    /// Reconstruct `TMxCNT_H` from the timer's parsed state.
+    pub fn read_control(&self, id: TimerId) -> u16 {
+        let t = &self.timers[id.index()];
+        let prescaler = match t.prescaler_shift {
+            6 => 1,
+            8 => 2,
+            10 => 3,
+            _ => 0,
+        };
+        prescaler
+            | ((t.cascade as u16) << 2)
+            | ((t.irq_enabled as u16) << 6)
+            | ((t.enabled as u16) << 7)
     }
 
     /// Write `TMxCNT_H`: prescaler (bits 0-1), count-up (bit 2, not on Timer 0),

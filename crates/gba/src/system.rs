@@ -42,7 +42,7 @@ impl System {
     /// Begin LCD timing, starting the PPU's continuous scanline schedule.
     pub fn start_lcd(&mut self) {
         let now = self.scheduler.now();
-        self.gba.ppu.start(now, &mut self.scheduler);
+        self.gba.bus.io.video.start(now, &mut self.scheduler);
     }
 
     /// Advance the timeline to `target`, dispatching every event due up to it.
@@ -114,8 +114,10 @@ mod tests {
     /// Configure Timer0 to overflow at `256` with its overflow IRQ enabled.
     fn arm_timer0(sys: &mut System) {
         let now = sys.scheduler.now();
-        sys.gba.timers.write_reload(TimerId::Timer0, 0xFF00);
+        sys.gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFF00);
         sys.gba
+            .bus
+            .io
             .timers
             .write_control(TimerId::Timer0, START | IRQ, now, &mut sys.scheduler);
     }
@@ -123,8 +125,8 @@ mod tests {
     #[test]
     fn halt_wakes_on_timer_irq_without_cpu_work() {
         let mut sys = System::new();
-        sys.gba.irq.set_ie(IrqSource::Timer0.mask());
-        sys.gba.irq.set_ime(true);
+        sys.gba.bus.io.irq.set_ie(IrqSource::Timer0.mask());
+        sys.gba.bus.io.irq.set_ime(true);
         arm_timer0(&mut sys);
 
         sys.gba.write_haltcnt(0x00); // Halt
@@ -134,15 +136,15 @@ mod tests {
         // The timeline reached the overflow with no instruction execution.
         assert_eq!(sys.scheduler.now(), 256);
         assert!(sys.gba.is_running());
-        assert!(sys.gba.irq.line_asserted());
+        assert!(sys.gba.bus.io.irq.line_asserted());
     }
 
     #[test]
     fn halt_wakes_even_when_ime_is_off() {
         // Halt wakes on IE & IF regardless of IME; IME only gates acceptance.
         let mut sys = System::new();
-        sys.gba.irq.set_ie(IrqSource::Timer0.mask());
-        sys.gba.irq.set_ime(false);
+        sys.gba.bus.io.irq.set_ie(IrqSource::Timer0.mask());
+        sys.gba.bus.io.irq.set_ime(false);
         arm_timer0(&mut sys);
         sys.gba.write_haltcnt(0x00);
 
@@ -150,8 +152,8 @@ mod tests {
         assert_eq!(sys.scheduler.now(), 256);
         assert!(sys.gba.is_running());
         // Woke, but the CPU would not accept the IRQ with IME clear.
-        assert!(sys.gba.irq.pending());
-        assert!(!sys.gba.irq.line_asserted());
+        assert!(sys.gba.bus.io.irq.pending());
+        assert!(!sys.gba.bus.io.irq.line_asserted());
     }
 
     #[test]
@@ -159,7 +161,7 @@ mod tests {
         let mut sys = System::new();
         // The overflow requests a Timer0 IRQ, but IE has it disabled, so the
         // machine stays halted.
-        sys.gba.irq.set_ie(0);
+        sys.gba.bus.io.irq.set_ie(0);
         arm_timer0(&mut sys);
         sys.gba.write_haltcnt(0x00);
 
@@ -167,8 +169,8 @@ mod tests {
         assert_eq!(sys.scheduler.now(), 256);
         assert!(sys.gba.is_low_power());
         // IF records the request even though it did not wake the CPU.
-        assert_ne!(sys.gba.irq.iflags() & IrqSource::Timer0.mask(), 0);
-        assert!(!sys.gba.irq.pending());
+        assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::Timer0.mask(), 0);
+        assert!(!sys.gba.bus.io.irq.pending());
     }
 
     #[test]
@@ -185,92 +187,92 @@ mod tests {
 
         // Line 0, before HBlank (which begins at cycle 1006).
         sys.run_until(1005);
-        assert_eq!(sys.gba.ppu.vcount(), 0);
-        assert!(!sys.gba.ppu.hblank_flag());
+        assert_eq!(sys.gba.bus.io.video.vcount(), 0);
+        assert!(!sys.gba.bus.io.video.hblank_flag());
 
         // HBlank flag is raised at 1006.
         sys.run_until(1006);
-        assert!(sys.gba.ppu.hblank_flag());
+        assert!(sys.gba.bus.io.video.hblank_flag());
 
         // The next line starts at 1232: VCOUNT advances, HBlank flag clears.
         sys.run_until(1232);
-        assert_eq!(sys.gba.ppu.vcount(), 1);
-        assert!(!sys.gba.ppu.hblank_flag());
+        assert_eq!(sys.gba.bus.io.video.vcount(), 1);
+        assert!(!sys.gba.bus.io.video.hblank_flag());
 
         // VCOUNT tracks elapsed lines.
         sys.run_until(100 * 1232);
-        assert_eq!(sys.gba.ppu.vcount(), 100);
+        assert_eq!(sys.gba.bus.io.video.vcount(), 100);
     }
 
     #[test]
     fn vblank_sets_flag_and_requests_irq() {
         let mut sys = System::new();
-        sys.gba.irq.set_ie(IrqSource::VBlank.mask());
-        sys.gba.irq.set_ime(true);
-        sys.gba.ppu.write_dispstat(1 << 3); // VBlank IRQ enable
+        sys.gba.bus.io.irq.set_ie(IrqSource::VBlank.mask());
+        sys.gba.bus.io.irq.set_ime(true);
+        sys.gba.bus.io.video.write_dispstat(1 << 3); // VBlank IRQ enable
         sys.start_lcd();
 
         // Just before VBlank (line 160 starts at 160 * 1232).
         sys.run_until(159 * 1232);
-        assert!(!sys.gba.ppu.vblank_flag());
-        assert_eq!(sys.gba.irq.iflags() & IrqSource::VBlank.mask(), 0);
+        assert!(!sys.gba.bus.io.video.vblank_flag());
+        assert_eq!(sys.gba.bus.io.irq.iflags() & IrqSource::VBlank.mask(), 0);
 
         // Entering line 160 raises the flag and the interrupt.
         sys.run_until(160 * 1232);
-        assert_eq!(sys.gba.ppu.vcount(), 160);
-        assert!(sys.gba.ppu.vblank_flag());
-        assert!(sys.gba.irq.line_asserted());
+        assert_eq!(sys.gba.bus.io.video.vcount(), 160);
+        assert!(sys.gba.bus.io.video.vblank_flag());
+        assert!(sys.gba.bus.io.irq.line_asserted());
     }
 
     #[test]
     fn vcount_match_requests_irq_on_the_selected_line() {
         let mut sys = System::new();
-        sys.gba.irq.set_ie(IrqSource::VCounterMatch.mask());
-        sys.gba.irq.set_ime(true);
+        sys.gba.bus.io.irq.set_ie(IrqSource::VCounterMatch.mask());
+        sys.gba.bus.io.irq.set_ime(true);
         // LYC = 100, V-counter IRQ enabled.
-        sys.gba.ppu.write_dispstat((100 << 8) | (1 << 5));
+        sys.gba.bus.io.video.write_dispstat((100 << 8) | (1 << 5));
         sys.start_lcd();
 
         sys.run_until(99 * 1232);
-        assert!(!sys.gba.ppu.vcount_match());
-        assert_eq!(sys.gba.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
+        assert!(!sys.gba.bus.io.video.vcount_match());
+        assert_eq!(sys.gba.bus.io.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
 
         sys.run_until(100 * 1232);
-        assert!(sys.gba.ppu.vcount_match());
-        assert_ne!(sys.gba.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
+        assert!(sys.gba.bus.io.video.vcount_match());
+        assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
     }
 
     #[test]
     fn hblank_irq_fires_every_scanline_including_vblank() {
         let mut sys = System::new();
-        sys.gba.irq.set_ie(IrqSource::HBlank.mask());
-        sys.gba.ppu.write_dispstat(1 << 4); // HBlank IRQ enable
+        sys.gba.bus.io.irq.set_ie(IrqSource::HBlank.mask());
+        sys.gba.bus.io.video.write_dispstat(1 << 4); // HBlank IRQ enable
         sys.start_lcd();
 
         // Line 0 HBlank.
         sys.run_until(1006);
-        assert_ne!(sys.gba.irq.iflags() & IrqSource::HBlank.mask(), 0);
-        sys.gba.irq.acknowledge(IrqSource::HBlank.mask());
+        assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::HBlank.mask(), 0);
+        sys.gba.bus.io.irq.acknowledge(IrqSource::HBlank.mask());
 
         // A VBlank scanline (line 200) still produces an HBlank interrupt.
         sys.run_until(200 * 1232 + 1006);
-        assert_eq!(sys.gba.ppu.vcount(), 200);
-        assert_ne!(sys.gba.irq.iflags() & IrqSource::HBlank.mask(), 0);
+        assert_eq!(sys.gba.bus.io.video.vcount(), 200);
+        assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::HBlank.mask(), 0);
     }
 
     #[test]
     fn stop_wakes_only_on_stop_sources() {
         let mut sys = System::new();
-        sys.gba.irq.set_ie(0xFFFF);
+        sys.gba.bus.io.irq.set_ie(0xFFFF);
         sys.gba.write_haltcnt(0x80); // Stop
-        assert_eq!(sys.gba.power_state(), crate::machine::PowerState::Stopped);
+        assert_eq!(sys.gba.power_state(), crate::io::PowerState::Stopped);
 
         // A timer interrupt does not terminate Stop mode.
-        sys.gba.irq.request(IrqSource::Timer0);
+        sys.gba.bus.io.irq.request(IrqSource::Timer0);
         assert!(!sys.gba.should_wake());
 
         // A keypad interrupt does.
-        sys.gba.irq.request(IrqSource::Keypad);
+        sys.gba.bus.io.irq.request(IrqSource::Keypad);
         assert!(sys.gba.should_wake());
     }
 }

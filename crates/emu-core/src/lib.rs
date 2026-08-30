@@ -5,9 +5,11 @@
 //! machines are built on — most centrally a [`Scheduler`] that is generic over
 //! the event payload, so each machine supplies its own event kinds and devices.
 
+pub mod bus;
 pub mod scheduler;
 pub mod time;
 
+pub use bus::{Access, AccessKind, AccessMaster, AccessSequence, AccessWidth, BusResult};
 pub use scheduler::{
     EventContext, EventHandle, EventHandler, ScheduledEvent, Scheduler,
 };

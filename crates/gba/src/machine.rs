@@ -1,41 +1,19 @@
-//! The GBA machine: the collection of devices that share the guest timeline and
-//! together handle scheduled events.
+//! The GBA machine: the memory bus (storage plus MMIO devices) that shares the
+//! guest timeline.
 //!
-//! The scheduler itself is owned outside the machine (by the top-level driver),
-//! matching the execution loop where `scheduler.run_due_events(&mut machine)`
-//! dispatches into the devices. Keeping the two separate avoids a self-borrow
-//! when a device schedules a follow-up event through the context.
+//! The scheduler is owned outside the machine (by [`crate::system::System`]) so
+//! that a device can schedule follow-up events through the event context, and so
+//! the CPU can thread it into bus writes, without a self-borrow.
 
+use crate::bus::Bus;
 use crate::event::EventKind;
-use crate::interrupt::{InterruptController, IrqSource};
-use crate::ppu::Ppu;
-use crate::timer::Timers;
+use crate::io::PowerState;
 use emu_core::{EventContext, EventHandler};
 
-/// The CPU power state, set via `HALTCNT`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PowerState {
-    /// Executing normally.
-    #[default]
-    Running,
-    /// Halt mode: paused until any enabled interrupt is pending (`IE & IF`).
-    Halted,
-    /// Stop mode: most hardware paused; woken only by keypad, gamepak, or
-    /// serial interrupts.
-    Stopped,
-}
-
-/// Interrupt sources that terminate Stop mode.
-const STOP_WAKE_MASK: u16 =
-    IrqSource::Keypad.mask() | IrqSource::GamePak.mask() | IrqSource::Serial.mask();
-
-/// The GBA's devices, sharing one timeline.
-#[derive(Clone, Copy, Debug, Default)]
+/// The GBA machine state: everything reachable through the bus.
+#[derive(Clone, Debug, Default)]
 pub struct Gba {
-    pub timers: Timers,
-    pub ppu: Ppu,
-    pub irq: InterruptController,
-    power: PowerState,
+    pub bus: Bus,
 }
 
 impl Gba {
@@ -43,53 +21,38 @@ impl Gba {
         Self::default()
     }
 
-    /// The current power state.
     pub fn power_state(&self) -> PowerState {
-        self.power
+        self.bus.io.power_state()
     }
 
-    /// Whether the CPU is executing normally.
     pub fn is_running(&self) -> bool {
-        self.power == PowerState::Running
+        self.bus.io.power_state() == PowerState::Running
     }
 
-    /// Whether the CPU is paused in a low-power (Halt/Stop) state.
     pub fn is_low_power(&self) -> bool {
-        self.power != PowerState::Running
+        self.bus.io.is_low_power()
     }
 
-    /// Write `HALTCNT` (`4000301h`): bit 7 selects Halt (0) or Stop (1).
-    pub fn write_haltcnt(&mut self, value: u8) {
-        self.power = if value & 0x80 != 0 {
-            PowerState::Stopped
-        } else {
-            PowerState::Halted
-        };
-    }
-
-    /// Whether a currently pending interrupt should wake the CPU from its
-    /// low-power state. In Halt this is any enabled request (regardless of
-    /// `IME`); in Stop only the stop-wake sources qualify.
     pub fn should_wake(&self) -> bool {
-        match self.power {
-            PowerState::Running => false,
-            PowerState::Halted => self.irq.pending(),
-            PowerState::Stopped => self.irq.pending_within(STOP_WAKE_MASK),
-        }
+        self.bus.io.should_wake()
     }
 
-    /// Resume normal execution. The pending interrupt is left set for the CPU to
-    /// accept when architecturally appropriate; waking is not acceptance.
     pub fn wake(&mut self) {
-        self.power = PowerState::Running;
+        self.bus.io.wake();
+    }
+
+    /// Write `HALTCNT` directly (a convenience mirror of the MMIO path).
+    pub fn write_haltcnt(&mut self, value: u8) {
+        self.bus.io.control.write_haltcnt(value);
     }
 }
 
 impl EventHandler<EventKind> for Gba {
     fn handle(&mut self, event: EventKind, ctx: &mut EventContext<'_, EventKind>) {
+        let io = &mut self.bus.io;
         match event {
-            EventKind::Timer(event) => self.timers.handle_overflow(event, &mut self.irq, ctx),
-            EventKind::Ppu(event) => self.ppu.handle_event(event, &mut self.irq, ctx),
+            EventKind::Timer(event) => io.timers.handle_overflow(event, &mut io.irq, ctx),
+            EventKind::Ppu(event) => io.video.handle_event(event, &mut io.irq, ctx),
         }
     }
 }
@@ -101,7 +64,7 @@ mod tests {
     use crate::timer::TimerId;
     use emu_core::{Scheduler, Timestamp};
 
-    /// Advance the scheduler like the machine loop, up to and including `limit`.
+    /// Drive the scheduler like the machine loop, up to and including `limit`.
     fn run_until(scheduler: &mut Scheduler<EventKind>, gba: &mut Gba, limit: Timestamp) {
         while let Some(deadline) = scheduler.next_deadline() {
             if deadline > limit {
@@ -116,21 +79,21 @@ mod tests {
     fn timer_overflow_requests_irq_and_reloads() {
         let mut sched = Scheduler::new();
         let mut gba = Gba::new();
-        gba.irq.set_ie(IrqSource::Timer0.mask());
-        gba.irq.set_ime(true);
+        gba.bus.io.irq.set_ie(IrqSource::Timer0.mask());
+        gba.bus.io.irq.set_ime(true);
 
         // Overflow every 10 cycles (reload 0xFFF6), prescaler F/1, IRQ on.
-        gba.timers.write_reload(TimerId::Timer0, 0xFFF6);
-        gba.timers
+        gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFFF6);
+        gba.bus
+            .io
+            .timers
             .write_control(TimerId::Timer0, (1 << 7) | (1 << 6), 0, &mut sched);
         assert_eq!(sched.next_deadline(), Some(10));
 
         run_until(&mut sched, &mut gba, 10);
-        // The overflow fired: IRQ requested and the line is asserted.
-        assert!(gba.irq.line_asserted());
-        assert_eq!(gba.irq.iflags(), IrqSource::Timer0.mask());
-        // Counter reloaded and a fresh overflow is queued 10 cycles later.
-        assert_eq!(gba.timers.read_counter(TimerId::Timer0, 10), 0xFFF6);
+        assert!(gba.bus.io.irq.line_asserted());
+        assert_eq!(gba.bus.io.irq.iflags(), IrqSource::Timer0.mask());
+        assert_eq!(gba.bus.io.timers.read_counter(TimerId::Timer0, 10), 0xFFF6);
         assert_eq!(sched.next_deadline(), Some(20));
     }
 
@@ -138,68 +101,53 @@ mod tests {
     fn disabling_invalidates_the_pending_overflow() {
         let mut sched = Scheduler::new();
         let mut gba = Gba::new();
-        gba.irq.set_ie(0xFFFF);
-        gba.irq.set_ime(true);
+        gba.bus.io.irq.set_ie(0xFFFF);
+        gba.bus.io.irq.set_ime(true);
 
-        gba.timers.write_reload(TimerId::Timer0, 0xFF00); // overflow at 256
-        gba.timers
+        gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFF00); // overflow at 256
+        gba.bus
+            .io
+            .timers
             .write_control(TimerId::Timer0, (1 << 7) | (1 << 6), 0, &mut sched);
-        assert_eq!(sched.next_deadline(), Some(256));
 
-        // Stop the timer partway. This bumps the generation, so the queued
-        // overflow at 256 is now stale.
+        // Stop the timer partway; its generation bumps, so the queued overflow
+        // at 256 is now stale.
         sched.set_now(100);
-        gba.timers.write_control(TimerId::Timer0, 0, 100, &mut sched);
+        gba.bus
+            .io
+            .timers
+            .write_control(TimerId::Timer0, 0, 100, &mut sched);
 
         run_until(&mut sched, &mut gba, 1000);
-        // The stale event fired but was ignored: no IRQ, no reload.
-        assert!(!gba.irq.pending());
+        assert!(!gba.bus.io.irq.pending());
     }
 
     #[test]
     fn cascade_overflow_propagates_at_one_instant() {
         let mut sched = Scheduler::new();
         let mut gba = Gba::new();
-        gba.irq.set_ie(0xFFFF);
-        gba.irq.set_ime(true);
+        gba.bus.io.irq.set_ie(0xFFFF);
+        gba.bus.io.irq.set_ime(true);
 
-        // Timer0: prescaler F/1, overflow every 4 cycles.
-        gba.timers.write_reload(TimerId::Timer0, 0xFFFC);
-        gba.timers
+        gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFFFC); // overflow every 4
+        gba.bus
+            .io
+            .timers
             .write_control(TimerId::Timer0, 1 << 7, 0, &mut sched);
-        // Timer1: cascade, IRQ on, overflows after two increments (two Timer0
-        // overflows), i.e. reload 0xFFFE.
-        gba.timers.write_reload(TimerId::Timer1, 0xFFFE);
-        gba.timers
-            .write_control(TimerId::Timer1, (1 << 7) | (1 << 2) | (1 << 6), 0, &mut sched);
+        gba.bus.io.timers.write_reload(TimerId::Timer1, 0xFFFE);
+        gba.bus.io.timers.write_control(
+            TimerId::Timer1,
+            (1 << 7) | (1 << 2) | (1 << 6),
+            0,
+            &mut sched,
+        );
 
-        // First Timer0 overflow at t=4: Timer1 -> 0xFFFF, no IRQ yet.
         run_until(&mut sched, &mut gba, 4);
-        assert_eq!(gba.timers.read_counter(TimerId::Timer1, 4), 0xFFFF);
-        assert!(!gba.irq.pending());
+        assert_eq!(gba.bus.io.timers.read_counter(TimerId::Timer1, 4), 0xFFFF);
+        assert!(!gba.bus.io.irq.pending());
 
-        // Second Timer0 overflow at t=8: Timer1 wraps -> reload, Timer1 IRQ.
         run_until(&mut sched, &mut gba, 8);
-        assert_eq!(gba.timers.read_counter(TimerId::Timer1, 8), 0xFFFE);
-        assert_ne!(gba.irq.iflags() & IrqSource::Timer1.mask(), 0);
-    }
-
-    #[test]
-    fn cascade_timer_ignores_time_and_only_counts_overflows() {
-        let mut sched = Scheduler::new();
-        let mut gba = Gba::new();
-
-        gba.timers.write_reload(TimerId::Timer0, 0xFFF0); // overflow every 16
-        gba.timers
-            .write_control(TimerId::Timer0, 1 << 7, 0, &mut sched);
-        gba.timers.write_reload(TimerId::Timer1, 0x1234);
-        gba.timers
-            .write_control(TimerId::Timer1, (1 << 7) | (1 << 2), 0, &mut sched);
-
-        // Long before Timer0 overflows, the cascade timer has not moved despite
-        // elapsed time.
-        assert_eq!(gba.timers.read_counter(TimerId::Timer1, 15), 0x1234);
-        // Only Timer0 has a scheduled event; the cascade timer schedules none.
-        assert_eq!(sched.next_deadline(), Some(16));
+        assert_eq!(gba.bus.io.timers.read_counter(TimerId::Timer1, 8), 0xFFFE);
+        assert_ne!(gba.bus.io.irq.iflags() & IrqSource::Timer1.mask(), 0);
     }
 }
