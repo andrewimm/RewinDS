@@ -60,15 +60,19 @@ pub fn render_text_scanline<S: ProvenanceSink>(
     let screenblocks_wide = tiles_w / 32;
     let hofs = state.regs.bg_hofs[bg] as usize;
     let vofs = state.regs.bg_vofs[bg] as usize;
+    let (mosaic_x, mosaic_y, mosaic) = super::bg_mosaic_factors(state, bg);
 
-    // The vertical coordinate is constant across the scanline.
-    let source_y = (y as usize + vofs) & (bg_h - 1);
+    // The vertical coordinate is constant across the scanline; mosaic snaps it to
+    // the top of its block.
+    let y_snapped = y as usize - (y as usize % mosaic_y);
+    let source_y = (y_snapped + vofs) & (bg_h - 1);
     let tile_y = source_y / 8;
     let in_tile_y = source_y % 8;
     let layer = LayerId::bg(bg);
 
     for x in 0..WIDTH {
-        let source_x = (x + hofs) & (bg_w - 1);
+        let x_snapped = x - (x % mosaic_x);
+        let source_x = (x_snapped + hofs) & (bg_w - 1);
         let tile_x = source_x / 8;
         let in_tile_x = source_x % 8;
 
@@ -106,12 +110,16 @@ pub fn render_text_scanline<S: ProvenanceSink>(
         };
         let color = mem.palette15(palette_entry);
 
+        let flags = PixelFlags {
+            mosaic,
+            ..PixelFlags::default()
+        };
         if opaque {
             scratch.bg[bg].pixels[x] = Some(CandidatePixel {
                 color,
                 layer,
                 priority,
-                flags: PixelFlags::default(),
+                flags,
             });
         }
 
@@ -120,7 +128,7 @@ pub fn render_text_scanline<S: ProvenanceSink>(
                 color,
                 layer,
                 priority,
-                flags: PixelFlags::default(),
+                flags,
             };
             let tile_address = VRAM_BASE + char_base + tile_number * bytes_per_tile;
             sink.record_candidate(x as u16, layer, || CandidateExplanation {
@@ -274,6 +282,30 @@ mod tests {
         assert_eq!(ppu.framebuffer()[0], Color15(0x7FE0));
         // x=1: BG1 transparent -> BG0 green shows.
         assert_eq!(ppu.framebuffer()[1], Color15(0x03E0));
+    }
+
+    /// Alpha blending combines the top and second backgrounds by their
+    /// coefficients.
+    #[test]
+    fn alpha_blend_combines_two_backgrounds() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt((1 << 8) | (1 << 9)); // BG0 and BG1
+        ppu.registers.bgcnt[0] = 1 << 2; // BG0 char base 1, priority 0 (top)
+        ppu.registers.bgcnt[1] = (2 << 2) | (1 << 8) | 1; // BG1 char base 2, screen 1, priority 1
+        // Alpha blend: BG0 first target, BG1 second target, eva = evb = 8.
+        ppu.registers.bldcnt = (1 << 6) | (1 << 0) | (1 << 9);
+        ppu.registers.bldalpha = 8 | (8 << 8);
+        set_palette(&mut mem, 3, 0x001F); // BG0 red
+        set_palette(&mut mem, 4, 0x7C00); // BG1 blue
+        set_map_entry(&mut mem, 0, 1); // BG0 tile 1
+        set_map_entry(&mut mem, 0x800, 1); // BG1 tile 1
+        mem.vram[0x4020] = 0x03; // BG0 texel 0 = 3
+        mem.vram[0x8020] = 0x04; // BG1 texel 0 = 4
+
+        render_line0(&mut ppu, &mem);
+        // red(31,0,0)*8/16 + blue(0,0,31)*8/16 = (15,0,15).
+        assert_eq!(ppu.framebuffer()[0], Color15(15 | (15 << 10)));
     }
 
     /// The explanation reports the exact map, tile-byte, and palette addresses.

@@ -327,6 +327,44 @@ mod tests {
         }
     }
 
+    /// BG mosaic snaps pixels within a block to the block's leftmost sample.
+    #[test]
+    fn bg_mosaic_snaps_pixels_into_blocks() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0003 | (1 << 10)); // mode 3, BG2
+        ppu.registers.bgcnt[2] = 1 << 6; // BG2 mosaic enabled
+        ppu.registers.mosaic = 3; // horizontal block size = 4
+        let colors = [0x001Fu16, 0x03E0, 0x7C00, 0x7FFF, 0x0200];
+        for (i, c) in colors.iter().enumerate() {
+            mem.vram[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        ppu.latch_for_scanline();
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        // x 0..4 all sample pixel 0 (red); x 4 begins a new block (its own color).
+        for x in 0..4 {
+            assert_eq!(ppu.framebuffer()[x], Color15(0x001F));
+        }
+        assert_eq!(ppu.framebuffer()[4], Color15(0x0200));
+    }
+
+    /// A full-strength brighten effect turns the top layer white.
+    #[test]
+    fn brighten_effect_lightens_the_top_layer() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(0x0003 | (1 << 10)); // mode 3, BG2 priority 0
+        ppu.registers.bldcnt = (2 << 6) | 0x04; // brighten, BG2 first target
+        ppu.registers.bldy = 16; // full strength
+        mem.vram[0..2].copy_from_slice(&0x0000u16.to_le_bytes()); // BG2 (0,0) black
+
+        ppu.latch_for_scanline();
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x7FFF)); // brightened black -> white
+    }
+
     /// A pixel outside the visible framebuffer is an explicit error.
     #[test]
     fn explain_rejects_out_of_range_pixel() {

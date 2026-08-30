@@ -62,19 +62,22 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
 
     let pa = state.regs.bg_pa[k] as i32;
     let pc = state.regs.bg_pc[k] as i32;
+    let pb = state.regs.bg_pb[k] as i32;
+    let pd = state.regs.bg_pd[k] as i32;
     let layer = LayerId::bg(bg);
+    let (mosaic_x, mosaic_y, mosaic) = super::bg_mosaic_factors(state, bg);
 
-    // Walk the texture coordinate as an incremental ramp in 8.8 fixed point: each
-    // step adds PA/PC. This avoids a multiply per pixel and is straightforward to
-    // vectorize later without changing the per-pixel gather that follows.
-    let mut fx = reference.x;
-    let mut fy = reference.y;
+    // Mosaic snaps in screen space before the transform: vertically by undoing the
+    // per-line PB/PD advances back to the block's top line, horizontally by
+    // snapping the screen x fed into the matrix.
+    let vback = y as i32 % mosaic_y as i32;
+    let ref_x = reference.x - pb * vback;
+    let ref_y = reference.y - pd * vback;
 
     for x in 0..WIDTH {
-        let tex_x = fx >> 8;
-        let tex_y = fy >> 8;
-        fx += pa;
-        fy += pc;
+        let x_src = (x - x % mosaic_x) as i32;
+        let tex_x = (ref_x + pa * x_src) >> 8;
+        let tex_y = (ref_y + pc * x_src) >> 8;
 
         let in_range = if wrap {
             true
@@ -103,13 +106,17 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
         }
         let opaque = in_range && texel != 0;
         let color = mem.palette15(texel as usize);
+        let flags = PixelFlags {
+            mosaic,
+            ..PixelFlags::default()
+        };
 
         if opaque {
             scratch.bg[bg].pixels[x] = Some(CandidatePixel {
                 color,
                 layer,
                 priority,
-                flags: PixelFlags::default(),
+                flags,
             });
         }
 
@@ -118,7 +125,7 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
                 color,
                 layer,
                 priority,
-                flags: PixelFlags::default(),
+                flags,
             };
             let rejection = if !in_range {
                 Some(RejectionReason::OutOfBounds)

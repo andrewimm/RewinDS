@@ -9,6 +9,17 @@ use super::debug::sink::ProvenanceSink;
 use super::memory::PpuMemoryView;
 use super::state::{AffineInternalState, LatchedState, Scratch};
 
+/// The mosaic block `(horizontal, vertical)` sizes for background `bg`, and
+/// whether mosaic is active. When inactive the factors are `1` (no snapping).
+pub(super) fn bg_mosaic_factors(state: &LatchedState, bg: usize) -> (usize, usize, bool) {
+    if state.bg_mosaic_enabled(bg) {
+        let (h, v) = state.bg_mosaic();
+        (h, v, true)
+    } else {
+        (1, 1, false)
+    }
+}
+
 /// Generate this scanline's background candidates into `scratch`, according to the
 /// latched video mode. Force-blank produces nothing (the screen shows white via
 /// the backdrop path).

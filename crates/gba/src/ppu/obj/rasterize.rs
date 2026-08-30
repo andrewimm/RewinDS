@@ -112,11 +112,18 @@ pub fn rasterize<S: ProvenanceSink>(
     sink: &mut S,
 ) {
     let one_dim = state.obj_one_dim_mapping();
+    let (mosaic_x, mosaic_y) = state.obj_mosaic();
 
     for sprite in sprites {
         let line = (y as i32 - sprite.y) & 0xFF;
         let is_window = sprite.obj_mode == ObjMode::ObjWindow;
         let semi = sprite.obj_mode == ObjMode::SemiTransparent;
+        // OBJ mosaic snaps the object-relative coordinate to its block origin.
+        let line_src = if sprite.mosaic {
+            line - line % mosaic_y as i32
+        } else {
+            line
+        };
 
         for col in 0..sprite.box_width {
             let screen_x = (sprite.x + col as i32) & 0x1FF;
@@ -125,7 +132,12 @@ pub fn rasterize<S: ProvenanceSink>(
             }
             let sx = screen_x as usize;
 
-            let Some((tx, ty)) = texture_coord(sprite, col, line, mem) else {
+            let col_src = if sprite.mosaic {
+                col - col % mosaic_x as u16
+            } else {
+                col
+            };
+            let Some((tx, ty)) = texture_coord(sprite, col_src, line_src, mem) else {
                 continue;
             };
             let (tile_number, byte_offset) = texel_address(sprite, tx, ty, one_dim);

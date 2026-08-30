@@ -199,6 +199,24 @@ mod tests {
         assert_eq!(out.len(), 18);
     }
 
+    /// OBJ mosaic snaps a sprite's texels into horizontal blocks.
+    #[test]
+    fn obj_mosaic_snaps_sprite_texels() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        ppu.write_dispcnt(OBJ_1D);
+        ppu.registers.mosaic = 3 << 8; // OBJ horizontal block size = 4
+        set_pal(&mut mem, 256 + 5, 0x03E0); // green (texel 0)
+        set_pal(&mut mem, 256 + 6, 0x001F); // red (texel 1)
+        set_oam(&mut mem, 0, 1 << 12, 0, 1); // mosaic bit set
+        mem.vram[0x10020] = 0x65; // texel 0 = 5, texel 1 = 6
+
+        render0(&mut ppu, &mem);
+        // With a 4-wide OBJ block, x 0 and 1 both sample texel 0 (green).
+        assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
+        assert_eq!(ppu.framebuffer()[1], Color15(0x03E0));
+    }
+
     /// The explanation reports the sprite's OAM entry and tile/palette sources.
     #[test]
     fn explain_reports_obj_sources() {

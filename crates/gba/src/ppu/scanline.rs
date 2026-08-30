@@ -63,7 +63,8 @@ impl Ppu {
         for x in 0..WIDTH {
             let set = compositor::gather(x, &self.scratch, backdrop, sink);
             let resolved = priority::resolve(&set);
-            let effect = effects::apply(resolved.top, resolved.second, &state.regs);
+            let effects_enabled = self.scratch.window.mask[x].effects;
+            let effect = effects::apply(resolved.top, resolved.second, &state.regs, effects_enabled);
             self.framebuffer.pixels[row + x] = effect.color;
             if sink.wants(x as u16) {
                 sink.record_resolved(x as u16, || resolved.explain());

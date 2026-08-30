@@ -297,6 +297,25 @@ impl LatchedState {
         self.regs.dispcnt & (1 << 5) != 0
     }
 
+    /// Whether background `index` has mosaic enabled (`BGxCNT` bit 6).
+    pub fn bg_mosaic_enabled(&self, index: usize) -> bool {
+        self.regs.bgcnt[index] & (1 << 6) != 0
+    }
+
+    /// The background mosaic `(horizontal, vertical)` block sizes in pixels
+    /// (`MOSAIC` bits 0-3 / 4-7, each stored as size-1).
+    pub fn bg_mosaic(&self) -> (usize, usize) {
+        let m = self.regs.mosaic;
+        (((m & 0xF) + 1) as usize, (((m >> 4) & 0xF) + 1) as usize)
+    }
+
+    /// The OBJ mosaic `(horizontal, vertical)` block sizes in pixels (`MOSAIC`
+    /// bits 8-11 / 12-15).
+    pub fn obj_mosaic(&self) -> (usize, usize) {
+        let m = self.regs.mosaic;
+        ((((m >> 8) & 0xF) + 1) as usize, (((m >> 12) & 0xF) + 1) as usize)
+    }
+
     /// Whether the display is force-blanked (`DISPCNT` bit 7).
     pub fn forced_blank(&self) -> bool {
         self.regs.dispcnt & (1 << 7) != 0
