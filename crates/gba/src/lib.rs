@@ -27,6 +27,9 @@ pub use machine::Gba;
 pub use ppu::debug::{
     ExplainError, PixelExplanation, ScanlineExplanation, SourceProvenance, VideoInstrumentation,
 };
+pub use ppu::inspect::{BackgroundKind, BackgroundSummary};
+pub use ppu::memory::PpuMemoryView;
+pub use ppu::obj::evaluate::SpriteInstance;
 pub use ppu::{Color15, LayerId, Ppu};
 pub use system::{HaltProgress, System};
 pub use timer::{TimerId, Timers};

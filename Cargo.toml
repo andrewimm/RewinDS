@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arm", "crates/emu-core", "crates/gba"]
+members = ["crates/arm", "crates/emu-core", "crates/gba", "crates/debug"]
 
-# Other crates (nds, video2d, jit, debug) will be added to the workspace as they
-# gain source and manifests.
+# Other crates (nds, video2d, jit) will be added to the workspace as they gain
+# source and manifests.

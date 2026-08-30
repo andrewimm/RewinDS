@@ -7,6 +7,15 @@ name = "arm"
 version = "0.1.0"
 
 [[package]]
+name = "debug"
+version = "0.1.0"
+dependencies = [
+ "arm",
+ "emu-core",
+ "gba",
+]
+
+[[package]]
 name = "emu-core"
 version = "0.1.0"
 

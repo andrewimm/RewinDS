@@ -12,12 +12,12 @@ use super::window;
 use super::debug::explain::{
     ExplainError, FrameId, PixelExplanation, ScanlineExplanation, ScanlineStateExplanation,
 };
-use super::debug::provenance::BackgroundId;
+use super::debug::provenance::{BackgroundId, RejectionReason};
 use super::debug::sink::{NullSink, PixelRecorder, ProvenanceSink, ScanlineRecorder};
 use super::effects;
 use super::memory::PpuMemoryView;
 use super::priority;
-use super::state::{CandidatePixel, LatchedState, HEIGHT, WIDTH};
+use super::state::{CandidatePixel, LatchedState, LayerId, HEIGHT, WIDTH};
 use super::Ppu;
 
 /// Build the structured latched-state summary for scanline `y`.
@@ -88,6 +88,23 @@ impl Ppu {
                 if sink.wants(x as u16) {
                     sink.record_resolved(x as u16, || resolved.explain());
                     sink.record_effect(x as u16, || effect.explain());
+                    // Candidates that were present but beaten on priority (neither
+                    // the top nor the blend operand) are explained as such.
+                    for candidate in set.as_slice() {
+                        let layer = candidate.layer;
+                        if layer != LayerId::Backdrop
+                            && layer != resolved.top.layer
+                            && layer != resolved.second.layer
+                        {
+                            sink.record_rejection(
+                                x as u16,
+                                layer,
+                                RejectionReason::LowerPriority {
+                                    winner_priority: resolved.top.priority,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -152,10 +169,15 @@ impl Ppu {
         let state = recorder
             .take_state()
             .unwrap_or_else(|| scanline_state_explanation(&self.latched, y));
+        let sprites = self.scratch.sprites.clone();
         let row = y as usize * WIDTH;
         let final_line = self.framebuffer.pixels[row..row + WIDTH]
             .to_vec()
             .into_boxed_slice();
-        ScanlineExplanation { state, final_line }
+        ScanlineExplanation {
+            state,
+            sprites,
+            final_line,
+        }
     }
 }

@@ -167,6 +167,30 @@ pub enum SourceProvenance {
     Obj(ObjProvenance),
 }
 
+impl SourceProvenance {
+    /// The exact guest memory addresses this pixel was sampled from — the bridge
+    /// to `memory.last_writer(addr)` once write tracking exists.
+    pub fn source_addresses(&self) -> Vec<u32> {
+        match self {
+            SourceProvenance::Backdrop(p) => vec![p.palette_address],
+            SourceProvenance::TextBg(p) => {
+                vec![p.map_address, p.tile_byte_address, p.palette_address]
+            }
+            SourceProvenance::AffineBg(p) => {
+                vec![p.map_address, p.tile_byte_address, p.palette_address]
+            }
+            SourceProvenance::BitmapBg(p) => {
+                let mut v = vec![p.vram_address];
+                v.extend(p.palette_address);
+                v
+            }
+            SourceProvenance::Obj(p) => {
+                vec![p.oam_address, p.tile_byte_address, p.palette_address]
+            }
+        }
+    }
+}
+
 /// Which window region a screen position resolved to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WindowRegion {

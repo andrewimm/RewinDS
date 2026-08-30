@@ -12,6 +12,7 @@ pub mod bg;
 pub mod compositor;
 pub mod debug;
 pub mod effects;
+pub mod inspect;
 pub mod latch;
 pub mod memory;
 pub mod obj;

@@ -148,5 +148,7 @@ impl PixelExplanation {
 #[derive(Clone, Debug)]
 pub struct ScanlineExplanation {
     pub state: ScanlineStateExplanation,
+    /// The sprites evaluated as visible on this scanline, in OAM order.
+    pub sprites: Vec<crate::ppu::obj::evaluate::SpriteInstance>,
     pub final_line: Box<[Color15]>,
 }

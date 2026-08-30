@@ -1,0 +1,10 @@
+[package]
+name = "debug"
+version = "0.1.0"
+edition = "2021"
+description = "Structured debug interface over emulator state"
+
+[dependencies]
+gba = { path = "../gba" }
+emu-core = { path = "../emu-core" }
+arm = { path = "../arm" }

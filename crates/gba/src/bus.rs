@@ -313,6 +313,17 @@ impl Bus {
         self.io.video.inspect_scanline(y, &view)
     }
 
+    /// Run `f` with the PPU and a read-only view of graphics memory — the disjoint
+    /// split borrow every video inspection accessor needs, exposed once so callers
+    /// (e.g. the debug interface) need not re-derive it.
+    pub fn with_video_view<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::ppu::Ppu, &PpuMemoryView<'_>) -> R,
+    ) -> R {
+        let view = PpuMemoryView::new(&self.memory);
+        f(&mut self.io.video, &view)
+    }
+
     /// The (non-sequential, sequential) wait cycles for a gamepak wait-state
     /// region, decoded from `WAITCNT`.
     fn ws_waits(&self, waitstate: u32) -> (u32, u32) {
