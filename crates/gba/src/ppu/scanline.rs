@@ -89,6 +89,8 @@ impl Ppu {
             return Err(ExplainError::PixelOutsideFramebuffer { x, y });
         }
         self.latch_for_scanline();
+        self.affine.bg2 = self.affine_reference_for_line(0, y);
+        self.affine.bg3 = self.affine_reference_for_line(1, y);
         let mut recorder = PixelRecorder::new(x);
         self.render_scanline(y, mem, &mut recorder);
         Ok(recorder.finish(self.frame_counter, y))
@@ -116,6 +118,8 @@ impl Ppu {
     pub fn inspect_scanline(&mut self, y: u16, mem: &PpuMemoryView<'_>) -> ScanlineExplanation {
         let y = y.min(HEIGHT as u16 - 1);
         self.latch_for_scanline();
+        self.affine.bg2 = self.affine_reference_for_line(0, y);
+        self.affine.bg3 = self.affine_reference_for_line(1, y);
         let mut recorder = ScanlineRecorder::new();
         self.render_scanline(y, mem, &mut recorder);
         let state = recorder

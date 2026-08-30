@@ -96,6 +96,14 @@ impl Ppu {
     /// Apply a masked write to a video register in the `0x008..=0x054` block.
     pub fn write_video_register(&mut self, offset: u32, value: u16, mask: u16) {
         self.registers.write16(offset, value, mask);
+        // Writing an affine reference point reloads the internal reference so the
+        // change takes effect from the next scanline.
+        match offset {
+            0x028 | 0x02A | 0x02C | 0x02E | 0x038 | 0x03A | 0x03C | 0x03E => {
+                self.reload_affine_references();
+            }
+            _ => {}
+        }
     }
 
     /// Whether the display is force-blanked (`DISPCNT` bit 7), during which the
@@ -133,10 +141,13 @@ impl Ppu {
     /// Begin LCD timing at `now`, latching scanline 0's registers.
     pub fn start(&mut self, now: Timestamp, scheduler: &mut Scheduler<EventKind>) {
         self.timing.start(now, scheduler);
+        self.reload_affine_references();
         self.latch_for_scanline();
     }
 
-    /// Dispatch a PPU timing event, latching registers when a visible line begins.
+    /// Dispatch a PPU timing event. When a visible line begins, advance the affine
+    /// reference (or reload it at frame start) and latch the registers that govern
+    /// the line about to be drawn.
     pub fn handle_event(
         &mut self,
         event: PpuEvent,
@@ -144,8 +155,16 @@ impl Ppu {
         ctx: &mut EventContext<'_, EventKind>,
     ) {
         self.timing.handle_event(event, irq, ctx);
-        if matches!(event, PpuEvent::LineStart) && (self.vcount() as usize) < HEIGHT {
-            self.latch_for_scanline();
+        if matches!(event, PpuEvent::LineStart) {
+            let line = self.vcount() as usize;
+            if line == 0 {
+                self.reload_affine_references();
+            } else if line < HEIGHT {
+                self.advance_affine_references();
+            }
+            if line < HEIGHT {
+                self.latch_for_scanline();
+            }
         }
     }
 }
