@@ -70,6 +70,12 @@ pub struct Bus {
     /// set so a stepping run loop can stop and report the writer.
     pub break_write_addr: Option<u32>,
     pub write_hit: bool,
+    /// The most recent opcode fetched from the BIOS. The BIOS is read-protected:
+    /// code executing outside it reads this latched value, not the real bytes.
+    pub bios_last_fetch: u32,
+    /// Whether the CPU is currently executing inside the BIOS (tracked from the
+    /// last instruction fetch).
+    executing_bios: bool,
 }
 
 impl Bus {
@@ -116,6 +122,11 @@ impl Bus {
 
     fn read(&mut self, addr: u32, width: AccessWidth, access: Access, scheduler: &mut Scheduler<EventKind>) -> BusResult<u32> {
         let addr = align(addr, width);
+        // Track whether the CPU is executing inside the BIOS; a fetch from outside
+        // it means it has left. This gates the BIOS read protection below.
+        if access.kind == AccessKind::Instruction {
+            self.executing_bios = addr >> 24 == 0 && (addr as usize) < BIOS_SIZE;
+        }
         if let Some(watch) = self.read_watch.as_mut() {
             if access.kind == AccessKind::Data {
                 *watch.entry(addr).or_insert(0) += 1;
@@ -123,7 +134,22 @@ impl Bus {
         }
         match addr >> 24 {
             0x00 if (addr as usize) < BIOS_SIZE => {
-                BusResult::plain(read_le(&self.memory.bios, addr as usize, width), 1)
+                if access.kind == AccessKind::Instruction {
+                    // A BIOS opcode fetch: latch it for later open-bus reads. The
+                    // fetched word is the one the pipeline is prefetching, which on
+                    // ARM7TDMI sits `pc_offset` bytes ahead of the executing one.
+                    let prefetch = if width == AccessWidth::Word { 8 } else { 4 };
+                    let latched = (addr.wrapping_add(prefetch) as usize) & (BIOS_SIZE - 1);
+                    self.bios_last_fetch =
+                        read_le(&self.memory.bios, latched & !3, AccessWidth::Word);
+                    BusResult::plain(read_le(&self.memory.bios, addr as usize, width), 1)
+                } else if self.executing_bios {
+                    // Code running inside the BIOS reads it normally.
+                    BusResult::plain(read_le(&self.memory.bios, addr as usize, width), 1)
+                } else {
+                    // Outside code sees only the most recently fetched BIOS opcode.
+                    BusResult::plain(bios_open_bus(self.bios_last_fetch, addr, width), 1)
+                }
             }
             0x02 => {
                 let off = addr as usize & (EWRAM_SIZE - 1);
@@ -561,6 +587,16 @@ fn rom_open_bus(addr: u32, width: AccessWidth) -> u32 {
     }
 }
 
+/// A protected BIOS read returns the latched last-fetched opcode. A sub-word read
+/// takes the corresponding byte/halfword lane of that 32-bit value.
+fn bios_open_bus(latch: u32, addr: u32, width: AccessWidth) -> u32 {
+    match width {
+        AccessWidth::Byte => (latch >> (8 * (addr & 3))) & 0xFF,
+        AccessWidth::Half => (latch >> (8 * (addr & 2))) & 0xFFFF,
+        AccessWidth::Word => latch,
+    }
+}
+
 /// SRAM is an 8-bit bus; wider reads see the byte replicated across the width.
 fn sram_replicate(byte: u8, width: AccessWidth) -> u32 {
     let byte = byte as u32;
@@ -617,6 +653,32 @@ mod tests {
         // VRAM's 0x18000..0x20000 window mirrors 0x10000..0x18000.
         b.write16(0x0601_0000, 0xABCD, CPU, &mut s);
         assert_eq!(b.read16(0x0601_8000, CPU, &mut s).value, 0xABCD);
+    }
+
+    #[test]
+    fn bios_is_read_protected_outside_itself() {
+        let (mut b, mut s) = bus();
+        let mut bios = vec![0u8; BIOS_SIZE];
+        bios[0..4].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+        bios[8..12].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+        b.load_bios(&bios);
+        let fetch = Access::cpu(AccessKind::Instruction, AccessSequence::NonSequential);
+
+        // Fetching the opcode at 0x00 returns the real word and latches the word
+        // the pipeline is prefetching (0x00 + 8 = 0x08).
+        assert_eq!(b.read32(0x0000_0000, fetch, &mut s).value, 0x1111_1111);
+        // A data read from inside the BIOS still sees the real bytes.
+        assert_eq!(b.read32(0x0000_0000, CPU, &mut s).value, 0x1111_1111);
+
+        // Leave the BIOS by fetching from ROM.
+        b.load_rom(vec![0; 16]);
+        b.read32(0x0800_0000, fetch, &mut s);
+
+        // Now BIOS reads return only the latched opcode, regardless of address.
+        assert_eq!(b.read32(0x0000_0000, CPU, &mut s).value, 0x2222_2222);
+        assert_eq!(b.read32(0x0000_0100, CPU, &mut s).value, 0x2222_2222);
+        // A sub-word read takes the matching lane of the latch.
+        assert_eq!(b.read8(0x0000_0001, CPU, &mut s).value, 0x22);
     }
 
     #[test]
