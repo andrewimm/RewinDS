@@ -145,6 +145,47 @@ mod tests {
     }
 
     #[test]
+    fn rescheduling_later_leaves_a_harmless_phantom_deadline() {
+        // Cancellation is generation-based: a reconfigured timer's old event
+        // stays queued but is ignored. Reschedule a timer to a *later* overflow
+        // so its stale event is an earlier phantom deadline — we still stop at
+        // it (never run past), but it does nothing.
+        let mut sched = Scheduler::new();
+        let mut gba = Gba::new();
+        gba.bus.io.irq.set_ie(0xFFFF);
+        gba.bus.io.irq.set_ime(true);
+
+        // Overflow at 256.
+        gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFF00);
+        gba.bus
+            .io
+            .timers
+            .write_control(TimerId::Timer0, (1 << 7) | (1 << 6), 0, &mut sched);
+        assert_eq!(sched.next_deadline(), Some(256));
+
+        // At t=100, reconfigure so the real overflow is at 612 (512 ticks). The
+        // old 256 event is now stale but still in the queue.
+        sched.set_now(100);
+        gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFE00); // 0x10000 - 0xFE00 = 512
+        gba.bus
+            .io
+            .timers
+            .write_control(TimerId::Timer0, 0, 100, &mut sched); // stop -> bump generation
+        gba.bus
+            .io
+            .timers
+            .write_control(TimerId::Timer0, (1 << 7) | (1 << 6), 100, &mut sched); // restart
+        assert_eq!(sched.next_deadline(), Some(256)); // the stale event is still the earliest
+
+        // Reaching 256 dispatches the stale event, which is ignored.
+        run_until(&mut sched, &mut gba, 256);
+        assert!(!gba.bus.io.irq.pending());
+        // The real overflow fires at 612.
+        run_until(&mut sched, &mut gba, 612);
+        assert_ne!(gba.bus.io.irq.iflags() & IrqSource::Timer0.mask(), 0);
+    }
+
+    #[test]
     fn cascade_overflow_propagates_at_one_instant() {
         let mut sched = Scheduler::new();
         let mut gba = Gba::new();
