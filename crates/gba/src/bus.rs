@@ -672,6 +672,18 @@ mod tests {
     }
 
     #[test]
+    fn unmodeled_io_registers_retain_writes() {
+        let (mut b, mut s) = bus();
+        // A sound register (SOUNDCNT_H, 0x4000082) is not modeled but reads back.
+        assert_eq!(b.read16(0x0400_0082, CPU, &mut s).value, 0);
+        b.write16(0x0400_0082, 0x770F, CPU, &mut s);
+        assert_eq!(b.read16(0x0400_0082, CPU, &mut s).value, 0x770F);
+        // A byte write touches only its byte.
+        b.write8(0x0400_0082, 0x00, CPU, &mut s);
+        assert_eq!(b.read16(0x0400_0082, CPU, &mut s).value, 0x7700);
+    }
+
+    #[test]
     fn mmio_vcount_is_read_only() {
         let (mut b, mut s) = bus();
         b.write16(0x0400_0006, 0x00FF, CPU, &mut s); // VCOUNT

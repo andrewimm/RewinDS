@@ -64,6 +64,39 @@ impl SystemControl {
     }
 }
 
+/// Backing storage for I/O registers that are mapped but not yet modeled by a
+/// device — the sound block (`0x060–0x0A8`), serial/SIO (`0x120–0x12C`,
+/// `0x134–0x15A`), and other unclaimed offsets. Reads return the last value
+/// written, so guest code that configures a register and reads it back sees a
+/// consistent value. This is a compatibility stand-in, not device behavior: it
+/// models no side effects (no audio, no serial transfers).
+#[derive(Clone, Debug)]
+struct RawRegisters(Box<[u8]>);
+
+impl Default for RawRegisters {
+    fn default() -> Self {
+        RawRegisters(vec![0; 0x400].into_boxed_slice())
+    }
+}
+
+impl RawRegisters {
+    fn read16(&self, offset: u32) -> u16 {
+        let i = offset as usize;
+        match (self.0.get(i), self.0.get(i + 1)) {
+            (Some(&lo), Some(&hi)) => u16::from_le_bytes([lo, hi]),
+            _ => 0,
+        }
+    }
+
+    fn write16(&mut self, offset: u32, value: u16, mask: u16) {
+        let i = offset as usize;
+        if i + 1 < self.0.len() {
+            let merged = merge(u16::from_le_bytes([self.0[i], self.0[i + 1]]), value, mask);
+            self.0[i..i + 2].copy_from_slice(&merged.to_le_bytes());
+        }
+    }
+}
+
 /// The memory-mapped devices.
 #[derive(Clone, Debug, Default)]
 pub struct Io {
@@ -73,6 +106,8 @@ pub struct Io {
     pub dma: Dma,
     pub video: Ppu,
     pub keypad: Keypad,
+    /// Storage for mapped-but-unmodeled registers (see [`RawRegisters`]).
+    raw: RawRegisters,
 }
 
 impl Io {
@@ -178,7 +213,8 @@ impl Io {
             0x208 => self.irq.ime() as u16,
             // POSTFLG (low byte); HALTCNT (high byte) is write-only.
             0x300 => self.control.postflg as u16,
-            _ => 0,
+            // Mapped-but-unmodeled registers (sound, serial, …) read back storage.
+            _ => self.raw.read16(offset),
         }
     }
 
@@ -256,7 +292,11 @@ impl Io {
                 }
                 false
             }
-            _ => false,
+            // Mapped-but-unmodeled registers (sound, serial, …) retain writes.
+            _ => {
+                self.raw.write16(offset, value, mask);
+                false
+            }
         }
     }
 }
