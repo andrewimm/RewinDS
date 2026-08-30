@@ -6,6 +6,7 @@
 //! machine whose [`Bus`] the CPU (and later DMA) drives.
 
 pub mod bus;
+pub mod cartridge;
 pub mod dma;
 pub mod event;
 pub mod interrupt;
@@ -20,6 +21,7 @@ pub mod timer;
 pub mod trace;
 
 pub use bus::{Bus, Memory};
+pub use cartridge::{Backup, Cartridge, FlashSize, SaveType};
 pub use dma::{Dma, DmaChannel, DmaTiming};
 pub use prefetch::Prefetch;
 pub use event::{EventKind, PpuEvent, TimerEvent};

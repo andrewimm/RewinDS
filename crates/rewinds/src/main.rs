@@ -7,9 +7,10 @@
 //! will replace only the window/present code in this file, reusing [`System`],
 //! [`System::run_frame`], [`System::framebuffer`], and the key map below.
 
-use gba::{Key as Button, System};
+use gba::{Cartridge, Key as Button, SaveType, System};
 use minifb::{Key, Scale, Window, WindowOptions};
 use std::error::Error;
+use std::path::{Path, PathBuf};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
@@ -48,9 +49,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut system = System::new();
     system.gba.bus.load_bios(&std::fs::read(bios_path)?);
+
+    // A loaded ROM brings a save backup: its type is detected from the ROM, an
+    // optional `<rom>.sav.meta` sidecar may override it, and a `<rom>.sav` file
+    // (raw chip dump, interoperable with other emulators) is restored if present.
+    let mut save_paths: Option<(PathBuf, PathBuf)> = None;
     if let Some(rom_path) = positional.get(1) {
         system.gba.bus.load_rom(std::fs::read(rom_path)?);
+        let sav = Path::new(rom_path).with_extension("sav");
+        let meta = {
+            let mut m = sav.clone().into_os_string();
+            m.push(".meta");
+            PathBuf::from(m)
+        };
+        if let Some(save_type) = read_meta_save_type(&meta) {
+            system.gba.bus.cartridge.set_save_type(save_type);
+        }
+        if let Ok(bytes) = std::fs::read(&sav) {
+            system.gba.bus.cartridge.load_backup(&bytes);
+        }
+        let save_type = system.gba.bus.cartridge.save_type();
+        eprintln!("cartridge save: {} ({} bytes)", save_type.name(), save_type.backup_size());
+        save_paths = Some((sav, meta));
     }
+
     // The CPU begins at the BIOS reset vector.
     system.cpu.set_pc(0);
 
@@ -73,6 +95,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Reused each frame: the BGR555 framebuffer converted to minifb's 0x00RRGGBB.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
+    // Flush the save at most a few times a second, only after the game writes it.
+    const FLUSH_EVERY_FRAMES: u32 = 180;
+    let mut frames_since_flush = 0u32;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Mirror the host keyboard into the keypad each frame.
         for &(host, button) in KEY_MAP {
@@ -86,6 +111,50 @@ fn main() -> Result<(), Box<dyn Error>> {
             *out = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
         }
         window.update_with_buffer(&buffer, WIDTH, HEIGHT)?;
+
+        if let Some((sav, meta)) = &save_paths {
+            frames_since_flush += 1;
+            if frames_since_flush >= FLUSH_EVERY_FRAMES && system.gba.bus.cartridge.backup_dirty() {
+                if write_save(sav, meta, &system.gba.bus.cartridge).is_ok() {
+                    system.gba.bus.cartridge.clear_backup_dirty();
+                }
+                frames_since_flush = 0;
+            }
+        }
     }
+
+    // Final flush on exit so the last writes are not lost.
+    if let Some((sav, meta)) = &save_paths {
+        if system.gba.bus.cartridge.backup_dirty() {
+            if let Err(e) = write_save(sav, meta, &system.gba.bus.cartridge) {
+                eprintln!("warning: could not write save {}: {e}", sav.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the `save_type` override from a `.sav.meta` sidecar, if present and valid.
+fn read_meta_save_type(path: &Path) -> Option<SaveType> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let key = "\"save_type\"";
+    let rest = &text[text.find(key)? + key.len()..];
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    SaveType::from_name(&rest[start..end])
+}
+
+/// Write the raw `.sav` (chip dump) plus a small JSON sidecar recording the save
+/// type. Absent backups (empty dump) write nothing.
+fn write_save(sav: &Path, meta: &Path, cartridge: &Cartridge) -> std::io::Result<()> {
+    let bytes = cartridge.backup_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    std::fs::write(sav, bytes)?;
+    std::fs::write(
+        meta,
+        format!("{{\n  \"save_type\": \"{}\"\n}}\n", cartridge.save_type().name()),
+    )?;
     Ok(())
 }

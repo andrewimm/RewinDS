@@ -133,7 +133,7 @@ impl Cpu {
                     let value = if address & 1 != 0 { value.rotate_right(8) } else { value };
                     self.set_reg(rd, value);
                 } else {
-                    self.cycles += bus.store16(address & !1, self.reg(rd) as u16, false) as u64;
+                    self.cycles += bus.store16(address, self.reg(rd) as u16, false) as u64;
                 }
             }
             SpRelativeLoadStore { load, rd, word8 } => {
@@ -298,10 +298,11 @@ impl Cpu {
             self.set_reg(rd, value);
         } else {
             let value = self.reg(rd);
+            // Pass the unaligned address; the 8-bit GamePak bus selects the byte.
             self.cycles += if byte {
                 bus.store8(address, value as u8, false)
             } else {
-                bus.store32(address & !3, value, false)
+                bus.store32(address, value, false)
             } as u64;
         }
     }
@@ -316,7 +317,7 @@ impl Cpu {
         self.data_access = true;
         match op {
             ThumbSignExtendOp::StoreHalfword => {
-                self.cycles += bus.store16(address & !1, self.reg(rd) as u16, false) as u64;
+                self.cycles += bus.store16(address, self.reg(rd) as u16, false) as u64;
             }
             ThumbSignExtendOp::LoadHalfword => {
                 let read = bus.load16(address & !1, false);

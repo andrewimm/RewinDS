@@ -429,10 +429,13 @@ impl Cpu {
             if op.rd.is_pc() {
                 value = value.wrapping_add(4);
             }
+            // The unaligned address goes to memory as-is; word-aligned memory
+            // ignores the low bits, but the 8-bit GamePak bus uses them to select
+            // which byte a wide store latches.
             let cycles = if op.byte {
                 bus.store8(address, value as u8, false)
             } else {
-                bus.store32(address & !3, value, false)
+                bus.store32(address, value, false)
             };
             self.cycles += cycles as u64;
             self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
@@ -489,7 +492,7 @@ impl Cpu {
             self.set_reg(op.rd, value);
         } else {
             // Only STRH stores; the signed kinds are load-only.
-            let cycles = bus.store16(address & !1, self.reg(op.rd) as u16, false);
+            let cycles = bus.store16(address, self.reg(op.rd) as u16, false);
             self.cycles += cycles as u64;
             self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
         }

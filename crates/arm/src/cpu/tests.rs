@@ -41,8 +41,11 @@ impl TestBus {
     }
 
     fn write(&mut self, address: u32, value: u32, bytes: usize) {
+        // Word-aligned memory ignores the low address bits of a wider store, just
+        // as the CPU now leaves alignment to the memory it targets.
+        let address = address as usize & !(bytes - 1);
         for i in 0..bytes {
-            self.memory[address as usize + i] = (value >> (8 * i)) as u8;
+            self.memory[address + i] = (value >> (8 * i)) as u8;
         }
     }
 }

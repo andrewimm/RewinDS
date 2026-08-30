@@ -6,6 +6,7 @@
 //! region, applies that region's mirroring and access rules, and — for the I/O
 //! region — hands off to the [`Io`] MMIO subsystem.
 
+use crate::cartridge::Cartridge;
 use crate::dma::DmaTiming;
 use crate::event::EventKind;
 use crate::interrupt::IrqSource;
@@ -24,9 +25,9 @@ const IWRAM_SIZE: usize = 0x8000; // 32 KiB
 const PALETTE_SIZE: usize = 0x400; // 1 KiB
 const VRAM_SIZE: usize = 0x1_8000; // 96 KiB
 const OAM_SIZE: usize = 0x400; // 1 KiB
-const SRAM_SIZE: usize = 0x1_0000; // 64 KiB
 
-/// The bus's backing storage. Cartridge ROM is loaded in; the rest is RAM.
+/// The bus's on-board RAM. Cartridge ROM and save memory live on the
+/// [`Cartridge`], not here.
 #[derive(Clone, Debug)]
 pub struct Memory {
     pub bios: Box<[u8]>,
@@ -35,8 +36,6 @@ pub struct Memory {
     pub palette: Box<[u8]>,
     pub vram: Box<[u8]>,
     pub oam: Box<[u8]>,
-    pub sram: Box<[u8]>,
-    pub rom: Vec<u8>,
 }
 
 impl Default for Memory {
@@ -48,8 +47,6 @@ impl Default for Memory {
             palette: vec![0; PALETTE_SIZE].into_boxed_slice(),
             vram: vec![0; VRAM_SIZE].into_boxed_slice(),
             oam: vec![0; OAM_SIZE].into_boxed_slice(),
-            sram: vec![0; SRAM_SIZE].into_boxed_slice(),
-            rom: Vec::new(),
         }
     }
 }
@@ -58,6 +55,7 @@ impl Default for Memory {
 #[derive(Clone, Debug, Default)]
 pub struct Bus {
     pub memory: Memory,
+    pub cartridge: Cartridge,
     pub io: Io,
     prefetch: Prefetch,
     /// Guest cycles that DMA transfers have stalled the CPU for, awaiting the CPU
@@ -79,9 +77,9 @@ impl Bus {
         Self::default()
     }
 
-    /// Load cartridge ROM.
+    /// Load cartridge ROM, detecting and provisioning its save backup.
     pub fn load_rom(&mut self, rom: Vec<u8>) {
-        self.memory.rom = rom;
+        self.cartridge.load_rom(rom);
     }
 
     /// Load the BIOS image (up to 16 KiB).
@@ -169,8 +167,8 @@ impl Bus {
                     return BusResult::plain(OPEN_BUS, cycles);
                 }
                 let off = (addr & 0x01FF_FFFF) as usize;
-                let value = if off + width.bytes() as usize <= self.memory.rom.len() {
-                    read_le(&self.memory.rom, off, width)
+                let value = if off + width.bytes() as usize <= self.cartridge.rom.len() {
+                    read_le(&self.cartridge.rom, off, width)
                 } else {
                     rom_open_bus(addr, width)
                 };
@@ -181,7 +179,7 @@ impl Bus {
                 if !sram_accessible(access.master) {
                     return BusResult::plain(OPEN_BUS, cycles);
                 }
-                let byte = self.memory.sram[addr as usize & (SRAM_SIZE - 1)];
+                let byte = self.cartridge.backup.read8(addr);
                 BusResult::plain(sram_replicate(byte, width), cycles)
             }
             _ => BusResult::plain(OPEN_BUS, 1),
@@ -189,6 +187,7 @@ impl Bus {
     }
 
     fn write(&mut self, addr: u32, value: u32, width: AccessWidth, access: Access, scheduler: &mut Scheduler<EventKind>) -> BusResult<()> {
+        let raw_addr = addr;
         let addr = align(addr, width);
         if access.kind == AccessKind::Data {
             if let Some(watch) = self.write_watch.as_mut() {
@@ -252,10 +251,12 @@ impl Bus {
             }
             0x08..=0x0D => BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence)),
             0x0E | 0x0F => {
-                // SRAM is an 8-bit bus, CPU-only: writes from a DMA master are
-                // dropped, and only the low byte is written.
+                // The backup region is an 8-bit bus, CPU-only: DMA writes are
+                // dropped. A 16/32-bit store latches a single byte — the one the
+                // low address bits select — at the *unaligned* address.
                 if sram_accessible(access.master) {
-                    self.memory.sram[addr as usize & (SRAM_SIZE - 1)] = value as u8;
+                    let shift = 8 * (raw_addr & (width.bytes() - 1));
+                    self.cartridge.backup.write8(raw_addr, (value >> shift) as u8);
                 }
                 BusResult::plain((), self.sram_cycles())
             }
