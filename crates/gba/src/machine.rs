@@ -6,9 +6,13 @@
 //! the CPU can thread it into bus writes, without a self-borrow.
 
 use crate::bus::Bus;
-use crate::event::EventKind;
+use crate::dma::DmaTiming;
+use crate::event::{EventKind, PpuEvent};
 use crate::io::PowerState;
 use emu_core::{EventContext, EventHandler};
+
+/// The first scanline of the vertical blank.
+const VBLANK_LINE: u16 = 160;
 
 /// The GBA machine state: everything reachable through the bus.
 #[derive(Clone, Debug, Default)]
@@ -49,10 +53,28 @@ impl Gba {
 
 impl EventHandler<EventKind> for Gba {
     fn handle(&mut self, event: EventKind, ctx: &mut EventContext<'_, EventKind>) {
-        let io = &mut self.bus.io;
         match event {
-            EventKind::Timer(event) => io.timers.handle_overflow(event, &mut io.irq, ctx),
-            EventKind::Ppu(event) => io.video.handle_event(event, &mut io.irq, ctx),
+            EventKind::Timer(event) => {
+                let io = &mut self.bus.io;
+                io.timers.handle_overflow(event, &mut io.irq, ctx);
+            }
+            EventKind::Ppu(event) => {
+                {
+                    let io = &mut self.bus.io;
+                    io.video.handle_event(event, &mut io.irq, ctx);
+                }
+                // A blank transition can trigger DMA. HBlank DMA fires only on
+                // visible scanlines; VBlank DMA fires as line 160 begins.
+                match event {
+                    PpuEvent::HBlank if self.bus.io.video.vcount() < VBLANK_LINE => {
+                        self.bus.trigger_dma(DmaTiming::HBlank, ctx.scheduler);
+                    }
+                    PpuEvent::LineStart if self.bus.io.video.vcount() == VBLANK_LINE => {
+                        self.bus.trigger_dma(DmaTiming::VBlank, ctx.scheduler);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

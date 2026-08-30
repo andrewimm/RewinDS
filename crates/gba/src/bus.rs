@@ -6,9 +6,13 @@
 //! region, applies that region's mirroring and access rules, and — for the I/O
 //! region — hands off to the [`Io`] MMIO subsystem.
 
+use crate::dma::DmaTiming;
 use crate::event::EventKind;
+use crate::interrupt::IrqSource;
 use crate::io::Io;
-use emu_core::{Access, AccessSequence, AccessWidth, BusResult, Scheduler};
+use emu_core::{
+    Access, AccessKind, AccessMaster, AccessSequence, AccessWidth, BusResult, Scheduler,
+};
 
 // Region sizes.
 const BIOS_SIZE: usize = 0x4000; // 16 KiB
@@ -128,17 +132,25 @@ impl Bus {
                 BusResult::plain(read_le(&self.memory.oam, off, width), 1)
             }
             0x08..=0x0D => {
+                let cycles = self.rom_cycles(addr >> 24, width, access.sequence);
+                if !rom_accessible(access.master) {
+                    return BusResult::plain(OPEN_BUS, cycles);
+                }
                 let off = (addr & 0x01FF_FFFF) as usize;
                 let value = if off + width.bytes() as usize <= self.memory.rom.len() {
                     read_le(&self.memory.rom, off, width)
                 } else {
                     rom_open_bus(addr, width)
                 };
-                BusResult::plain(value, self.rom_cycles(addr >> 24, width, access.sequence))
+                BusResult::plain(value, cycles)
             }
             0x0E | 0x0F => {
+                let cycles = self.sram_cycles();
+                if !sram_accessible(access.master) {
+                    return BusResult::plain(OPEN_BUS, cycles);
+                }
                 let byte = self.memory.sram[addr as usize & (SRAM_SIZE - 1)];
-                BusResult::plain(sram_replicate(byte, width), self.sram_cycles())
+                BusResult::plain(sram_replicate(byte, width), cycles)
             }
             _ => BusResult::plain(OPEN_BUS, 1),
         }
@@ -165,10 +177,12 @@ impl Bus {
                 } else {
                     false
                 };
+                // A write that enabled an immediate-timing DMA runs it now.
+                let dma_ran = self.run_pending_dmas(scheduler);
                 BusResult {
                     value: (),
                     cycles: fixed_cycles(1, 1, width),
-                    scheduling_changed: changed,
+                    scheduling_changed: changed || dma_ran,
                 }
             }
             0x05 => {
@@ -192,8 +206,11 @@ impl Bus {
             }
             0x08..=0x0D => BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence)),
             0x0E | 0x0F => {
-                // SRAM is an 8-bit bus: only the low byte is written.
-                self.memory.sram[addr as usize & (SRAM_SIZE - 1)] = value as u8;
+                // SRAM is an 8-bit bus, CPU-only: writes from a DMA master are
+                // dropped, and only the low byte is written.
+                if sram_accessible(access.master) {
+                    self.memory.sram[addr as usize & (SRAM_SIZE - 1)] = value as u8;
+                }
                 BusResult::plain((), self.sram_cycles())
             }
             _ => BusResult::plain((), 1),
@@ -232,11 +249,105 @@ impl Bus {
         const NONSEQ: [u32; 4] = [4, 3, 2, 8];
         1 + NONSEQ[(self.io.control.waitcnt() & 3) as usize]
     }
+
+    /// Run any channels armed for an immediate-timing start (after an MMIO write
+    /// enabled one). Returns whether any transfer ran. Channels run in priority
+    /// order, DMA0 highest.
+    pub fn run_pending_dmas(&mut self, scheduler: &mut Scheduler<EventKind>) -> bool {
+        let mut ran = false;
+        for i in 0..4 {
+            if self.io.dma.channels[i].start_pending {
+                self.io.dma.channels[i].start_pending = false;
+                self.run_dma_channel(i, scheduler);
+                ran = true;
+            }
+        }
+        ran
+    }
+
+    /// Trigger enabled channels waiting on a blank timing, in priority order.
+    pub fn trigger_dma(&mut self, timing: DmaTiming, scheduler: &mut Scheduler<EventKind>) -> bool {
+        let mut ran = false;
+        for i in 0..4 {
+            let channel = &self.io.dma.channels[i];
+            if channel.enabled && channel.timing() == timing {
+                self.run_dma_channel(i, scheduler);
+                ran = true;
+            }
+        }
+        ran
+    }
+
+    /// Perform channel `i`'s transfer as a bus master. The whole transfer runs at
+    /// the current instant; guest cycles are not yet charged (see [`crate::dma`]).
+    fn run_dma_channel(&mut self, i: usize, scheduler: &mut Scheduler<EventKind>) {
+        let channel = self.io.dma.channels[i]; // snapshot of config
+        let is_32bit = channel.is_32bit();
+        let source_step = channel.source_step();
+        let dest_step = channel.dest_step();
+        let mut source = channel.internal_source;
+        let mut dest = channel.internal_dest;
+        let mut sequence = AccessSequence::NonSequential;
+
+        for _ in 0..channel.internal_count {
+            let access = Access::dma(i as u8, AccessKind::Data, sequence);
+            if is_32bit {
+                let value = self.read32(source, access, scheduler).value;
+                self.write32(dest, value, access, scheduler);
+            } else {
+                let value = self.read16(source, access, scheduler).value;
+                self.write16(dest, value, access, scheduler);
+            }
+            source = source.wrapping_add(source_step);
+            dest = dest.wrapping_add(dest_step);
+            sequence = AccessSequence::Sequential;
+        }
+
+        // Update internal pointers and handle repeat / auto-disable.
+        let channel = &mut self.io.dma.channels[i];
+        channel.internal_source = source;
+        if channel.repeat() && channel.timing() != DmaTiming::Immediate {
+            channel.internal_count = channel.latched_count();
+            channel.internal_dest = if channel.dest_reloads() {
+                channel.masked_dest()
+            } else {
+                dest
+            };
+        } else {
+            channel.internal_dest = dest;
+            channel.enabled = false;
+            channel.control &= !(1 << 15); // clear the enable bit
+        }
+
+        if channel.irq_on_end() {
+            self.io.irq.request(dma_irq_source(i));
+        }
+    }
+}
+
+/// The interrupt source raised on completion of DMA channel `i`.
+fn dma_irq_source(i: usize) -> IrqSource {
+    match i {
+        0 => IrqSource::Dma0,
+        1 => IrqSource::Dma1,
+        2 => IrqSource::Dma2,
+        _ => IrqSource::Dma3,
+    }
 }
 
 /// Value returned for reads of unmapped addresses. Real open-bus returns the
 /// last value on the bus; this is a placeholder until that is tracked.
 const OPEN_BUS: u32 = 0;
+
+/// Only the CPU and DMA3 may access GamePak ROM.
+fn rom_accessible(master: AccessMaster) -> bool {
+    matches!(master, AccessMaster::Cpu | AccessMaster::Dma(3))
+}
+
+/// GamePak SRAM is accessible by the CPU only — no DMA channel may reach it.
+fn sram_accessible(master: AccessMaster) -> bool {
+    matches!(master, AccessMaster::Cpu)
+}
 
 /// Align an address down to its access width.
 fn align(addr: u32, width: AccessWidth) -> u32 {
@@ -437,6 +548,64 @@ mod tests {
         assert_eq!(b.read16(0x0400_0100, CPU, &mut s).value, 0xFF00 + 100);
         // Reading control returns the parsed register.
         assert_eq!(b.read16(0x0400_0102, CPU, &mut s).value, (1 << 7) | (1 << 6));
+    }
+
+    #[test]
+    fn rom_is_accessible_only_by_cpu_and_dma3() {
+        let (mut b, mut s) = bus();
+        b.load_rom(vec![0x11, 0x22, 0x33, 0x44]);
+        // The CPU and DMA3 read the cartridge.
+        assert_eq!(b.read16(0x0800_0000, Access::cpu_data(), &mut s).value, 0x2211);
+        assert_eq!(b.read16(0x0800_0000, Access::dma_data(3), &mut s).value, 0x2211);
+        // DMA0-2 cannot reach ROM: open bus.
+        assert_eq!(b.read16(0x0800_0000, Access::dma_data(0), &mut s).value, 0);
+        assert_eq!(b.read16(0x0800_0000, Access::dma_data(1), &mut s).value, 0);
+    }
+
+    #[test]
+    fn sram_is_accessible_only_by_cpu() {
+        let (mut b, mut s) = bus();
+        b.write8(0x0E00_0000, 0xAB, Access::cpu_data(), &mut s);
+        assert_eq!(b.read8(0x0E00_0000, Access::cpu_data(), &mut s).value, 0xAB);
+        // No DMA channel, not even DMA3, may touch SRAM.
+        assert_eq!(b.read8(0x0E00_0000, Access::dma_data(3), &mut s).value, 0);
+        b.write8(0x0E00_0000, 0xFF, Access::dma_data(3), &mut s);
+        assert_eq!(b.read8(0x0E00_0000, Access::cpu_data(), &mut s).value, 0xAB);
+    }
+
+    #[test]
+    fn immediate_dma_copies_and_auto_disables() {
+        let (mut b, mut s) = bus();
+        // Source words in EWRAM.
+        b.write32(0x0200_0000, 0x1111_1111, CPU, &mut s);
+        b.write32(0x0200_0004, 0x2222_2222, CPU, &mut s);
+        // DMA0: EWRAM -> IWRAM, 2 words, 32-bit, IRQ, immediate.
+        b.write32(0x0400_00B0, 0x0200_0000, CPU, &mut s); // SAD
+        b.write32(0x0400_00B4, 0x0300_0000, CPU, &mut s); // DAD
+        b.write16(0x0400_00B8, 2, CPU, &mut s); // count
+        let result = b.write16(0x0400_00BA, (1 << 15) | (1 << 10) | (1 << 14), CPU, &mut s);
+
+        assert!(result.scheduling_changed); // a transfer ran
+        assert_eq!(b.read32(0x0300_0000, CPU, &mut s).value, 0x1111_1111);
+        assert_eq!(b.read32(0x0300_0004, CPU, &mut s).value, 0x2222_2222);
+        // Completion interrupt requested, and (repeat off) the enable bit cleared.
+        assert_ne!(b.io.irq.iflags() & IrqSource::Dma0.mask(), 0);
+        assert_eq!(b.read16(0x0400_00BA, CPU, &mut s).value & (1 << 15), 0);
+    }
+
+    #[test]
+    fn dma_source_fixed_replicates_into_dest() {
+        let (mut b, mut s) = bus();
+        b.write16(0x0200_0000, 0xBEEF, CPU, &mut s);
+        b.write32(0x0400_00B0, 0x0200_0000, CPU, &mut s); // SAD
+        b.write32(0x0400_00B4, 0x0300_0000, CPU, &mut s); // DAD
+        b.write16(0x0400_00B8, 4, CPU, &mut s); // count 4
+        // Enable, 16-bit, source fixed (control bits 7-8 = 2), dest increment.
+        b.write16(0x0400_00BA, (1 << 15) | (2 << 7), CPU, &mut s);
+
+        for i in 0..4 {
+            assert_eq!(b.read16(0x0300_0000 + i * 2, CPU, &mut s).value, 0xBEEF);
+        }
     }
 
     #[test]

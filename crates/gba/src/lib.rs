@@ -6,6 +6,7 @@
 //! machine whose [`Bus`] the CPU (and later DMA) drives.
 
 pub mod bus;
+pub mod dma;
 pub mod event;
 pub mod interrupt;
 pub mod io;
@@ -15,6 +16,7 @@ pub mod system;
 pub mod timer;
 
 pub use bus::{Bus, Memory};
+pub use dma::{Dma, DmaChannel, DmaTiming};
 pub use event::{EventKind, PpuEvent, TimerEvent};
 pub use interrupt::{InterruptController, IrqSource};
 pub use io::{Io, PowerState, SystemControl};

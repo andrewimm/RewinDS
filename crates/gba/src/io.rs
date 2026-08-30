@@ -8,6 +8,7 @@
 //! Only the registers backed by a modeled device are wired up; other I/O reads
 //! as zero and ignores writes for now.
 
+use crate::dma::Dma;
 use crate::event::EventKind;
 use crate::interrupt::{InterruptController, IrqSource};
 use crate::ppu::Ppu;
@@ -68,6 +69,7 @@ pub struct Io {
     pub control: SystemControl,
     pub irq: InterruptController,
     pub timers: Timers,
+    pub dma: Dma,
     pub video: Ppu,
 }
 
@@ -147,6 +149,7 @@ impl Io {
         match offset {
             0x004 => self.video.read_dispstat(),
             0x006 => self.video.read_vcount(),
+            0x0B0..=0x0DF => self.dma.read_register(offset),
             0x100 | 0x104 | 0x108 | 0x10C => {
                 self.timers.read_counter(timer_at(offset, 0x100), now)
             }
@@ -171,6 +174,11 @@ impl Io {
                 false
             }
             // 0x006 VCOUNT is read-only.
+            0x0B0..=0x0DF => {
+                self.dma.write_register(offset, value, mask);
+                // The transfer itself is run by the bus after this returns.
+                false
+            }
             0x100 | 0x104 | 0x108 | 0x10C => {
                 let id = timer_at(offset, 0x100);
                 let merged = merge(self.timers.read_reload(id), value, mask);

@@ -73,6 +73,20 @@ impl Access {
     pub const fn cpu_data() -> Access {
         Access::cpu(AccessKind::Data, AccessSequence::NonSequential)
     }
+
+    /// A DMA-channel access of the given kind and sequence.
+    pub const fn dma(channel: u8, kind: AccessKind, sequence: AccessSequence) -> Access {
+        Access {
+            master: AccessMaster::Dma(channel),
+            kind,
+            sequence,
+        }
+    }
+
+    /// A non-sequential DMA data access on `channel`.
+    pub const fn dma_data(channel: u8) -> Access {
+        Access::dma(channel, AccessKind::Data, AccessSequence::NonSequential)
+    }
 }
 
 /// The outcome of a bus access: the value read (or `()` for a write), the guest

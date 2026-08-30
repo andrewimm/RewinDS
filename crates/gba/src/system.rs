@@ -261,6 +261,36 @@ mod tests {
     }
 
     #[test]
+    fn hblank_dma_fires_on_a_visible_scanline() {
+        use emu_core::Access;
+        let mut sys = System::new();
+        let cpu = Access::cpu_data();
+        let bus = &mut sys.gba.bus;
+        let sched = &mut sys.scheduler;
+
+        bus.write16(0x0200_0000, 0xABCD, cpu, sched); // source in EWRAM
+        bus.write32(0x0400_00B0, 0x0200_0000, cpu, sched); // SAD
+        bus.write32(0x0400_00B4, 0x0300_0000, cpu, sched); // DAD -> IWRAM
+        bus.write16(0x0400_00B8, 1, cpu, sched); // one unit
+        // Enable, 16-bit, HBlank timing (2<<12), repeat so it stays armed.
+        bus.write16(0x0400_00BA, (1 << 15) | (1 << 9) | (2 << 12), cpu, sched);
+
+        sys.start_lcd();
+        // Nothing transferred yet (HBlank timing, not immediate).
+        assert_eq!(
+            sys.gba.bus.read16(0x0300_0000, cpu, &mut sys.scheduler).value,
+            0
+        );
+
+        // Line 0's HBlank at cycle 1006 triggers the transfer.
+        sys.run_until(1006);
+        assert_eq!(
+            sys.gba.bus.read16(0x0300_0000, cpu, &mut sys.scheduler).value,
+            0xABCD
+        );
+    }
+
+    #[test]
     fn stop_wakes_only_on_stop_sources() {
         let mut sys = System::new();
         sys.gba.bus.io.irq.set_ie(0xFFFF);
