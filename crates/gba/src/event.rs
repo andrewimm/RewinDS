@@ -11,6 +11,17 @@ use crate::timer::TimerId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Timer(TimerEvent),
+    Ppu(PpuEvent),
+}
+
+/// PPU timing events. The display runs continuously, two events per scanline;
+/// VBlank and V-counter transitions are derived at each line start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PpuEvent {
+    /// A new scanline begins: VCOUNT advances and per-line state updates.
+    LineStart,
+    /// The current scanline enters its horizontal blank.
+    HBlank,
 }
 
 /// Timer events.

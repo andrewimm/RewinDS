@@ -8,7 +8,7 @@
 
 use crate::event::EventKind;
 use crate::machine::Gba;
-use emu_core::Scheduler;
+use emu_core::{Scheduler, Timestamp};
 
 /// The whole GBA: one timeline, one device machine.
 #[derive(Clone, Debug, Default)]
@@ -37,6 +37,31 @@ impl System {
     /// Dispatch every event due at the current time into the machine.
     pub fn run_due_events(&mut self) {
         self.scheduler.run_due_events(&mut self.gba);
+    }
+
+    /// Begin LCD timing, starting the PPU's continuous scanline schedule.
+    pub fn start_lcd(&mut self) {
+        let now = self.scheduler.now();
+        self.gba.ppu.start(now, &mut self.scheduler);
+    }
+
+    /// Advance the timeline to `target`, dispatching every event due up to it.
+    ///
+    /// This is the no-CPU stand-in for the execution loop: with no instructions
+    /// to run, time simply advances and device events fire in order. It becomes
+    /// the event-dispatch half of the real loop once the CPU can consume the
+    /// cycle budget between events.
+    pub fn run_until(&mut self, target: Timestamp) {
+        while let Some(deadline) = self.scheduler.next_deadline() {
+            if deadline > target {
+                break;
+            }
+            self.scheduler.set_now(deadline);
+            self.scheduler.run_due_events(&mut self.gba);
+        }
+        if self.scheduler.now() < target {
+            self.scheduler.set_now(target);
+        }
     }
 
     /// Progress a halted CPU by exactly one event: jump the timeline directly to
@@ -151,6 +176,86 @@ mod tests {
         let mut sys = System::new();
         sys.gba.write_haltcnt(0x00);
         assert_eq!(sys.run_while_halted(), HaltProgress::Deadlocked);
+    }
+
+    #[test]
+    fn ppu_scanline_timing_and_hblank_flag() {
+        let mut sys = System::new();
+        sys.start_lcd();
+
+        // Line 0, before HBlank (which begins at cycle 1006).
+        sys.run_until(1005);
+        assert_eq!(sys.gba.ppu.vcount(), 0);
+        assert!(!sys.gba.ppu.hblank_flag());
+
+        // HBlank flag is raised at 1006.
+        sys.run_until(1006);
+        assert!(sys.gba.ppu.hblank_flag());
+
+        // The next line starts at 1232: VCOUNT advances, HBlank flag clears.
+        sys.run_until(1232);
+        assert_eq!(sys.gba.ppu.vcount(), 1);
+        assert!(!sys.gba.ppu.hblank_flag());
+
+        // VCOUNT tracks elapsed lines.
+        sys.run_until(100 * 1232);
+        assert_eq!(sys.gba.ppu.vcount(), 100);
+    }
+
+    #[test]
+    fn vblank_sets_flag_and_requests_irq() {
+        let mut sys = System::new();
+        sys.gba.irq.set_ie(IrqSource::VBlank.mask());
+        sys.gba.irq.set_ime(true);
+        sys.gba.ppu.write_dispstat(1 << 3); // VBlank IRQ enable
+        sys.start_lcd();
+
+        // Just before VBlank (line 160 starts at 160 * 1232).
+        sys.run_until(159 * 1232);
+        assert!(!sys.gba.ppu.vblank_flag());
+        assert_eq!(sys.gba.irq.iflags() & IrqSource::VBlank.mask(), 0);
+
+        // Entering line 160 raises the flag and the interrupt.
+        sys.run_until(160 * 1232);
+        assert_eq!(sys.gba.ppu.vcount(), 160);
+        assert!(sys.gba.ppu.vblank_flag());
+        assert!(sys.gba.irq.line_asserted());
+    }
+
+    #[test]
+    fn vcount_match_requests_irq_on_the_selected_line() {
+        let mut sys = System::new();
+        sys.gba.irq.set_ie(IrqSource::VCounterMatch.mask());
+        sys.gba.irq.set_ime(true);
+        // LYC = 100, V-counter IRQ enabled.
+        sys.gba.ppu.write_dispstat((100 << 8) | (1 << 5));
+        sys.start_lcd();
+
+        sys.run_until(99 * 1232);
+        assert!(!sys.gba.ppu.vcount_match());
+        assert_eq!(sys.gba.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
+
+        sys.run_until(100 * 1232);
+        assert!(sys.gba.ppu.vcount_match());
+        assert_ne!(sys.gba.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
+    }
+
+    #[test]
+    fn hblank_irq_fires_every_scanline_including_vblank() {
+        let mut sys = System::new();
+        sys.gba.irq.set_ie(IrqSource::HBlank.mask());
+        sys.gba.ppu.write_dispstat(1 << 4); // HBlank IRQ enable
+        sys.start_lcd();
+
+        // Line 0 HBlank.
+        sys.run_until(1006);
+        assert_ne!(sys.gba.irq.iflags() & IrqSource::HBlank.mask(), 0);
+        sys.gba.irq.acknowledge(IrqSource::HBlank.mask());
+
+        // A VBlank scanline (line 200) still produces an HBlank interrupt.
+        sys.run_until(200 * 1232 + 1006);
+        assert_eq!(sys.gba.ppu.vcount(), 200);
+        assert_ne!(sys.gba.irq.iflags() & IrqSource::HBlank.mask(), 0);
     }
 
     #[test]

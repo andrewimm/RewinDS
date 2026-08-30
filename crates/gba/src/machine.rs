@@ -8,6 +8,7 @@
 
 use crate::event::EventKind;
 use crate::interrupt::{InterruptController, IrqSource};
+use crate::ppu::Ppu;
 use crate::timer::Timers;
 use emu_core::{EventContext, EventHandler};
 
@@ -32,6 +33,7 @@ const STOP_WAKE_MASK: u16 =
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gba {
     pub timers: Timers,
+    pub ppu: Ppu,
     pub irq: InterruptController,
     power: PowerState,
 }
@@ -87,6 +89,7 @@ impl EventHandler<EventKind> for Gba {
     fn handle(&mut self, event: EventKind, ctx: &mut EventContext<'_, EventKind>) {
         match event {
             EventKind::Timer(event) => self.timers.handle_overflow(event, &mut self.irq, ctx),
+            EventKind::Ppu(event) => self.ppu.handle_event(event, &mut self.irq, ctx),
         }
     }
 }
