@@ -147,6 +147,7 @@ impl Io {
 
     fn read16(&self, offset: u32, now: Timestamp) -> u16 {
         match offset {
+            0x000 => self.video.read_dispcnt(),
             0x004 => self.video.read_dispstat(),
             0x006 => self.video.read_vcount(),
             0x0B0..=0x0DF => self.dma.read_register(offset),
@@ -168,6 +169,11 @@ impl Io {
     /// scheduling may have changed.
     fn write16(&mut self, offset: u32, value: u16, mask: u16, scheduler: &mut Scheduler<EventKind>) -> bool {
         match offset {
+            0x000 => {
+                let merged = merge(self.video.read_dispcnt(), value, mask);
+                self.video.write_dispcnt(merged);
+                false
+            }
             0x004 => {
                 let merged = merge(self.video.read_dispstat(), value, mask);
                 self.video.write_dispstat(merged);

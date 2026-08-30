@@ -37,6 +37,9 @@ pub struct Ppu {
     vblank_irq_enable: bool,
     hblank_irq_enable: bool,
     vcount_irq_enable: bool,
+    /// `DISPCNT` — only the forced-blank bit (7) affects timing so far; the
+    /// register is stored whole so it reads back.
+    dispcnt: u16,
 }
 
 impl Ppu {
@@ -87,6 +90,29 @@ impl Ppu {
     /// Read `VCOUNT` (`4000006h`).
     pub fn read_vcount(&self) -> u16 {
         self.vcount
+    }
+
+    /// Read `DISPCNT` (`4000000h`).
+    pub fn read_dispcnt(&self) -> u16 {
+        self.dispcnt
+    }
+
+    /// Write `DISPCNT`.
+    pub fn write_dispcnt(&mut self, value: u16) {
+        self.dispcnt = value;
+    }
+
+    /// Whether the display is force-blanked (`DISPCNT` bit 7), during which the
+    /// PPU does not access video memory.
+    pub fn forced_blank(&self) -> bool {
+        self.dispcnt & (1 << 7) != 0
+    }
+
+    /// Whether the PPU is actively drawing and thus contending for video memory:
+    /// a visible scanline, outside HBlank, with the display enabled. A CPU or DMA
+    /// access to VRAM/palette/OAM during this window costs one extra cycle.
+    pub fn is_rendering(&self) -> bool {
+        self.vcount < VBLANK_START_LINE && !self.hblank_flag && !self.forced_blank()
     }
 
     /// Begin LCD timing at `now`, on scanline 0.

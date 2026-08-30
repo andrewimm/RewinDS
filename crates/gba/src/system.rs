@@ -291,6 +291,38 @@ mod tests {
     }
 
     #[test]
+    fn video_memory_contention_tracks_the_ppu() {
+        use emu_core::Access;
+        let mut sys = System::new();
+        let cpu = Access::cpu_data();
+        sys.start_lcd();
+
+        // Line 0, actively drawing: a VRAM halfword read pays +1 contention.
+        assert_eq!(
+            sys.gba.bus.read16(0x0600_0000, cpu, &mut sys.scheduler).cycles,
+            2
+        );
+
+        // During HBlank the PPU isn't fetching pixels: no penalty.
+        sys.run_until(1006);
+        assert_eq!(
+            sys.gba.bus.read16(0x0600_0000, cpu, &mut sys.scheduler).cycles,
+            1
+        );
+
+        // Back to a visible drawing phase, but force-blank the display: the PPU
+        // releases video memory, so access is full speed again.
+        sys.run_until(2 * 1232);
+        sys.gba
+            .bus
+            .write16(0x0400_0000, 1 << 7, cpu, &mut sys.scheduler); // DISPCNT force blank
+        assert_eq!(
+            sys.gba.bus.read16(0x0600_0000, cpu, &mut sys.scheduler).cycles,
+            1
+        );
+    }
+
+    #[test]
     fn stop_wakes_only_on_stop_sources() {
         let mut sys = System::new();
         sys.gba.bus.io.irq.set_ie(0xFFFF);

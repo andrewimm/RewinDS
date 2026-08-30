@@ -129,12 +129,16 @@ impl Bus {
             }
             0x05 => {
                 let off = addr as usize & (PALETTE_SIZE - 1);
-                BusResult::plain(read_le(&self.memory.palette, off, width), fixed_cycles(1, 2, width))
+                let cycles = fixed_cycles(1, 2, width) + self.video_contention();
+                BusResult::plain(read_le(&self.memory.palette, off, width), cycles)
             }
-            0x06 => BusResult::plain(read_le(&self.memory.vram, vram_offset(addr), width), fixed_cycles(1, 2, width)),
+            0x06 => {
+                let cycles = fixed_cycles(1, 2, width) + self.video_contention();
+                BusResult::plain(read_le(&self.memory.vram, vram_offset(addr), width), cycles)
+            }
             0x07 => {
                 let off = addr as usize & (OAM_SIZE - 1);
-                BusResult::plain(read_le(&self.memory.oam, off, width), 1)
+                BusResult::plain(read_le(&self.memory.oam, off, width), 1 + self.video_contention())
             }
             0x08..=0x0D => {
                 // Instruction fetches go through the prefetch buffer when it is
@@ -202,22 +206,25 @@ impl Bus {
             }
             0x05 => {
                 let off = addr as usize & (PALETTE_SIZE - 1);
+                let cycles = fixed_cycles(1, 2, width) + self.video_contention();
                 // A byte write duplicates into both halves of the halfword.
                 write_duplicating(&mut self.memory.palette, off, width, value);
-                BusResult::plain((), fixed_cycles(1, 2, width))
+                BusResult::plain((), cycles)
             }
             0x06 => {
                 let off = vram_offset(addr);
+                let cycles = fixed_cycles(1, 2, width) + self.video_contention();
                 write_duplicating(&mut self.memory.vram, off, width, value);
-                BusResult::plain((), fixed_cycles(1, 2, width))
+                BusResult::plain((), cycles)
             }
             0x07 => {
+                let cycles = 1 + self.video_contention();
                 // OAM ignores byte writes entirely.
                 if width != AccessWidth::Byte {
                     let off = addr as usize & (OAM_SIZE - 1);
                     write_le(&mut self.memory.oam, off, width, value);
                 }
-                BusResult::plain((), 1)
+                BusResult::plain((), cycles)
             }
             0x08..=0x0D => BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence)),
             0x0E | 0x0F => {
@@ -293,6 +300,16 @@ impl Bus {
     fn sram_cycles(&self) -> u32 {
         const NONSEQ: [u32; 4] = [4, 3, 2, 8];
         1 + NONSEQ[(self.io.control.waitcnt() & 3) as usize]
+    }
+
+    /// The extra cycle charged for a VRAM/palette/OAM access that collides with
+    /// the PPU drawing a visible scanline.
+    fn video_contention(&self) -> u32 {
+        if self.io.video.is_rendering() {
+            1
+        } else {
+            0
+        }
     }
 
     /// Run any channels armed for an immediate-timing start (after an MMIO write
