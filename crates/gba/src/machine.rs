@@ -67,9 +67,13 @@ impl EventHandler<EventKind> for Gba {
                 // visible scanlines; VBlank DMA fires as line 160 begins.
                 match event {
                     PpuEvent::HBlank if self.bus.io.video.vcount() < VBLANK_LINE => {
+                        // Draw the scanline that just finished, then run its HBlank DMA.
+                        self.bus.render_ppu_scanline();
                         self.bus.trigger_dma(DmaTiming::HBlank, ctx.scheduler);
                     }
                     PpuEvent::LineStart if self.bus.io.video.vcount() == VBLANK_LINE => {
+                        // The frame is complete as the vertical blank begins.
+                        self.bus.io.video.end_frame();
                         self.bus.trigger_dma(DmaTiming::VBlank, ctx.scheduler);
                     }
                     _ => {}

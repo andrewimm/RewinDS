@@ -1,15 +1,13 @@
-//! A timing-only model of the GBA's picture processing unit.
+//! The PPU's scanline/blank timing machine.
 //!
-//! No pixels are rendered here. This is the scanline/blank state machine the
-//! rest of the timing model — VCOUNT, the HBlank/VBlank/V-counter interrupts,
-//! and later the blank-triggered DMAs and the renderer itself — attaches to.
-//!
-//! The display runs continuously. Each of the 228 scanlines is 1232 cycles: the
-//! line starts (VCOUNT advances), then at cycle 1006 the horizontal blank
-//! begins, then at 1232 the next line starts. Two scheduled events per line
-//! drive this; VBlank and V-counter transitions are derived at line start. No
-//! generation invalidation is needed because DISPSTAT writes change only which
-//! interrupts are enabled and the V-count target, never the timing itself.
+//! No pixels here — this drives VCOUNT, the HBlank/VBlank/V-counter flags, and the
+//! display interrupts that the rest of the timing model attaches to. The display
+//! runs continuously: each of the 228 scanlines is 1232 cycles — the line starts
+//! (VCOUNT advances), the horizontal blank begins at cycle 1006, and the next line
+//! starts at 1232. Two scheduled events per line drive this; VBlank and V-counter
+//! transitions are derived at line start. No generation invalidation is needed
+//! because DISPSTAT writes change only which interrupts fire and the V-count
+//! target, never the timing itself.
 
 use crate::event::{EventKind, PpuEvent};
 use crate::interrupt::{InterruptController, IrqSource};
@@ -27,9 +25,9 @@ const VBLANK_START_LINE: u16 = 160;
 /// Last scanline for which the VBlank flag is set (227 clears it).
 const VBLANK_FLAG_LAST_LINE: u16 = 226;
 
-/// The PPU timing state (`DISPSTAT` control bits plus the current scanline).
+/// The PPU timing state: the `DISPSTAT` control bits and the current scanline.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Ppu {
+pub struct TimingState {
     vcount: u16,
     hblank_flag: bool,
     /// `DISPSTAT` V-count target (LYC).
@@ -37,16 +35,9 @@ pub struct Ppu {
     vblank_irq_enable: bool,
     hblank_irq_enable: bool,
     vcount_irq_enable: bool,
-    /// `DISPCNT` — only the forced-blank bit (7) affects timing so far; the
-    /// register is stored whole so it reads back.
-    dispcnt: u16,
 }
 
-impl Ppu {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl TimingState {
     /// The current scanline (VCOUNT), 0..=227.
     pub fn vcount(&self) -> u16 {
         self.vcount
@@ -92,29 +83,6 @@ impl Ppu {
         self.vcount
     }
 
-    /// Read `DISPCNT` (`4000000h`).
-    pub fn read_dispcnt(&self) -> u16 {
-        self.dispcnt
-    }
-
-    /// Write `DISPCNT`.
-    pub fn write_dispcnt(&mut self, value: u16) {
-        self.dispcnt = value;
-    }
-
-    /// Whether the display is force-blanked (`DISPCNT` bit 7), during which the
-    /// PPU does not access video memory.
-    pub fn forced_blank(&self) -> bool {
-        self.dispcnt & (1 << 7) != 0
-    }
-
-    /// Whether the PPU is actively drawing and thus contending for video memory:
-    /// a visible scanline, outside HBlank, with the display enabled. A CPU or DMA
-    /// access to VRAM/palette/OAM during this window costs one extra cycle.
-    pub fn is_rendering(&self) -> bool {
-        self.vcount < VBLANK_START_LINE && !self.hblank_flag && !self.forced_blank()
-    }
-
     /// Begin LCD timing at `now`, on scanline 0.
     pub fn start(&mut self, now: Timestamp, scheduler: &mut Scheduler<EventKind>) {
         self.vcount = 0;
@@ -122,7 +90,8 @@ impl Ppu {
         self.schedule_line_events(now, scheduler);
     }
 
-    /// Dispatch a PPU timing event.
+    /// Dispatch a PPU timing event, returning the event kind so the aggregate can
+    /// react (e.g. latch registers at line start).
     pub fn handle_event(
         &mut self,
         event: PpuEvent,
@@ -140,7 +109,7 @@ impl Ppu {
         // The HBlank interrupt fires on every scanline, VBlank lines included —
         // matching hardware. (GBATEK's "no HBlank IRQ within VBlank" note is
         // inaccurate; it is HBlank-triggered *DMA* that is restricted to the
-        // visible lines, which will matter when DMA is added.)
+        // visible lines, which the machine enforces separately.)
         if self.hblank_irq_enable {
             irq.request(IrqSource::HBlank);
         }
@@ -181,20 +150,20 @@ mod tests {
 
     #[test]
     fn dispstat_round_trips_control_bits() {
-        let mut ppu = Ppu::new();
+        let mut timing = TimingState::default();
         // LYC = 100, V-count IRQ and VBlank IRQ enabled.
-        ppu.write_dispstat((100 << 8) | (1 << 5) | (1 << 3));
-        assert_eq!(ppu.vcount_target, 100);
+        timing.write_dispstat((100 << 8) | (1 << 5) | (1 << 3));
+        assert_eq!(timing.vcount_target, 100);
         // At line 0: no flags set, so the read is just the control bits back.
-        assert_eq!(ppu.read_dispstat(), (100 << 8) | (1 << 5) | (1 << 3));
+        assert_eq!(timing.read_dispstat(), (100 << 8) | (1 << 5) | (1 << 3));
     }
 
     #[test]
     fn hblank_flag_reads_back_in_dispstat() {
-        let mut ppu = Ppu::new();
+        let mut timing = TimingState::default();
         let mut irq = InterruptController::new();
-        ppu.on_hblank(&mut irq);
-        assert!(ppu.hblank_flag());
-        assert_ne!(ppu.read_dispstat() & (1 << 1), 0);
+        timing.on_hblank(&mut irq);
+        assert!(timing.hblank_flag());
+        assert_ne!(timing.read_dispstat() & (1 << 1), 0);
     }
 }

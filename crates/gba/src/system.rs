@@ -9,6 +9,8 @@
 use crate::bus::Bus;
 use crate::event::EventKind;
 use crate::machine::Gba;
+use crate::ppu::debug::{ExplainError, PixelExplanation, ScanlineExplanation, VideoInstrumentation};
+use crate::ppu::Color15;
 use crate::trace::{describe_event, io_register_name, Trace};
 use arm::cpu::{Bus as CpuMemory, Cpu, Timed};
 use emu_core::{Access, AccessKind, AccessSequence, Scheduler, Timestamp};
@@ -21,6 +23,8 @@ pub struct System {
     pub gba: Gba,
     /// Optional event trace (off by default; see [`System::enable_trace`]).
     trace: Option<Trace>,
+    /// Which video instrumentation a running frame collects (off by default).
+    video_debug: VideoInstrumentation,
 }
 
 /// Adapts the GBA [`Bus`] and [`Scheduler`] to the CPU's memory interface: it
@@ -187,6 +191,32 @@ impl System {
     pub fn start_lcd(&mut self) {
         let now = self.scheduler.now();
         self.gba.bus.io.video.start(now, &mut self.scheduler);
+    }
+
+    /// Select which video instrumentation a running frame collects. Off by default
+    /// and zero-cost when off; mirrors the event-trace opt-in.
+    pub fn set_video_instrumentation(&mut self, level: VideoInstrumentation) {
+        self.video_debug = level;
+    }
+
+    /// The current video instrumentation level.
+    pub fn video_instrumentation(&self) -> VideoInstrumentation {
+        self.video_debug
+    }
+
+    /// The current output image, in canonical BGR555.
+    pub fn framebuffer(&self) -> &[Color15] {
+        self.gba.bus.io.video.framebuffer()
+    }
+
+    /// Explain how the pixel at `(x, y)` in the current state came to be its color.
+    pub fn explain_pixel(&mut self, x: u16, y: u16) -> Result<PixelExplanation, ExplainError> {
+        self.gba.bus.explain_pixel(x, y)
+    }
+
+    /// A whole-scanline debug summary for line `y`.
+    pub fn inspect_scanline(&mut self, y: u16) -> ScanlineExplanation {
+        self.gba.bus.inspect_scanline(y)
     }
 
     /// Advance the timeline to `target`, dispatching every event due up to it.
@@ -598,6 +628,33 @@ mod tests {
             sys.gba.bus.read16(0x0600_0000, cpu, &mut sys.scheduler).cycles,
             1
         );
+    }
+
+    #[test]
+    fn frame_renders_mode3_through_scanline_timing() {
+        use crate::ppu::Color15;
+        use emu_core::Access;
+        let mut sys = System::new();
+        let cpu = Access::cpu_data();
+
+        // Mode 3 with BG2 enabled, via the real MMIO path.
+        sys.gba
+            .bus
+            .write16(0x0400_0000, 0x0003 | (1 << 10), cpu, &mut sys.scheduler);
+        // Pixel (0, 2) = blue (0x7C00): byte offset (2*240 + 0) * 2 = 960.
+        let off = (2 * 240) * 2;
+        sys.gba.bus.memory.vram[off..off + 2].copy_from_slice(&0x7C00u16.to_le_bytes());
+
+        sys.start_lcd();
+        // Advance through line 2's HBlank (2*1232 + 1006), where line 2 is drawn.
+        sys.advance_time(2 * 1232 + 1006);
+
+        // The timing-driven render wrote the pixel into the framebuffer.
+        assert_eq!(sys.framebuffer()[2 * 240], Color15(0x7C00));
+        // And the debug API explains it back to its VRAM source.
+        let explanation = sys.explain_pixel(0, 2).unwrap();
+        assert_eq!(explanation.final_color, Color15(0x7C00));
+        assert_eq!(explanation.video_mode, 3);
     }
 
     #[test]

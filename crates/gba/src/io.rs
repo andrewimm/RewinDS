@@ -64,7 +64,7 @@ impl SystemControl {
 }
 
 /// The memory-mapped devices.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Io {
     pub control: SystemControl,
     pub irq: InterruptController,
@@ -150,6 +150,7 @@ impl Io {
             0x000 => self.video.read_dispcnt(),
             0x004 => self.video.read_dispstat(),
             0x006 => self.video.read_vcount(),
+            0x008..=0x054 => self.video.read_video_register(offset),
             0x0B0..=0x0DF => self.dma.read_register(offset),
             0x100 | 0x104 | 0x108 | 0x10C => {
                 self.timers.read_counter(timer_at(offset, 0x100), now)
@@ -180,6 +181,10 @@ impl Io {
                 false
             }
             // 0x006 VCOUNT is read-only.
+            0x008..=0x054 => {
+                self.video.write_video_register(offset, value, mask);
+                false
+            }
             0x0B0..=0x0DF => {
                 self.dma.write_register(offset, value, mask);
                 // The transfer itself is run by the bus after this returns.

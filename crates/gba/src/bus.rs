@@ -10,6 +10,8 @@ use crate::dma::DmaTiming;
 use crate::event::EventKind;
 use crate::interrupt::IrqSource;
 use crate::io::Io;
+use crate::ppu::debug::{ExplainError, PixelExplanation, ScanlineExplanation};
+use crate::ppu::memory::PpuMemoryView;
 use crate::prefetch::Prefetch;
 use emu_core::{
     Access, AccessKind, AccessMaster, AccessSequence, AccessWidth, BusResult, Scheduler,
@@ -283,6 +285,32 @@ impl Bus {
     /// Take (and clear) the guest cycles DMA has stalled the CPU for.
     pub fn take_dma_stall_cycles(&mut self) -> u64 {
         std::mem::take(&mut self.dma_stall_cycles)
+    }
+
+    /// Draw the visible scanline that just finished into the PPU framebuffer.
+    ///
+    /// `&self.memory` (shared) and `&mut self.io` (exclusive) are disjoint fields,
+    /// so the borrow checker splits them — the renderer reads VRAM/palette/OAM
+    /// through a read-only view while the PPU owns the framebuffer it writes.
+    pub fn render_ppu_scanline(&mut self) {
+        let view = PpuMemoryView::new(&self.memory);
+        self.io.video.render_current_scanline(&view);
+    }
+
+    /// Explain how the pixel at `(x, y)` came to be its color (same split borrow).
+    pub fn explain_pixel(
+        &mut self,
+        x: u16,
+        y: u16,
+    ) -> Result<PixelExplanation, ExplainError> {
+        let view = PpuMemoryView::new(&self.memory);
+        self.io.video.explain_current_pixel(x, y, &view)
+    }
+
+    /// A whole-scanline debug summary (same split borrow).
+    pub fn inspect_scanline(&mut self, y: u16) -> ScanlineExplanation {
+        let view = PpuMemoryView::new(&self.memory);
+        self.io.video.inspect_scanline(y, &view)
     }
 
     /// The (non-sequential, sequential) wait cycles for a gamepak wait-state

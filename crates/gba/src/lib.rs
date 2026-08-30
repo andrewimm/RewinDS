@@ -24,7 +24,10 @@ pub use event::{EventKind, PpuEvent, TimerEvent};
 pub use interrupt::{InterruptController, IrqSource};
 pub use io::{Io, PowerState, SystemControl};
 pub use machine::Gba;
-pub use ppu::Ppu;
+pub use ppu::debug::{
+    ExplainError, PixelExplanation, ScanlineExplanation, SourceProvenance, VideoInstrumentation,
+};
+pub use ppu::{Color15, LayerId, Ppu};
 pub use system::{HaltProgress, System};
 pub use timer::{TimerId, Timers};
 pub use trace::{Trace, TraceRecord};
