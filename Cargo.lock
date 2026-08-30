@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "arm"
 version = "0.1.0"
+
+[[package]]
+name = "emu-core"
+version = "0.1.0"
