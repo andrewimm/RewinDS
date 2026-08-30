@@ -6,15 +6,109 @@
 //! loop once an interpreter exists; for now it implements the HALT/wake
 //! progression, which needs no CPU and is an early end-to-end scheduler test.
 
+use crate::bus::Bus;
 use crate::event::EventKind;
 use crate::machine::Gba;
-use emu_core::{Scheduler, Timestamp};
+use arm::cpu::{Bus as CpuMemory, Cpu, Timed};
+use emu_core::{Access, AccessKind, AccessSequence, Scheduler, Timestamp};
 
-/// The whole GBA: one timeline, one device machine.
+/// The whole GBA: the CPU, one timeline, and the device machine.
 #[derive(Clone, Debug, Default)]
 pub struct System {
+    pub cpu: Cpu,
     pub scheduler: Scheduler<EventKind>,
     pub gba: Gba,
+}
+
+/// Adapts the GBA [`Bus`] and [`Scheduler`] to the CPU's memory interface: it
+/// tags each access as a CPU instruction/data access, advances the timeline by
+/// the cycles consumed, folds in any DMA stall a store triggered, and steps the
+/// ROM prefetcher on internal cycles.
+struct CpuBus<'a> {
+    bus: &'a mut Bus,
+    scheduler: &'a mut Scheduler<EventKind>,
+}
+
+impl CpuBus<'_> {
+    fn advance(&mut self, cycles: u32) {
+        let now = self.scheduler.now().saturating_add(cycles as u64);
+        self.scheduler.set_now(now);
+    }
+}
+
+fn cpu_access(kind: AccessKind, sequential: bool) -> Access {
+    let sequence = if sequential {
+        AccessSequence::Sequential
+    } else {
+        AccessSequence::NonSequential
+    };
+    Access::cpu(kind, sequence)
+}
+
+impl CpuMemory for CpuBus<'_> {
+    fn fetch32(&mut self, address: u32, sequential: bool) -> Timed<u32> {
+        let read = self
+            .bus
+            .read32(address, cpu_access(AccessKind::Instruction, sequential), self.scheduler);
+        self.advance(read.cycles);
+        Timed { value: read.value, cycles: read.cycles }
+    }
+    fn fetch16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
+        let read = self
+            .bus
+            .read16(address, cpu_access(AccessKind::Instruction, sequential), self.scheduler);
+        self.advance(read.cycles);
+        Timed { value: read.value, cycles: read.cycles }
+    }
+    fn load32(&mut self, address: u32, sequential: bool) -> Timed<u32> {
+        let read = self
+            .bus
+            .read32(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.advance(read.cycles);
+        Timed { value: read.value, cycles: read.cycles }
+    }
+    fn load16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
+        let read = self
+            .bus
+            .read16(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.advance(read.cycles);
+        Timed { value: read.value, cycles: read.cycles }
+    }
+    fn load8(&mut self, address: u32, sequential: bool) -> Timed<u8> {
+        let read = self
+            .bus
+            .read8(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        self.advance(read.cycles);
+        Timed { value: read.value, cycles: read.cycles }
+    }
+    fn store32(&mut self, address: u32, value: u32, sequential: bool) -> u32 {
+        let write = self
+            .bus
+            .write32(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
+        self.advance(cycles);
+        cycles
+    }
+    fn store16(&mut self, address: u32, value: u16, sequential: bool) -> u32 {
+        let write = self
+            .bus
+            .write16(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
+        self.advance(cycles);
+        cycles
+    }
+    fn store8(&mut self, address: u32, value: u8, sequential: bool) -> u32 {
+        let write = self
+            .bus
+            .write8(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
+        let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
+        self.advance(cycles);
+        cycles
+    }
+    fn internal(&mut self, cycles: u32) {
+        self.bus.step_prefetch(cycles);
+        self.advance(cycles);
+    }
 }
 
 /// The result of progressing a low-power machine by one event.
@@ -51,7 +145,7 @@ impl System {
     /// to run, time simply advances and device events fire in order. It becomes
     /// the event-dispatch half of the real loop once the CPU can consume the
     /// cycle budget between events.
-    pub fn run_until(&mut self, target: Timestamp) {
+    pub fn advance_time(&mut self, target: Timestamp) {
         while let Some(deadline) = self.scheduler.next_deadline() {
             if deadline > target {
                 break;
@@ -61,6 +155,53 @@ impl System {
         }
         if self.scheduler.now() < target {
             self.scheduler.set_now(target);
+        }
+    }
+
+    /// Run the machine until the guest timeline reaches `target`.
+    ///
+    /// Each iteration runs the CPU (or, when halted, idles) up to the next event
+    /// deadline, then dispatches the events due there. This is the canonical
+    /// execution loop: the CPU consumes the cycle budget between events, MMIO it
+    /// writes can reschedule, and interrupts are accepted at instruction
+    /// boundaries.
+    pub fn run_until(&mut self, target: Timestamp) {
+        while self.scheduler.now() < target {
+            let deadline = self
+                .scheduler
+                .next_deadline()
+                .map_or(target, |d| d.min(target));
+
+            if self.gba.is_low_power() {
+                // The CPU executes nothing; jump straight to the deadline.
+                self.scheduler.set_now(deadline);
+            } else {
+                while self.scheduler.now() < deadline && !self.gba.is_low_power() {
+                    // Accept a pending interrupt at this instruction boundary.
+                    if self.gba.bus.io.irq.line_asserted() && self.cpu.irq_enabled() {
+                        self.cpu.take_irq();
+                    }
+                    let mut memory = CpuBus {
+                        bus: &mut self.gba.bus,
+                        scheduler: &mut self.scheduler,
+                    };
+                    self.cpu.step(&mut memory);
+                }
+            }
+
+            self.scheduler.run_due_events(&mut self.gba);
+
+            // A blank-triggered DMA during event dispatch also stalls the CPU.
+            let stall = self.gba.bus.take_dma_stall_cycles();
+            if stall > 0 {
+                let now = self.scheduler.now().saturating_add(stall);
+                self.scheduler.set_now(now);
+            }
+
+            // Wake from a low-power state once an interrupt is pending.
+            if self.gba.is_low_power() && self.gba.should_wake() {
+                self.gba.wake();
+            }
         }
     }
 
@@ -180,27 +321,71 @@ mod tests {
         assert_eq!(sys.run_while_halted(), HaltProgress::Deadlocked);
     }
 
+    /// Write little-endian ARM words into IWRAM starting at its base.
+    fn load_iwram(sys: &mut System, program: &[u32]) {
+        for (i, word) in program.iter().enumerate() {
+            sys.gba.bus.memory.iwram[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn cpu_executes_a_program_from_iwram() {
+        let mut sys = System::new();
+        // mov r0, #5 ; add r0, r0, #3 ; b . (spin)
+        load_iwram(&mut sys, &[0xE3A0_0005, 0xE280_0003, 0xEAFF_FFFE]);
+        sys.cpu.set_pc(0x0300_0000);
+        sys.run_until(200);
+        assert_eq!(sys.cpu.register(0), 8);
+        assert!(sys.scheduler.now() >= 200);
+    }
+
+    #[test]
+    fn cpu_services_a_timer_interrupt() {
+        use arm::cpu::Mode;
+        let mut sys = System::new();
+        // A spin loop the CPU runs until the interrupt arrives.
+        load_iwram(&mut sys, &[0xEAFF_FFFE]); // b .
+        sys.cpu.set_pc(0x0300_0000);
+
+        // Enable Timer0's interrupt, and arm it to overflow at cycle 50.
+        sys.gba.bus.io.irq.set_ie(IrqSource::Timer0.mask());
+        sys.gba.bus.io.irq.set_ime(true);
+        let now = sys.scheduler.now();
+        sys.gba.bus.io.timers.write_reload(TimerId::Timer0, 0xFFCE); // 0x10000 - 50
+        sys.gba
+            .bus
+            .io
+            .timers
+            .write_control(TimerId::Timer0, START | IRQ, now, &mut sys.scheduler);
+
+        sys.run_until(100);
+        // The overflow requested the IRQ, and the CPU accepted it: it is now in
+        // IRQ mode, executing from the exception vector.
+        assert_eq!(sys.cpu.mode(), Some(Mode::Irq));
+        assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::Timer0.mask(), 0);
+    }
+
     #[test]
     fn ppu_scanline_timing_and_hblank_flag() {
         let mut sys = System::new();
         sys.start_lcd();
 
         // Line 0, before HBlank (which begins at cycle 1006).
-        sys.run_until(1005);
+        sys.advance_time(1005);
         assert_eq!(sys.gba.bus.io.video.vcount(), 0);
         assert!(!sys.gba.bus.io.video.hblank_flag());
 
         // HBlank flag is raised at 1006.
-        sys.run_until(1006);
+        sys.advance_time(1006);
         assert!(sys.gba.bus.io.video.hblank_flag());
 
         // The next line starts at 1232: VCOUNT advances, HBlank flag clears.
-        sys.run_until(1232);
+        sys.advance_time(1232);
         assert_eq!(sys.gba.bus.io.video.vcount(), 1);
         assert!(!sys.gba.bus.io.video.hblank_flag());
 
         // VCOUNT tracks elapsed lines.
-        sys.run_until(100 * 1232);
+        sys.advance_time(100 * 1232);
         assert_eq!(sys.gba.bus.io.video.vcount(), 100);
     }
 
@@ -213,12 +398,12 @@ mod tests {
         sys.start_lcd();
 
         // Just before VBlank (line 160 starts at 160 * 1232).
-        sys.run_until(159 * 1232);
+        sys.advance_time(159 * 1232);
         assert!(!sys.gba.bus.io.video.vblank_flag());
         assert_eq!(sys.gba.bus.io.irq.iflags() & IrqSource::VBlank.mask(), 0);
 
         // Entering line 160 raises the flag and the interrupt.
-        sys.run_until(160 * 1232);
+        sys.advance_time(160 * 1232);
         assert_eq!(sys.gba.bus.io.video.vcount(), 160);
         assert!(sys.gba.bus.io.video.vblank_flag());
         assert!(sys.gba.bus.io.irq.line_asserted());
@@ -233,11 +418,11 @@ mod tests {
         sys.gba.bus.io.video.write_dispstat((100 << 8) | (1 << 5));
         sys.start_lcd();
 
-        sys.run_until(99 * 1232);
+        sys.advance_time(99 * 1232);
         assert!(!sys.gba.bus.io.video.vcount_match());
         assert_eq!(sys.gba.bus.io.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
 
-        sys.run_until(100 * 1232);
+        sys.advance_time(100 * 1232);
         assert!(sys.gba.bus.io.video.vcount_match());
         assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::VCounterMatch.mask(), 0);
     }
@@ -250,12 +435,12 @@ mod tests {
         sys.start_lcd();
 
         // Line 0 HBlank.
-        sys.run_until(1006);
+        sys.advance_time(1006);
         assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::HBlank.mask(), 0);
         sys.gba.bus.io.irq.acknowledge(IrqSource::HBlank.mask());
 
         // A VBlank scanline (line 200) still produces an HBlank interrupt.
-        sys.run_until(200 * 1232 + 1006);
+        sys.advance_time(200 * 1232 + 1006);
         assert_eq!(sys.gba.bus.io.video.vcount(), 200);
         assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::HBlank.mask(), 0);
     }
@@ -283,7 +468,7 @@ mod tests {
         );
 
         // Line 0's HBlank at cycle 1006 triggers the transfer.
-        sys.run_until(1006);
+        sys.advance_time(1006);
         assert_eq!(
             sys.gba.bus.read16(0x0300_0000, cpu, &mut sys.scheduler).value,
             0xABCD
@@ -304,7 +489,7 @@ mod tests {
         );
 
         // During HBlank the PPU isn't fetching pixels: no penalty.
-        sys.run_until(1006);
+        sys.advance_time(1006);
         assert_eq!(
             sys.gba.bus.read16(0x0600_0000, cpu, &mut sys.scheduler).cycles,
             1
@@ -312,7 +497,7 @@ mod tests {
 
         // Back to a visible drawing phase, but force-blank the display: the PPU
         // releases video memory, so access is full speed again.
-        sys.run_until(2 * 1232);
+        sys.advance_time(2 * 1232);
         sys.gba
             .bus
             .write16(0x0400_0000, 1 << 7, cpu, &mut sys.scheduler); // DISPCNT force blank

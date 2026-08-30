@@ -5,4 +5,5 @@ edition = "2021"
 description = "GBA hardware semantics"
 
 [dependencies]
+arm = { path = "../arm" }
 emu-core = { path = "../emu-core" }
