@@ -272,6 +272,41 @@ impl Cpu {
         }
     }
 
+    /// Read a register operand of a data-processing instruction that uses a
+    /// register-specified shift. The extra internal cycle to read the shift
+    /// amount advances the prefetch one more instruction, so `r15` reads at
+    /// PC+12 (ARM) rather than PC+8.
+    fn reg_register_shifted(&self, register: Register) -> u32 {
+        if register.is_pc() {
+            self.r[15].wrapping_add(self.pc_offset() + 4)
+        } else {
+            self.r[register.index()]
+        }
+    }
+
+    /// Read register `index` from the User-mode bank, for `LDM/STM {..}^` without
+    /// r15 in the list, which always transfers the User registers.
+    fn reg_user(&self, index: usize) -> u32 {
+        match index {
+            8..=12 if self.cpsr.mode() == Some(Mode::Fiq) => self.banked_r8_r12[0][index - 8],
+            13 | 14 if !matches!(self.cpsr.mode(), Some(Mode::User | Mode::System)) => {
+                self.banked_r13_r14[0][index - 13]
+            }
+            _ => self.r[index],
+        }
+    }
+
+    /// Write register `index` in the User-mode bank (see [`Self::reg_user`]).
+    fn set_reg_user(&mut self, index: usize, value: u32) {
+        match index {
+            8..=12 if self.cpsr.mode() == Some(Mode::Fiq) => self.banked_r8_r12[0][index - 8] = value,
+            13 | 14 if !matches!(self.cpsr.mode(), Some(Mode::User | Mode::System)) => {
+                self.banked_r13_r14[0][index - 13] = value
+            }
+            _ => self.r[index] = value,
+        }
+    }
+
     /// Write a register. Writing `r15` redirects execution.
     fn set_reg(&mut self, register: Register, value: u32) {
         if register.is_pc() {
@@ -436,9 +471,17 @@ impl Cpu {
                     read.value as i8 as i32 as u32
                 }
                 HalfwordKind::SignedHalfword => {
-                    let read = bus.load16(address & !1, false);
-                    self.cycles += read.cycles as u64;
-                    read.value as i16 as i32 as u32
+                    // A misaligned (odd) LDRSH on ARM7TDMI loads a *signed byte*
+                    // from that address rather than a halfword.
+                    if address & 1 != 0 {
+                        let read = bus.load8(address, false);
+                        self.cycles += read.cycles as u64;
+                        read.value as i8 as i32 as u32
+                    } else {
+                        let read = bus.load16(address, false);
+                        self.cycles += read.cycles as u64;
+                        read.value as i16 as i32 as u32
+                    }
                 }
             };
             self.internal_cycles(bus, 1);
@@ -454,13 +497,37 @@ impl Cpu {
 
     fn execute_block_transfer<B: Bus>(&mut self, op: BlockTransfer, bus: &mut B) {
         self.data_access = true;
-        // An empty register list is an ARM7 edge case, not modeled yet.
+        let base = self.reg(op.rn);
         let count = op.register_list.count_ones();
         if count == 0 {
+            // ARM7TDMI empty-list edge case: only r15 is transferred, and the base
+            // is adjusted by 0x40 (as though all sixteen registers had moved).
+            let (address, writeback_value) = if op.add {
+                let start = if op.pre_indexed { base.wrapping_add(4) } else { base };
+                (start, base.wrapping_add(0x40))
+            } else {
+                let low = base.wrapping_sub(0x40);
+                let start = if op.pre_indexed { low } else { low.wrapping_add(4) };
+                (start, low)
+            };
+            if op.load {
+                let read = bus.load32(address, false);
+                self.cycles += read.cycles as u64;
+                self.internal_cycles(bus, 1);
+                if op.writeback {
+                    self.set_reg(op.rn, writeback_value);
+                }
+                self.set_reg(Register::new(15), read.value);
+            } else {
+                let value = self.reg(Register::new(15)).wrapping_add(4);
+                self.cycles += bus.store32(address, value, false) as u64;
+                if op.writeback {
+                    self.set_reg(op.rn, writeback_value);
+                }
+            }
             return;
         }
 
-        let base = self.reg(op.rn);
         // Registers always transfer lowest-first at the lowest address; the
         // base and direction set where that block sits.
         let (mut address, writeback_value) = if op.add {
@@ -472,6 +539,20 @@ impl Cpu {
             (start, low)
         };
 
+        // `{..}^` with r15 absent transfers the User-mode banked registers,
+        // regardless of the current mode. (With r15 present, an `LDM` is instead
+        // an exception return, handled below.)
+        let user_bank = op.psr_force_user && op.register_list & (1 << 15) == 0;
+
+        // When an `STM` writes back a base that is itself in the list, the value
+        // stored for the base is the *new* (written-back) one unless the base is
+        // the lowest register in the list (stored before the writeback happens).
+        let base_index = op.rn.index();
+        let store_written_back_base = !op.load
+            && op.writeback
+            && op.register_list & (1 << base_index) != 0
+            && op.register_list.trailing_zeros() as usize != base_index;
+
         let mut sequential = false;
         for i in 0..16 {
             if op.register_list & (1 << i) == 0 {
@@ -481,11 +562,20 @@ impl Cpu {
             if op.load {
                 let read = bus.load32(address, sequential);
                 self.cycles += read.cycles as u64;
-                self.set_reg(register, read.value);
+                if user_bank {
+                    self.set_reg_user(i, read.value);
+                } else {
+                    self.set_reg(register, read.value);
+                }
             } else {
-                // STM stores r15 as this instruction's address plus 12, and
-                // stores the base's old value (writeback happens afterwards).
-                let mut value = self.reg(register);
+                // STM stores r15 as this instruction's address plus 12.
+                let mut value = if store_written_back_base && i == base_index {
+                    writeback_value
+                } else if user_bank {
+                    self.reg_user(i)
+                } else {
+                    self.reg(register)
+                };
                 if register.is_pc() {
                     value = value.wrapping_add(4);
                 }
@@ -605,8 +695,17 @@ impl Cpu {
     }
 
     fn execute_data_processing(&mut self, op: DataProcessing) {
+        // A register-specified shift makes any r15 operand read at PC+12.
+        let register_shift = matches!(
+            &op.operand2,
+            Operand2::Register { shift, .. } if matches!(shift.source, ShiftSource::Register(_))
+        );
         let (operand2, shifter_carry) = self.eval_operand2(&op.operand2);
-        let rn = self.reg(op.rn);
+        let rn = if register_shift {
+            self.reg_register_shifted(op.rn)
+        } else {
+            self.reg(op.rn)
+        };
         let carry_in = self.cpsr.c();
 
         use DataProcessingOpcode::*;
@@ -635,9 +734,12 @@ impl Cpu {
         }
 
         if op.set_flags {
-            if writes && op.rd.is_pc() {
-                // Exception return (e.g. `SUBS pc, lr, #4`): the destination is
-                // the PC and the flags come from the SPSR, restoring the mode.
+            if op.rd.is_pc() {
+                // With the S bit and r15 as destination, the CPSR is restored from
+                // the SPSR rather than set from the result. This is the exception
+                // return (`SUBS pc, lr, #4`) and the deprecated comparison forms
+                // (`CMP/CMN/TST/TEQ` with Rd=15 — "TEQP" etc.), which restore the
+                // mode instead of comparing.
                 if let Some(spsr) = self.current_spsr() {
                     self.write_cpsr(spsr);
                 }
@@ -667,12 +769,14 @@ impl Cpu {
                 (result, carry)
             }
             Operand2::Register { rm, shift } => {
-                let value = self.reg(*rm);
                 match shift.source {
                     ShiftSource::Immediate(amount) => {
+                        let value = self.reg(*rm);
                         shift_by_immediate(shift.kind, value, amount, self.cpsr.c())
                     }
                     ShiftSource::Register(rs) => {
+                        // Register-specified shift: r15 operands read at PC+12.
+                        let value = self.reg_register_shifted(*rm);
                         let amount = self.reg(rs) & 0xFF;
                         shift_by_register(shift.kind, value, amount, self.cpsr.c())
                     }

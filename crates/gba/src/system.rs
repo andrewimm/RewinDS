@@ -289,11 +289,14 @@ impl System {
     /// halted — dispatch the due events (waking the CPU if that made an interrupt
     /// pending). This is the single-step primitive the debugger drives.
     pub fn step(&mut self) {
+        // The LCD runs from power-on; ensure its schedule exists so stepping and
+        // frame-running behave identically.
+        self.start_lcd();
         let can_run_cpu = !self.gba.is_low_power()
             && self
                 .scheduler
                 .next_deadline()
-                .map_or(true, |d| self.scheduler.now() < d);
+                .is_none_or(|d| self.scheduler.now() < d);
         if can_run_cpu {
             if self.gba.bus.io.irq.line_asserted() && self.cpu.irq_enabled() {
                 self.cpu.take_irq();

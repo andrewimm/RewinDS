@@ -78,6 +78,9 @@ fn u32p(params: &Value, key: &str) -> u32 {
 fn u64p(params: &Value, key: &str, default: u64) -> u64 {
     params.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
+fn u32p_or(params: &Value, key: &str, default: u32) -> u32 {
+    params.get(key).and_then(Value::as_u64).map(|v| v as u32).unwrap_or(default)
+}
 
 fn read8(system: &mut System, addr: u32) -> u8 {
     system
@@ -297,6 +300,23 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
                 })
                 .collect();
             json!({"thumb": thumb, "lines": lines})
+        }
+
+        "execution.callStack" => {
+            // Heuristic: scan the stack for Thumb return addresses (ROM code, bit0
+            // set). Not exact, but reveals the call chain up to a high-level frame.
+            let sp = system.cpu.register(13) & !3;
+            let top = u32p_or(params, "top", 0x0300_7f00);
+            let mut frames = Vec::new();
+            let mut a = sp;
+            while a < top && frames.len() < 48 {
+                let v = read32(system, a);
+                if (0x0800_0000..0x0a00_0000).contains(&v) && v & 1 == 1 {
+                    frames.push(json!({"sp": a, "addr": v & !1}));
+                }
+                a += 4;
+            }
+            json!({"pc": system.cpu.register(15), "sp": sp, "frames": frames})
         }
 
         // --- video ---

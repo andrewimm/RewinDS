@@ -122,14 +122,18 @@ impl Cpu {
             }
             LoadStoreHalfword { load, offset, rb, rd } => {
                 self.data_access = true;
-                let address = self.reg(rb).wrapping_add(offset as u32 * 2) & !1;
+                let address = self.reg(rb).wrapping_add(offset as u32 * 2);
                 if load {
-                    let read = bus.load16(address, false);
+                    let read = bus.load16(address & !1, false);
                     self.cycles += read.cycles as u64;
                     self.internal_cycles(bus, 1);
-                    self.set_reg(rd, read.value as u32);
+                    let value = read.value as u32;
+                    // A misaligned (odd) LDRH reads the aligned halfword and
+                    // rotates the zero-extended word right by 8.
+                    let value = if address & 1 != 0 { value.rotate_right(8) } else { value };
+                    self.set_reg(rd, value);
                 } else {
-                    self.cycles += bus.store16(address, self.reg(rd) as u16, false) as u64;
+                    self.cycles += bus.store16(address & !1, self.reg(rd) as u16, false) as u64;
                 }
             }
             SpRelativeLoadStore { load, rd, word8 } => {
@@ -318,7 +322,11 @@ impl Cpu {
                 let read = bus.load16(address & !1, false);
                 self.cycles += read.cycles as u64;
                 self.internal_cycles(bus, 1);
-                self.set_reg(rd, read.value as u32);
+                let value = read.value as u32;
+                // A misaligned (odd) LDRH reads the aligned halfword and rotates
+                // the zero-extended word right by 8.
+                let value = if address & 1 != 0 { value.rotate_right(8) } else { value };
+                self.set_reg(rd, value);
             }
             ThumbSignExtendOp::LoadSignedByte => {
                 let read = bus.load8(address, false);
@@ -327,10 +335,19 @@ impl Cpu {
                 self.set_reg(rd, read.value as i8 as i32 as u32);
             }
             ThumbSignExtendOp::LoadSignedHalfword => {
-                let read = bus.load16(address & !1, false);
-                self.cycles += read.cycles as u64;
+                // A misaligned (odd) LDRSH on ARM7TDMI loads a *signed byte* from
+                // that address rather than a halfword.
+                let value = if address & 1 != 0 {
+                    let read = bus.load8(address, false);
+                    self.cycles += read.cycles as u64;
+                    read.value as i8 as i32 as u32
+                } else {
+                    let read = bus.load16(address, false);
+                    self.cycles += read.cycles as u64;
+                    read.value as i16 as i32 as u32
+                };
                 self.internal_cycles(bus, 1);
-                self.set_reg(rd, read.value as i16 as i32 as u32);
+                self.set_reg(rd, value);
             }
         }
     }
@@ -378,32 +395,64 @@ impl Cpu {
 
     fn thumb_block_transfer<B: Bus>(&mut self, bus: &mut B, load: bool, rb: Register, list: u8) {
         self.data_access = true;
+        let base = self.reg(rb);
         if list == 0 {
+            // ARM7TDMI empty-list edge case: only r15 is transferred, and the base
+            // is adjusted by 0x40 (as though all sixteen registers had moved).
+            let writeback = base.wrapping_add(0x40);
+            if load {
+                let read = bus.load32(base, false);
+                self.cycles += read.cycles as u64;
+                self.internal_cycles(bus, 1);
+                self.set_reg(rb, writeback);
+                // ARMv4T stays in Thumb state on a loaded PC (no interworking).
+                self.set_reg(Register::PC, read.value & !1);
+            } else {
+                // The stored PC is this instruction's address plus 6.
+                let value = self.reg(Register::PC).wrapping_add(2);
+                self.cycles += bus.store32(base, value, false) as u64;
+                self.set_reg(rb, writeback);
+            }
             return;
         }
-        let mut address = self.reg(rb);
+
+        let base_index = rb.index();
+        // When an STM writes back a base that is itself in the list, the value
+        // stored for the base is the *new* (written-back) one unless the base is
+        // the lowest register in the list (stored before the writeback happens).
+        let store_written_back_base =
+            !load && list & (1 << base_index) != 0 && list.trailing_zeros() as usize != base_index;
+        let writeback_value = base.wrapping_add(list.count_ones() * 4);
+
+        let mut address = base;
         let mut sequential = false;
         for i in 0..8 {
-            if list & (1 << i) != 0 {
-                let register = Register::new(i);
-                if load {
-                    let read = bus.load32(address, sequential);
-                    self.cycles += read.cycles as u64;
-                    self.set_reg(register, read.value);
-                } else {
-                    self.cycles += bus.store32(address, self.reg(register), sequential) as u64;
-                }
-                address = address.wrapping_add(4);
-                sequential = true;
+            if list & (1 << i) == 0 {
+                continue;
             }
+            let register = Register::new(i);
+            if load {
+                let read = bus.load32(address, sequential);
+                self.cycles += read.cycles as u64;
+                self.set_reg(register, read.value);
+            } else {
+                let value = if store_written_back_base && i as usize == base_index {
+                    writeback_value
+                } else {
+                    self.reg(register)
+                };
+                self.cycles += bus.store32(address, value, sequential) as u64;
+            }
+            address = address.wrapping_add(4);
+            sequential = true;
         }
         if load {
             self.internal_cycles(bus, 1);
         }
         // Writeback, unless LDM reloaded the base from memory.
-        let base_loaded = load && list & (1 << rb.index()) != 0;
+        let base_loaded = load && list & (1 << base_index) != 0;
         if !base_loaded {
-            self.set_reg(rb, address);
+            self.set_reg(rb, writeback_value);
         }
     }
 }

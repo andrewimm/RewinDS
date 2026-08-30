@@ -11,8 +11,12 @@ use crate::interrupt::{InterruptController, IrqSource};
 
 /// `SIOCNT` bit 7 — start / busy.
 const START_BUSY: u16 = 1 << 7;
+/// `SIOCNT` bit 6 — multiplayer error (no other GBA/adapter responded).
+const MULTI_ERROR: u16 = 1 << 6;
 /// `SIOCNT` bit 14 — transfer-complete interrupt enable.
 const IRQ_ENABLE: u16 = 1 << 14;
+/// `SIOCNT` bits 12-13 — SIO mode (`10` = multiplayer).
+const MODE_MULTIPLAYER: u16 = 0b10 << 12;
 
 /// The serial registers, modeled just enough to answer detection probes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,6 +74,11 @@ impl Serial {
         // Nothing is connected: received data is all-ones and the transfer ends.
         self.data = [0xFFFF; 4];
         self.siocnt &= !START_BUSY;
+        // In multiplayer mode a transfer with no responder flags the error bit —
+        // this is the "nothing connected" signal link/adapter detection checks.
+        if self.siocnt & (0b11 << 12) == MODE_MULTIPLAYER {
+            self.siocnt |= MULTI_ERROR;
+        }
         if self.siocnt & IRQ_ENABLE != 0 {
             irq.request(IrqSource::Serial);
         }
