@@ -6,6 +6,7 @@
 //! ([`Instruction`]) that higher layers interpret.
 
 pub mod condition;
+pub mod cpu;
 pub mod decode;
 pub mod disasm;
 pub mod instruction;
