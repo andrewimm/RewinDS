@@ -1,6 +1,6 @@
 //! Interpreter tests: run real ARM programs against a flat test memory.
 
-use super::{Bus, Cpu, Timed};
+use super::{Bus, Cpu, Mode, Timed};
 
 /// A flat little-endian memory implementing the CPU [`Bus`].
 struct TestBus {
@@ -271,6 +271,74 @@ fn sum_array_program() {
     cpu.set_register(14, 0x1000); // return address sentinel
     run_to(&mut cpu, &mut bus, 0x1000, 200);
     assert_eq!(cpu.register(0), 60); // 10 + 20 + 30
+}
+
+#[test]
+fn status_register_access() {
+    let mut bus = TestBus::new(0x100);
+    // msr cpsr_f, r1 ; mrs r0, cpsr
+    bus.load(0, &[0xE128_F001, 0xE10F_0000]);
+    let mut cpu = Cpu::new();
+    cpu.set_register(1, 0xF000_0000); // set N, Z, C, V
+    cpu.step(&mut bus);
+    cpu.step(&mut bus);
+    assert!(cpu.cpsr().n() && cpu.cpsr().z() && cpu.cpsr().c() && cpu.cpsr().v());
+    assert_eq!(cpu.register(0), 0xF000_001F); // flags | System mode
+}
+
+#[test]
+fn software_interrupt_enters_supervisor() {
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xEF00_0000]); // swi #0
+    let mut cpu = Cpu::new();
+    cpu.step(&mut bus);
+    assert_eq!(cpu.mode(), Some(Mode::Supervisor));
+    assert_eq!(cpu.register(15), 0x08); // SWI vector
+    assert_eq!(cpu.register(14), 0x04); // LR = instruction after SWI
+    assert!(cpu.cpsr().irq_disabled());
+    assert_eq!(cpu.spsr().unwrap().mode(), Some(Mode::System)); // saved caller mode
+}
+
+#[test]
+fn exception_return_restores_mode() {
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xEF00_0000]); // swi #0
+    bus.load(0x08, &[0xE1B0_F00E]); // movs pc, lr
+    let mut cpu = Cpu::new();
+    cpu.step(&mut bus); // swi -> supervisor, pc = 0x08
+    cpu.step(&mut bus); // movs pc, lr -> return
+    assert_eq!(cpu.register(15), 0x04);
+    assert_eq!(cpu.mode(), Some(Mode::System));
+}
+
+#[test]
+fn irq_entry() {
+    let mut cpu = Cpu::new();
+    cpu.set_pc(0x0100);
+    assert!(cpu.irq_enabled());
+    cpu.take_irq();
+    assert_eq!(cpu.mode(), Some(Mode::Irq));
+    assert_eq!(cpu.register(15), 0x18); // IRQ vector
+    assert_eq!(cpu.register(14), 0x0104); // LR = pc + 4
+    assert!(cpu.cpsr().irq_disabled());
+    assert_eq!(cpu.spsr().unwrap().mode(), Some(Mode::System));
+}
+
+#[test]
+fn register_banking_preserves_the_callers_stack_pointer() {
+    let mut bus = TestBus::new(0x100);
+    // main:            swi #0
+    // 0x08 (handler):  mov sp, #0xBB ; movs pc, lr
+    bus.load(0, &[0xEF00_0000]);
+    bus.load(0x08, &[0xE3A0_D0BB, 0xE1B0_F00E]);
+    let mut cpu = Cpu::new();
+    cpu.set_register(13, 0xAAAA); // System sp
+    for _ in 0..3 {
+        cpu.step(&mut bus);
+    }
+    // The handler wrote the Supervisor sp; the System sp is untouched.
+    assert_eq!(cpu.mode(), Some(Mode::System));
+    assert_eq!(cpu.register(13), 0xAAAA);
 }
 
 #[test]

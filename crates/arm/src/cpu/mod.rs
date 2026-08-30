@@ -17,8 +17,8 @@ use crate::condition::Condition;
 use crate::decode::decode_arm;
 use crate::instruction::arm::{
     ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
-    HalfwordKind, HalfwordOffset, HalfwordTransfer, Multiply, MultiplyLong, Operand2, ShiftKind,
-    ShiftSource, SingleOffset, SingleTransfer, Swap,
+    HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
+    Operand2, ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -131,6 +131,12 @@ impl Psr {
     pub fn set_thumb(&mut self, v: bool) {
         self.set_flag(Self::T, v);
     }
+    pub fn set_irq_disabled(&mut self, v: bool) {
+        self.set_flag(Self::I, v);
+    }
+    pub fn set_fiq_disabled(&mut self, v: bool) {
+        self.set_flag(Self::F, v);
+    }
 
     pub fn mode(self) -> Option<Mode> {
         Mode::from_bits(self.0)
@@ -170,6 +176,12 @@ pub struct Cpu {
     /// r0..r15; `r[15]` holds the address of the instruction being executed.
     r: [u32; 16],
     cpsr: Psr,
+    /// Banked r13/r14 for the inactive modes, indexed by [`bank13`].
+    banked_r13_r14: [[u32; 2]; 6],
+    /// Banked r8..r12: index 0 is the non-FIQ bank, index 1 is FIQ.
+    banked_r8_r12: [[u32; 5]; 2],
+    /// SPSRs for the exception modes, indexed by [`spsr_index`].
+    spsr: [Psr; 5],
     /// Total guest cycles executed.
     cycles: u64,
     /// Whether the current instruction redirected the PC.
@@ -194,11 +206,24 @@ impl Cpu {
         Cpu {
             r: [0; 16],
             cpsr,
+            banked_r13_r14: [[0; 2]; 6],
+            banked_r8_r12: [[0; 5]; 2],
+            spsr: [Psr::from_bits(0); 5],
             cycles: 0,
             branched: false,
             sequential: false,
             data_access: false,
         }
+    }
+
+    /// The current operating mode.
+    pub fn mode(&self) -> Option<Mode> {
+        self.cpsr.mode()
+    }
+
+    /// The SPSR of the current mode, if it has one.
+    pub fn spsr(&self) -> Option<Psr> {
+        spsr_index(self.cpsr.mode()?).map(|i| self.spsr[i])
     }
 
     pub fn cpsr(&self) -> Psr {
@@ -304,8 +329,10 @@ impl Cpu {
             ArmOperation::Swap(op) => self.execute_swap(op, bus),
             ArmOperation::Multiply(op) => self.execute_multiply(op, bus),
             ArmOperation::MultiplyLong(op) => self.execute_multiply_long(op, bus),
-            // Mrs/Msr/SoftwareInterrupt/Undefined are implemented in later phases.
-            _ => {}
+            ArmOperation::Mrs(op) => self.execute_mrs(op),
+            ArmOperation::Msr(op) => self.execute_msr(op),
+            ArmOperation::SoftwareInterrupt(op) => self.execute_software_interrupt(op),
+            ArmOperation::Undefined { .. } => self.execute_undefined(),
         }
     }
 
@@ -465,6 +492,13 @@ impl Cpu {
                 self.set_reg(op.rn, writeback_value);
             }
         }
+
+        // `LDM {..., pc}^` restores the CPSR from the SPSR (exception return).
+        if op.load && op.psr_force_user && op.register_list & (1 << 15) != 0 {
+            if let Some(spsr) = self.current_spsr() {
+                self.write_cpsr(spsr);
+            }
+        }
     }
 
     fn execute_swap<B: Bus>(&mut self, op: Swap, bus: &mut B) {
@@ -588,11 +622,19 @@ impl Cpu {
         }
 
         if op.set_flags {
-            self.cpsr.set_n(result & (1 << 31) != 0);
-            self.cpsr.set_z(result == 0);
-            self.cpsr.set_c(carry);
-            if arithmetic {
-                self.cpsr.set_v(overflow);
+            if writes && op.rd.is_pc() {
+                // Exception return (e.g. `SUBS pc, lr, #4`): the destination is
+                // the PC and the flags come from the SPSR, restoring the mode.
+                if let Some(spsr) = self.current_spsr() {
+                    self.write_cpsr(spsr);
+                }
+            } else {
+                self.cpsr.set_n(result & (1 << 31) != 0);
+                self.cpsr.set_z(result == 0);
+                self.cpsr.set_c(carry);
+                if arithmetic {
+                    self.cpsr.set_v(overflow);
+                }
             }
         }
     }
@@ -625,6 +667,160 @@ impl Cpu {
             }
         }
     }
+
+    // --- Status registers, banking, and exceptions ---
+
+    fn current_spsr(&self) -> Option<Psr> {
+        spsr_index(self.cpsr.mode()?).map(|i| self.spsr[i])
+    }
+
+    fn set_current_spsr(&mut self, value: Psr) {
+        if let Some(i) = self.cpsr.mode().and_then(spsr_index) {
+            self.spsr[i] = value;
+        }
+    }
+
+    /// Switch to `new_mode`, moving the banked registers accordingly and setting
+    /// the CPSR mode field.
+    fn change_mode(&mut self, new_mode: Mode) {
+        let old_mode = self.cpsr.mode().unwrap_or(Mode::System);
+        if old_mode == new_mode {
+            return;
+        }
+        let (old13, new13) = (bank13(old_mode), bank13(new_mode));
+        if old13 != new13 {
+            self.banked_r13_r14[old13] = [self.r[13], self.r[14]];
+            let restored = self.banked_r13_r14[new13];
+            self.r[13] = restored[0];
+            self.r[14] = restored[1];
+        }
+        let old_fiq = old_mode == Mode::Fiq;
+        let new_fiq = new_mode == Mode::Fiq;
+        if old_fiq != new_fiq {
+            self.banked_r8_r12[old_fiq as usize].copy_from_slice(&self.r[8..13]);
+            let restored = self.banked_r8_r12[new_fiq as usize];
+            self.r[8..13].copy_from_slice(&restored);
+        }
+        self.cpsr.set_mode(new_mode);
+    }
+
+    /// Write the whole CPSR, re-banking registers if the mode changed.
+    fn write_cpsr(&mut self, value: Psr) {
+        if let Some(new_mode) = value.mode() {
+            self.change_mode(new_mode);
+        }
+        // change_mode has already applied the mode field; keep the rest.
+        self.cpsr = value;
+    }
+
+    /// Enter an exception: save the CPSR to the target mode's SPSR, set its LR,
+    /// switch to ARM state with IRQs masked, and jump to the vector.
+    fn enter_exception(&mut self, vector: u32, mode: Mode, return_address: u32, disable_fiq: bool) {
+        let saved = self.cpsr;
+        self.change_mode(mode);
+        self.set_current_spsr(saved);
+        self.r[14] = return_address;
+        self.cpsr.set_thumb(false);
+        self.cpsr.set_irq_disabled(true);
+        if disable_fiq {
+            self.cpsr.set_fiq_disabled(true);
+        }
+        self.r[15] = vector;
+        self.branched = true;
+        self.sequential = false;
+    }
+
+    /// Whether an IRQ can currently be accepted (the CPSR I-bit is clear).
+    pub fn irq_enabled(&self) -> bool {
+        !self.cpsr.irq_disabled()
+    }
+
+    /// Take an IRQ exception. The machine decides when the line is asserted and
+    /// interrupts are enabled; this performs the entry.
+    pub fn take_irq(&mut self) {
+        let return_address = self.r[15].wrapping_add(4);
+        self.enter_exception(0x18, Mode::Irq, return_address, false);
+    }
+
+    fn execute_software_interrupt(&mut self, _swi: SoftwareInterrupt) {
+        let return_address = self.r[15].wrapping_add(4);
+        self.enter_exception(0x08, Mode::Supervisor, return_address, false);
+    }
+
+    fn execute_undefined(&mut self) {
+        let return_address = self.r[15].wrapping_add(4);
+        self.enter_exception(0x04, Mode::Undefined, return_address, false);
+    }
+
+    fn execute_mrs(&mut self, op: Mrs) {
+        let value = if op.source_spsr {
+            self.current_spsr().unwrap_or(self.cpsr).bits()
+        } else {
+            self.cpsr.bits()
+        };
+        self.set_reg(op.rd, value);
+    }
+
+    fn execute_msr(&mut self, op: Msr) {
+        let source = match op.source {
+            MsrSource::Register(rm) => self.reg(rm),
+            MsrSource::Immediate { value, rotate } => (value as u32).rotate_right(rotate as u32 * 2),
+        };
+        let mut mask = 0u32;
+        if op.write_flags {
+            mask |= 0xFF00_0000;
+        }
+        if op.write_status {
+            mask |= 0x00FF_0000;
+        }
+        if op.write_extension {
+            mask |= 0x0000_FF00;
+        }
+        if op.write_control {
+            mask |= 0x0000_00FF;
+        }
+
+        if op.dest_spsr {
+            if let Some(current) = self.current_spsr() {
+                let bits = (current.bits() & !mask) | (source & mask);
+                self.set_current_spsr(Psr::from_bits(bits));
+            }
+        } else {
+            // In User mode only the condition flags are writable; the control
+            // byte (mode, interrupt masks, state) is protected.
+            let effective = if self.cpsr.mode() == Some(Mode::User) {
+                mask & 0xF000_0000
+            } else {
+                mask
+            };
+            let bits = (self.cpsr.bits() & !effective) | (source & effective);
+            self.write_cpsr(Psr::from_bits(bits));
+        }
+    }
+}
+
+/// The r13/r14 bank index for a mode.
+fn bank13(mode: Mode) -> usize {
+    match mode {
+        Mode::User | Mode::System => 0,
+        Mode::Fiq => 1,
+        Mode::Irq => 2,
+        Mode::Supervisor => 3,
+        Mode::Abort => 4,
+        Mode::Undefined => 5,
+    }
+}
+
+/// The SPSR index for a mode, or `None` for modes without an SPSR.
+fn spsr_index(mode: Mode) -> Option<usize> {
+    Some(match mode {
+        Mode::Fiq => 0,
+        Mode::Irq => 1,
+        Mode::Supervisor => 2,
+        Mode::Abort => 3,
+        Mode::Undefined => 4,
+        Mode::User | Mode::System => return None,
+    })
 }
 
 /// Attach the "arithmetic" flag and destination-write flag to an ALU result.
