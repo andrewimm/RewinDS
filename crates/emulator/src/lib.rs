@@ -122,6 +122,8 @@ pub enum LoadError {
     MissingBios,
     /// The console is recognised but not yet implemented.
     Unsupported(Console),
+    /// A `.nds` image could not be direct-booted.
+    BadImage(nds::BootError),
 }
 
 impl std::fmt::Display for LoadError {
@@ -130,6 +132,7 @@ impl std::fmt::Display for LoadError {
             LoadError::UnknownConsole => write!(f, "could not determine the console"),
             LoadError::MissingBios => write!(f, "a BIOS image is required"),
             LoadError::Unsupported(c) => write!(f, "{c:?} is not yet supported"),
+            LoadError::BadImage(e) => write!(f, "invalid .nds image: {e:?}"),
         }
     }
 }
@@ -146,8 +149,10 @@ pub struct Load<'a> {
     /// The cartridge image (a `.gba`, or later a `.nds`). May be absent for a
     /// BIOS-only GBA boot, in which case `console` must be set.
     pub rom: Option<&'a [u8]>,
-    /// The BIOS image. Required for the GBA.
+    /// The BIOS image. Required for the GBA; the ARM9 BIOS for the DS.
     pub bios: Option<&'a [u8]>,
+    /// The DS ARM7 BIOS. Optional (BIOS-free homebrew runs without it).
+    pub bios7: Option<&'a [u8]>,
 }
 
 /// Either console, behind one surface.
@@ -178,10 +183,19 @@ impl Emulator {
                 system.cpu.set_pc(0);
                 Ok(Emulator::Gba(GbaEmulator::new(system)))
             }
-            // A bare DS: the machine and its two-screen presentation exist and run,
-            // but there is no cartridge boot path yet (that lands with M2.4), so it
-            // runs no guest code — the screens present the 2D engine's output.
-            Console::Nds => Ok(Emulator::Nds(NdsEmulator::new(nds::System::new()))),
+            Console::Nds => {
+                let mut system = nds::System::new();
+                // Load the BIOS images if given (optional for BIOS-free homebrew).
+                if let (Some(b9), Some(b7)) = (cfg.bios, cfg.bios7) {
+                    system.load_bios(b9, b7);
+                }
+                // Direct-boot the cartridge if present; a bare DS (no ROM) still
+                // runs and presents its two screens.
+                if let Some(rom) = cfg.rom {
+                    system.direct_boot(rom).map_err(LoadError::BadImage)?;
+                }
+                Ok(Emulator::Nds(NdsEmulator::new(system)))
+            }
         }
     }
 
@@ -207,8 +221,8 @@ impl Emulator {
     pub fn set_input(&mut self, input: Input) {
         match self {
             Emulator::Gba(g) => g.set_input(input),
-            // DS input (keypad + touch via the ARM7) is not wired yet.
-            Emulator::Nds(_) => {}
+            // The DS keypad shares the low-ten bit order; touch is not wired yet.
+            Emulator::Nds(n) => n.system.set_keypad(input.buttons),
         }
     }
 
@@ -476,6 +490,7 @@ mod tests {
             console: Some(Console::Gba),
             rom: None,
             bios: Some(&bios),
+            bios7: None,
         })
         .expect("bios-only GBA boot");
         assert_eq!(emu.console(), Console::Gba);
@@ -494,6 +509,7 @@ mod tests {
             console: Some(Console::Gba),
             rom: None,
             bios: None,
+            bios7: None,
         });
         assert!(matches!(result, Err(LoadError::MissingBios)));
     }
@@ -504,6 +520,7 @@ mod tests {
             console: Some(Console::Nds),
             rom: None,
             bios: None,
+            bios7: None,
         })
         .expect("bare NDS");
         assert_eq!(emu.console(), Console::Nds);
@@ -519,12 +536,59 @@ mod tests {
     }
 
     #[test]
+    fn nds_direct_boots_a_real_rom_to_a_rendered_frame() {
+        fn put(rom: &mut [u8], off: usize, v: u32) {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x6000];
+        // Header: ARM9 binary at rom 0x4000 → 0x0200_0000; ARM7 at 0x5000 → 0x0210_0000.
+        put(&mut rom, 0x20, 0x4000);
+        put(&mut rom, 0x24, 0x0200_0000);
+        put(&mut rom, 0x28, 0x0200_0000);
+        put(&mut rom, 0x2C, 7 * 4);
+        put(&mut rom, 0x30, 0x5000);
+        put(&mut rom, 0x34, 0x0210_0000);
+        put(&mut rom, 0x38, 0x0210_0000);
+        put(&mut rom, 0x3C, 4);
+        // ARM9: BG palette entry 0 = green, DISPCNT = graphics mode → the compositor
+        // fills the top screen with the backdrop. Then park.
+        let arm9 = [
+            0xE3A0_0650u32, // mov r0, #0x0500_0000  (BG palette)
+            0xE3A0_2E3E,    // mov r2, #0x03E0       (BGR555 green)
+            0xE1C0_20B0,    // strh r2, [r0]
+            0xE3A0_1640,    // mov r1, #0x0400_0000  (DISPCNT)
+            0xE3A0_3801,    // mov r3, #0x0001_0000  (display mode 1 = graphics)
+            0xE581_3000,    // str r3, [r1]
+            0xEAFF_FFFE,    // b .
+        ];
+        for (i, w) in arm9.iter().enumerate() {
+            put(&mut rom, 0x4000 + i * 4, *w);
+        }
+        put(&mut rom, 0x5000, 0xEAFF_FFFE); // ARM7: b .
+
+        let mut emu = Emulator::load(Load {
+            console: Some(Console::Nds),
+            rom: Some(&rom),
+            bios: None,
+            bios7: None,
+        })
+        .expect("direct boot");
+        emu.run_frame();
+
+        // The top screen shows the green backdrop the ARM9 code programmed.
+        let top = emu.screen(0).unwrap();
+        assert_eq!(&top.rgba[0..4], &[0, 255, 0, 255]);
+        assert!(top.rgba.as_chunks::<4>().0.iter().all(|p| *p == [0, 255, 0, 255]));
+    }
+
+    #[test]
     fn input_maps_buttons_and_ignores_ds_only_bits() {
         let bios = tiny_bios();
         let mut emu = Emulator::load(Load {
             console: Some(Console::Gba),
             rom: None,
             bios: Some(&bios),
+            bios7: None,
         })
         .unwrap();
         let mut input = Input::default();

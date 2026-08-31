@@ -16,9 +16,6 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const WIDTH: usize = 240;
-const HEIGHT: usize = 160;
-
 /// Host key → console button bit. Arrow keys drive the D-pad; X/Z are A/B (VBA
 /// layout); A/S are the L/R shoulders; Enter/Backspace are Start/Select. Hold
 /// Space to fast-forward.
@@ -35,40 +32,56 @@ const KEY_MAP: &[(Key, u32)] = &[
     (Key::S, button::R),
 ];
 
+const USAGE: &str =
+    "usage: rewinds <rom.gba|rom.nds> [--bios <path>] [--bios7 <path>] [--debug-port N]";
+
 fn main() -> Result<(), Box<dyn Error>> {
     logging::init();
 
-    // Parse args: positional bios [rom], plus optional --debug-port <port>.
-    let mut positional = Vec::new();
+    // Parse args: a positional ROM plus --bios / --bios7 / --debug-port.
+    let mut rom_path: Option<String> = None;
+    let mut bios_path: Option<String> = None;
+    let mut bios7_path: Option<String> = None;
     let mut debug_port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--bios" => bios_path = Some(args.next().ok_or("--bios needs a value")?),
+            "--bios7" => bios7_path = Some(args.next().ok_or("--bios7 needs a value")?),
             "--debug-port" => {
                 debug_port = Some(args.next().ok_or("--debug-port needs a value")?.parse::<u16>()?);
             }
-            _ => positional.push(arg),
+            _ => rom_path = Some(arg),
         }
     }
-    let bios_path = positional
-        .first()
-        .ok_or("usage: rewinds <bios.bin> [rom.gba] [--debug-port N]")?;
 
-    let bios = std::fs::read(bios_path)?;
-    let rom = positional.get(1).map(std::fs::read).transpose()?;
+    // The ROM's extension selects the console (a bare `--bios` boots the GBA BIOS).
+    let console = match rom_path.as_deref() {
+        Some(p) if p.ends_with(".nds") => Console::Nds,
+        Some(_) => Console::Gba,
+        None => Console::Gba,
+    };
+
+    let rom = rom_path.as_ref().map(std::fs::read).transpose()?;
+    let bios = bios_path.as_ref().map(std::fs::read).transpose()?;
+    let bios7 = bios7_path.as_ref().map(std::fs::read).transpose()?;
+    if console == Console::Gba && bios.is_none() {
+        return Err(format!("the GBA needs a BIOS: {USAGE}").into());
+    }
     let mut emulator = Emulator::load(Load {
-        console: Some(Console::Gba),
+        console: Some(console),
         rom: rom.as_deref(),
-        bios: Some(&bios),
+        bios: bios.as_deref(),
+        bios7: bios7.as_deref(),
     })?;
 
-    // A loaded ROM brings a save backup: its type is detected from the ROM, an
+    // A loaded GBA ROM brings a save backup: its type is detected from the ROM, an
     // optional `<rom>.sav.meta` sidecar may override it, and a `<rom>.sav` file
-    // (raw chip dump, interoperable with other emulators) is restored if present.
-    // Persistence is the host's job — the emulator only exchanges the bytes.
+    // (raw chip dump) is restored if present. Persistence is the host's job.
     let mut save_paths: Option<(PathBuf, PathBuf)> = None;
-    if let Some(rom_path) = positional.get(1) {
-        let sav = Path::new(rom_path).with_extension("sav");
+    if console == Console::Gba {
+        if let Some(rp) = rom_path.as_deref() {
+        let sav = Path::new(rp).with_extension("sav");
         let meta = {
             let mut m = sav.clone().into_os_string();
             m.push(".meta");
@@ -82,6 +95,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         log::info!("cartridge save: {}", emulator.save_type_name());
         save_paths = Some((sav, meta));
+        }
     }
 
     // Headless debug-server mode: the client drives execution and inspects state.
@@ -93,12 +107,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Window geometry from the console's screens: each screen's width, and the
+    // screens stacked vertically (GBA: one; NDS: two, top over bottom).
+    let screen_w = emulator.screen(0).expect("a screen").width as usize;
+    let screen_h = emulator.screen(0).expect("a screen").height as usize;
+    let screen_count = emulator.screen_count();
+    let (win_w, win_h) = (screen_w, screen_h * screen_count);
+    let scale = if console == Console::Nds { Scale::X2 } else { Scale::X4 };
     let mut window = Window::new(
         "RewinDS",
-        WIDTH,
-        HEIGHT,
+        win_w,
+        win_h,
         WindowOptions {
-            scale: Scale::X4,
+            scale,
             ..WindowOptions::default()
         },
     )?;
@@ -109,7 +130,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _audio = audio::Audio::open(&mut emulator);
 
     // Reused each frame: the RGBA present buffer packed into minifb's 0x00RRGGBB.
-    let mut buffer = vec![0u32; WIDTH * HEIGHT];
+    let mut buffer = vec![0u32; win_w * win_h];
     // Flush the save at most a few times a second, only after the game writes it.
     const FLUSH_EVERY_FRAMES: u32 = 180;
     let mut frames_since_flush = 0u32;
@@ -156,11 +177,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             emulator.run_frame();
         }
 
-        let screen = emulator.screen(0).expect("GBA presents one screen");
-        for (out, px) in buffer.iter_mut().zip(screen.rgba.as_chunks::<4>().0) {
-            *out = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+        // Present every screen, stacked top-to-bottom.
+        for i in 0..screen_count {
+            let screen = emulator.screen(i).expect("screen");
+            let base = i * screen_h * win_w;
+            for (out, px) in buffer[base..].iter_mut().zip(screen.rgba.as_chunks::<4>().0) {
+                *out = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+            }
         }
-        window.update_with_buffer(&buffer, WIDTH, HEIGHT)?;
+        window.update_with_buffer(&buffer, win_w, win_h)?;
 
         if let Some((sav, meta)) = &save_paths {
             frames_since_flush += 1;

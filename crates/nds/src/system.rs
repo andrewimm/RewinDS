@@ -54,6 +54,9 @@ pub struct Machine {
     pub(crate) vram: Vram,
     pub(crate) ppu: Ppu,
     pub(crate) ipc: Ipc,
+    /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
+    /// readable by both cores.
+    pub(crate) keyinput: u16,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
@@ -71,6 +74,7 @@ impl Machine {
             vram: Vram::new(),
             ppu: Ppu::new(),
             ipc: Ipc::new(),
+            keyinput: 0x03FF, // all released
             clock: [0; 2],
         }
     }
@@ -159,6 +163,7 @@ impl Machine {
             0x0400_0006 => self.ppu.vcount() as u32,
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
+            0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
             0x0400_0214 => self.interrupts[c].iflags(),
@@ -314,6 +319,13 @@ impl System {
         &mut self.machine.memory
     }
 
+    /// Load the ARM9 and ARM7 BIOS images. Optional for direct boot (BIOS-free
+    /// homebrew runs without them); required for ROMs that call BIOS SWIs.
+    pub fn load_bios(&mut self, bios9: &[u8], bios7: &[u8]) {
+        self.machine.memory.load_bios9(bios9);
+        self.machine.memory.load_bios7(bios7);
+    }
+
     /// The ARM9's CP15 coprocessor state.
     pub fn cp15(&self) -> &Cp15 {
         &self.machine.cp15
@@ -373,6 +385,57 @@ impl System {
             core,
         };
         cpu.step(&mut bus);
+    }
+
+    /// Direct-boot a `.nds` image: copy the ARM9/ARM7 binaries to their RAM
+    /// addresses, seed the entry points and stacks, and leave the cores ready to
+    /// run. Bypasses the firmware/BIOS handshake (deferred). The stacks/`WRAMCNT`
+    /// use the conventional direct-boot values; the game's startup code sets up
+    /// the rest (CP15/TCM, banked stacks, I/O).
+    pub fn direct_boot(&mut self, rom: &[u8]) -> Result<(), crate::boot::BootError> {
+        let header = crate::boot::Header::parse(rom)?;
+        self.load_binary(
+            Core::Arm9,
+            rom,
+            header.arm9_rom_offset,
+            header.arm9_ram_address,
+            header.arm9_size,
+        );
+        self.load_binary(
+            Core::Arm7,
+            rom,
+            header.arm7_rom_offset,
+            header.arm7_ram_address,
+            header.arm7_size,
+        );
+        // The firmware copies the header to Main RAM at 0x027F_FE00.
+        for (i, &byte) in rom.iter().take(0x170).enumerate() {
+            self.machine
+                .data_write(Core::Arm9, 0x027F_FE00 + i as u32, byte as u32, 1);
+        }
+        // Give the ARM9 the Shared WRAM its stack sits in.
+        self.machine.memory.wramcnt = 0;
+        // Entry points and conventional system-mode stacks (the cores boot in
+        // System mode; the ARM9 stack is in Shared WRAM, the ARM7's in ARM7-WRAM).
+        self.arm9.set_pc(header.arm9_entry);
+        self.arm9.set_register(13, 0x0300_2F7C);
+        self.arm7.set_pc(header.arm7_entry);
+        self.arm7.set_register(13, 0x0380_FD80);
+        Ok(())
+    }
+
+    /// Copy a cartridge binary into a core's RAM, byte by byte through its map.
+    fn load_binary(&mut self, core: Core, rom: &[u8], rom_offset: u32, ram: u32, size: u32) {
+        for i in 0..size {
+            let byte = rom[(rom_offset + i) as usize];
+            self.machine.data_write(core, ram + i, byte as u32, 1);
+        }
+    }
+
+    /// Set the keypad state from a pressed-button bitmask whose low ten bits use
+    /// the `KEYINPUT` bit order (A, B, Select, Start, Right, Left, Up, Down, R, L).
+    pub fn set_keypad(&mut self, pressed: u32) {
+        self.machine.keyinput = 0x03FF & !(pressed as u16);
     }
 
     /// Begin the PPU's continuous scanline schedule (idempotent).
@@ -701,6 +764,57 @@ mod tests {
         // The whole top screen shows the backdrop color.
         let fb = system.framebuffer();
         assert!(fb.iter().all(|&p| p == 0x001F));
+    }
+
+    #[test]
+    fn keypad_reads_active_low_on_both_cores() {
+        let mut system = System::new();
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_0130, 2), 0x03FF); // all released
+        system.set_keypad((1 << 0) | (1 << 7)); // press A + Down
+        let v = system.io_read(Core::Arm7, 0x0400_0130, 2); // both cores see it
+        assert_eq!(v & 1, 0); // A pressed (bit cleared)
+        assert_eq!(v & (1 << 7), 0); // Down pressed
+        assert_eq!(v & (1 << 1), 1 << 1); // B still released
+    }
+
+    #[test]
+    fn direct_boot_runs_both_cores_from_their_entry_points() {
+        fn put(rom: &mut [u8], off: usize, v: u32) {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x6000];
+        // Header: ARM9 binary at rom 0x4000 → 0x0200_0000; ARM7 at 0x5000 → 0x0210_0000.
+        put(&mut rom, 0x20, 0x4000);
+        put(&mut rom, 0x24, 0x0200_0000);
+        put(&mut rom, 0x28, 0x0200_0000);
+        put(&mut rom, 0x2C, 16);
+        put(&mut rom, 0x30, 0x5000);
+        put(&mut rom, 0x34, 0x0210_0000);
+        put(&mut rom, 0x38, 0x0210_0000);
+        put(&mut rom, 0x3C, 16);
+        // ARM9: write 0xA9 to 0x0200_0300, then park.
+        for (i, w) in [0xE3A0_1402u32, 0xE3A0_00A9, 0xE581_0300, 0xEAFF_FFFE]
+            .iter()
+            .enumerate()
+        {
+            put(&mut rom, 0x4000 + i * 4, *w);
+        }
+        // ARM7: write 0x77 to 0x0200_0400, then park.
+        for (i, w) in [0xE3A0_1402u32, 0xE3A0_0077, 0xE581_0400, 0xEAFF_FFFE]
+            .iter()
+            .enumerate()
+        {
+            put(&mut rom, 0x5000 + i * 4, *w);
+        }
+
+        let mut system = System::new();
+        system.direct_boot(&rom).unwrap();
+        system.run_until(400);
+
+        // Both cores booted from their entry points and ran their code.
+        assert_eq!(system.read(Core::Arm9, 0x0200_0300, 1), 0xA9);
+        assert_eq!(system.read(Core::Arm7, 0x0200_0400, 1), 0x77);
+        assert_eq!(system.arm9.register(15) & !3, 0x0200_000C); // parked at the B .
     }
 
     #[test]

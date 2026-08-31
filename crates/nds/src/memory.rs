@@ -101,6 +101,18 @@ impl Memory {
         }
     }
 
+    /// Load the ARM9 BIOS image (mapped read-only at `0xFFFF_0000`).
+    pub fn load_bios9(&mut self, data: &[u8]) {
+        let n = data.len().min(self.arm9_bios.len());
+        self.arm9_bios[..n].copy_from_slice(&data[..n]);
+    }
+
+    /// Load the ARM7 BIOS image (mapped read-only at `0x0000_0000`).
+    pub fn load_bios7(&mut self, data: &[u8]) {
+        let n = data.len().min(self.arm7_bios.len());
+        self.arm7_bios[..n].copy_from_slice(&data[..n]);
+    }
+
     // --- reads --------------------------------------------------------------
 
     pub fn read8(&self, core: Core, addr: u32, instruction: bool, cp15: &Cp15) -> u8 {
