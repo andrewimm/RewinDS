@@ -66,6 +66,25 @@ impl Vram {
         u16::from_le_bytes([s[offset & mask], s[(offset + 1) & mask]])
     }
 
+    /// Assemble a contiguous view of the 2D Engine A background VRAM region
+    /// (`0x0600_0000`-`0x0607_FFFF`) into `out`, so the shared renderer — which
+    /// reads a flat slice offset from the region base — sees the banked memory as
+    /// one image. Blocks routed elsewhere contribute nothing.
+    pub fn assemble_engine_a_bg(&self, out: &mut [u8]) {
+        out.fill(0);
+        for bank in 0..9 {
+            if let Some((base, size)) = self.mapped_range(bank) {
+                if (0x0600_0000..0x0608_0000).contains(&base) {
+                    let off = (base - 0x0600_0000) as usize;
+                    let n = (size as usize)
+                        .min(self.banks[bank].len())
+                        .min(out.len().saturating_sub(off));
+                    out[off..off + n].copy_from_slice(&self.banks[bank][..n]);
+                }
+            }
+        }
+    }
+
     pub fn read(&self, addr: u32, bytes: u32) -> u32 {
         match self.resolve(addr) {
             Some((bank, off)) => {

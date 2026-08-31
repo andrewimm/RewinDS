@@ -53,6 +53,14 @@ pub struct Ppu {
     frame: u64,
     /// Output image in BGR555, `WIDTH * HEIGHT`.
     framebuffer: Vec<u16>,
+    // Shared-renderer working state for graphics-mode BG/OBJ compositing.
+    render_fb: video2d::state::Framebuffer,
+    latched: video2d::state::LatchedState,
+    affine: video2d::state::AffineInternalState,
+    segments: Vec<video2d::state::ScanlineSegment>,
+    scratch: video2d::state::Scratch,
+    /// Reused contiguous view of the Engine A BG VRAM region (up to 512 KB).
+    bg_vram: Vec<u8>,
     started: bool,
 }
 
@@ -71,6 +79,12 @@ impl Ppu {
             vcount: 0,
             frame: 0,
             framebuffer: vec![0; WIDTH * HEIGHT],
+            render_fb: video2d::state::Framebuffer::new(WIDTH, HEIGHT),
+            latched: video2d::state::LatchedState::default(),
+            affine: video2d::state::AffineInternalState::default(),
+            segments: Vec::new(),
+            scratch: video2d::state::Scratch::default(),
+            bg_vram: vec![0; 0x8_0000],
             started: false,
         }
     }
@@ -157,6 +171,7 @@ impl Ppu {
         irqs: &mut [Interrupts; 2],
         vram: &Vram,
         palette: &[u8],
+        oam: &[u8],
         ctx: &mut EventContext<'_, NdsEvent>,
     ) {
         match event {
@@ -172,7 +187,7 @@ impl Ppu {
 
                 if self.vcount == HEIGHT as u16 {
                     // Entering V-blank: render the finished frame and signal.
-                    self.render_frame(vram, palette);
+                    self.render_frame(vram, palette, oam);
                     self.frame += 1;
                     for (c, irq) in irqs.iter_mut().enumerate() {
                         if self.dispstat[c] & (1 << 3) != 0 {
@@ -198,14 +213,10 @@ impl Ppu {
     }
 
     /// Produce the frame from the Engine A display mode (`DISPCNT` bits 16-17).
-    fn render_frame(&mut self, vram: &Vram, palette: &[u8]) {
+    fn render_frame(&mut self, vram: &Vram, palette: &[u8], oam: &[u8]) {
         match (self.dispcnt >> 16) & 3 {
-            // Graphics: full BG/OBJ compositing awaits the `video2d` generalization
-            // (DS dimensions + banked VRAM); present the backdrop (BG palette 0).
-            1 => {
-                let backdrop = u16::from_le_bytes([palette[0], palette[1]]);
-                self.framebuffer.fill(backdrop);
-            }
+            // Graphics: composite the BG/OBJ layers through the shared renderer.
+            1 => self.render_graphics(vram, palette, oam),
             // Direct "VRAM display": blit an LCDC VRAM block (A–D) as a bitmap.
             2 => {
                 let block = ((self.dispcnt >> 18) & 3) as usize;
@@ -215,6 +226,44 @@ impl Ppu {
             }
             // Display off, or main-memory FIFO (unmodelled): black.
             _ => self.framebuffer.fill(0),
+        }
+    }
+
+    /// Composite the Engine A BG (and OBJ) layers through the shared `video2d`
+    /// renderer: assemble a flat view of the banked BG VRAM, derive the DS's
+    /// char/screen base offsets from `DISPCNT`, and draw every visible line.
+    fn render_graphics(&mut self, vram: &Vram, palette: &[u8], oam: &[u8]) {
+        video2d::latch::reload_affine_references(&self.registers, &mut self.affine);
+        video2d::latch::latch_for_scanline(
+            &self.registers,
+            &self.affine,
+            &mut self.latched,
+            &mut self.segments,
+        );
+        vram.assemble_engine_a_bg(&mut self.bg_vram);
+
+        // DS char/screen bases: BGxCNT (handled inside the renderer) plus the
+        // 64 KB-step offsets from DISPCNT (bits 24-26 char, 27-29 screen). OBJ
+        // VRAM is a separate region, not yet assembled, so its base stays 0.
+        let layout = video2d::VramLayout {
+            bg_char_base: ((self.dispcnt >> 24) & 7) * 0x1_0000,
+            bg_screen_base: ((self.dispcnt >> 27) & 7) * 0x1_0000,
+            obj_tile_base: 0,
+        };
+        let mem = video2d::PpuMemoryView::new(&self.bg_vram, palette, oam);
+        for y in 0..HEIGHT as u16 {
+            video2d::render_scanline(
+                &mut self.render_fb,
+                &self.segments,
+                &mut self.scratch,
+                y,
+                &mem,
+                layout,
+                &mut video2d::debug::sink::NullSink,
+            );
+        }
+        for (dst, src) in self.framebuffer.iter_mut().zip(self.render_fb.pixels.iter()) {
+            *dst = src.0;
         }
     }
 }

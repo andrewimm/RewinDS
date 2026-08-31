@@ -276,6 +276,7 @@ impl EventHandler<NdsEvent> for Machine {
                     &mut self.interrupts,
                     &self.vram,
                     &self.memory.palette,
+                    &self.memory.oam,
                     ctx,
                 );
             }
@@ -700,6 +701,33 @@ mod tests {
         // The whole top screen shows the backdrop color.
         let fb = system.framebuffer();
         assert!(fb.iter().all(|&p| p == 0x001F));
+    }
+
+    #[test]
+    fn engine_a_renders_a_text_background_through_video2d() {
+        let mut system = System::new();
+        // Block A → 2D Engine-A BG VRAM at 0x0600_0000.
+        system.io_write(Core::Arm9, 0x0400_0240, 0x80 | 1, 1); // VRAMCNT_A: enable, MST 1
+        // Tile 0 (4bpp, char base 0): every pixel is palette index 1 (bytes 0x11).
+        for i in 0..8u32 {
+            system.write(Core::Arm9, 0x0600_0000 + i * 4, 0x1111_1111, 4);
+        }
+        // The tilemap at screen-base block 1 (0x800) is zero-filled, so every map
+        // entry selects tile 0. BG palette entry 1 = green.
+        system.write(Core::Arm9, 0x0500_0002, 0x03E0, 2);
+        // BG0CNT: screen base block 1 (bits 8-12), char base 0, 4bpp, size 0.
+        system.io_write(Core::Arm9, 0x0400_0008, 1 << 8, 2);
+        // DISPCNT: graphics display mode (bit 16), BG mode 0, BG0 enabled (bit 8).
+        system.io_write(Core::Arm9, 0x0400_0000, (1 << 16) | (1 << 8), 4);
+
+        system.run_frame();
+
+        // The whole screen is tile 0 → palette index 1 → green, composited by the
+        // shared renderer over the assembled banked VRAM.
+        let fb = system.framebuffer();
+        assert_eq!(fb[0], 0x03E0);
+        assert_eq!(fb[137], 0x03E0);
+        assert_eq!(fb[crate::ppu::WIDTH * 100 + 200], 0x03E0);
     }
 
     #[test]
