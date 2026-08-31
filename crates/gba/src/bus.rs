@@ -201,6 +201,10 @@ impl Bus {
                 if self.cartridge.is_eeprom_at(addr) {
                     return BusResult::plain(u32::from(self.cartridge.eeprom_read()), cycles);
                 }
+                // The cartridge GPIO/RTC overlays three ROM-region addresses.
+                if let Some(v) = self.cartridge.gpio_read(addr) {
+                    return BusResult::plain(u32::from(v), cycles);
+                }
                 let off = (addr & 0x01FF_FFFF) as usize;
                 let value = if off + width.bytes() as usize <= self.cartridge.rom.len() {
                     read_le(&self.cartridge.rom, off, width)
@@ -285,9 +289,13 @@ impl Bus {
                 BusResult::plain((), cycles)
             }
             0x08..=0x0D => {
-                // A write into the EEPROM window clocks one serial bit in (D0).
+                // A write into the EEPROM window clocks one serial bit in (D0); a
+                // write to the GPIO overlay drives the RTC pins. Otherwise ROM is
+                // read-only and the write is dropped.
                 if self.cartridge.is_eeprom_at(addr) {
                     self.cartridge.eeprom_write(value & 1 != 0);
+                } else {
+                    self.cartridge.gpio_write(addr, value as u16);
                 }
                 BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence))
             }

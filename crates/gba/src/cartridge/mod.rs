@@ -9,11 +9,13 @@
 mod backup;
 mod eeprom;
 mod flash;
+mod rtc;
 mod sram;
 
 pub use backup::Backup;
 pub use eeprom::Eeprom;
 pub use flash::{Flash, FlashSize};
+pub use rtc::Rtc;
 pub use sram::Sram;
 
 /// The kind of save chip a cartridge carries.
@@ -97,6 +99,11 @@ pub fn detect_save_type(rom: &[u8]) -> SaveType {
     }
 }
 
+/// Whether a ROM carries the Seiko RTC library, exposing a GPIO/RTC at `0x080000C4`.
+pub fn has_rtc(rom: &[u8]) -> bool {
+    rom.windows(8).any(|w| w == b"SIIRTC_V")
+}
+
 /// A loaded cartridge: flat ROM plus its backup chip.
 #[derive(Clone, Debug)]
 pub struct Cartridge {
@@ -104,6 +111,8 @@ pub struct Cartridge {
     pub rom: Vec<u8>,
     /// The save chip, behind the `0x0E000000` region.
     pub backup: Backup,
+    /// The GPIO port + RTC, when the cart carries one (mapped at `0x080000C4..C8`).
+    pub gpio: Option<Rtc>,
     save_type: SaveType,
 }
 
@@ -111,16 +120,29 @@ impl Default for Cartridge {
     fn default() -> Self {
         // A bare cartridge (no ROM loaded — e.g. a test fixture) exposes plain
         // SRAM so the save region is usable without a detection pass.
-        Cartridge { rom: Vec::new(), backup: Backup::sram(), save_type: SaveType::Sram }
+        Cartridge { rom: Vec::new(), backup: Backup::sram(), gpio: None, save_type: SaveType::Sram }
     }
 }
 
 impl Cartridge {
-    /// Load a ROM, detecting its save type and provisioning a matching backup.
+    /// Load a ROM, detecting its save type and provisioning a matching backup, plus
+    /// a GPIO/RTC when the ROM advertises one (`SIIRTC_V`).
     pub fn load_rom(&mut self, rom: Vec<u8>) {
         self.save_type = detect_save_type(&rom);
         self.backup = self.save_type.make_backup();
+        self.gpio = has_rtc(&rom).then(Rtc::new);
         self.rom = rom;
+    }
+
+    /// Read a cartridge GPIO register (mapped in the ROM region at `0xC4`/`C6`/`C8`),
+    /// or `None` if there is no GPIO or the offset is elsewhere (→ read ROM).
+    pub fn gpio_read(&self, addr: u32) -> Option<u16> {
+        self.gpio.as_ref()?.read(addr & 0x01FF_FFFF)
+    }
+
+    /// Write a cartridge GPIO register; returns whether it was a GPIO write.
+    pub fn gpio_write(&mut self, addr: u32, value: u16) -> bool {
+        self.gpio.as_mut().is_some_and(|g| g.write(addr & 0x01FF_FFFF, value))
     }
 
     /// The detected (or overridden) save type. For EEPROM the reported size tracks
