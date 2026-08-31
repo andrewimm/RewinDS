@@ -633,6 +633,25 @@ fn thumb_blx_switches_back_to_arm() {
 }
 
 #[test]
+fn ldr_pc_interworks_on_v5_only() {
+    // ldr pc, [r0]; the loaded value's bit 0 selects the instruction set on v5.
+    let run = |version| {
+        let mut bus = TestBus::new(0x300);
+        bus.load(0, &[0xE590_F000]);
+        bus.load(0x100, &[0x201]); // odd -> Thumb, target 0x200
+        let mut cpu = Cpu::with_version(version);
+        cpu.set_register(0, 0x100);
+        cpu.step(&mut bus);
+        cpu
+    };
+    let v5 = run(super::ArmVersion::Armv5TE);
+    assert!(v5.cpsr().thumb()); // interworked to Thumb
+    assert_eq!(v5.register(15) & !1, 0x200);
+    let v4 = run(super::ArmVersion::Armv4T);
+    assert!(!v4.cpsr().thumb()); // stayed ARM
+}
+
+#[test]
 fn cpu_version_defaults_to_v4t_and_selects_v5() {
     use super::ArmVersion;
     assert_eq!(Cpu::new().version(), ArmVersion::Armv4T);

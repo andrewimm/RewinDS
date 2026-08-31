@@ -356,6 +356,16 @@ impl Cpu {
         }
     }
 
+    /// Write the PC from a *loaded* value (`LDR`/`LDM`/`POP` into r15). On ARMv5
+    /// bit 0 selects the instruction set (Thumb if set); on ARMv4T it is ignored
+    /// (the address is aligned at fetch, so the core stays in ARM state).
+    fn load_pc(&mut self, value: u32) {
+        if self.version.is_v5() {
+            self.cpsr.set_thumb(value & 1 != 0);
+        }
+        self.set_reg(Register::PC, value);
+    }
+
     /// Write a register. Writing `r15` redirects execution.
     fn set_reg(&mut self, register: Register, value: u32) {
         if register.is_pc() {
@@ -476,7 +486,12 @@ impl Cpu {
             };
             self.internal_cycles(bus, 1); // the load-use internal cycle
             self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
-            self.set_reg(op.rd, value); // rd after writeback, so it wins if rn == rd
+            // rd after writeback, so it wins if rn == rd. `LDR pc` interworks on v5.
+            if op.rd.is_pc() {
+                self.load_pc(value);
+            } else {
+                self.set_reg(op.rd, value);
+            }
         } else {
             // Storing r15 stores the address of this instruction plus 12.
             let mut value = self.reg(op.rd);
@@ -621,6 +636,8 @@ impl Cpu {
                 self.cycles += read.cycles as u64;
                 if user_bank {
                     self.set_reg_user(i, read.value);
+                } else if register.is_pc() {
+                    self.load_pc(read.value); // `LDM {.., pc}` interworks on v5
                 } else {
                     self.set_reg(register, read.value);
                 }

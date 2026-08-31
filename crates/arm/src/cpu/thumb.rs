@@ -381,8 +381,8 @@ impl Cpu {
             if include_pc_lr {
                 let read = bus.load32(address, sequential);
                 self.cycles += read.cycles as u64;
-                // ARMv4T stays in Thumb state on a popped PC (no interworking).
-                self.set_reg(Register::PC, read.value & !1);
+                // A popped PC interworks on ARMv5 (bit 0 selects state); ARMv4T stays Thumb.
+                self.load_pc(read.value);
                 address = address.wrapping_add(4);
             }
             self.internal_cycles(bus, 1);
@@ -416,8 +416,8 @@ impl Cpu {
                 self.cycles += read.cycles as u64;
                 self.internal_cycles(bus, 1);
                 self.set_reg(rb, writeback);
-                // ARMv4T stays in Thumb state on a loaded PC (no interworking).
-                self.set_reg(Register::PC, read.value & !1);
+                // A loaded PC interworks on ARMv5 (bit 0 selects state); ARMv4T stays Thumb.
+                self.load_pc(read.value);
             } else {
                 // The stored PC is this instruction's address plus 6.
                 let value = self.reg(Register::PC).wrapping_add(2);
