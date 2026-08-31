@@ -50,6 +50,17 @@ impl CpuBus<'_> {
         self.scheduler.set_now(now);
     }
 
+    /// Advance for a data access. The GamePak prefetch unit works during any cycle
+    /// the CPU is not on the cartridge bus, so a data access to *other* memory
+    /// (BIOS/RAM/VRAM/I-O) lets the prefetcher buffer opcodes ahead — accesses to
+    /// the cartridge itself (ROM/SRAM) do not.
+    fn advance_data(&mut self, address: u32, cycles: u32) {
+        if address < 0x0800_0000 {
+            self.bus.step_prefetch(cycles);
+        }
+        self.advance(cycles);
+    }
+
     /// Record an MMIO write (and any event it (re)scheduled) into the trace.
     fn trace_write(&mut self, address: u32, value: u32, scheduling_changed: bool) {
         // Only the I/O region is interesting, and only when tracing is on.
@@ -86,35 +97,35 @@ impl CpuMemory for CpuBus<'_> {
         let read = self
             .bus
             .read32(address, cpu_access(AccessKind::Instruction, sequential), self.scheduler);
-        self.advance(read.cycles);
+        self.advance_data(address, read.cycles);
         Timed { value: read.value, cycles: read.cycles }
     }
     fn fetch16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
         let read = self
             .bus
             .read16(address, cpu_access(AccessKind::Instruction, sequential), self.scheduler);
-        self.advance(read.cycles);
+        self.advance_data(address, read.cycles);
         Timed { value: read.value, cycles: read.cycles }
     }
     fn load32(&mut self, address: u32, sequential: bool) -> Timed<u32> {
         let read = self
             .bus
             .read32(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
-        self.advance(read.cycles);
+        self.advance_data(address, read.cycles);
         Timed { value: read.value, cycles: read.cycles }
     }
     fn load16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
         let read = self
             .bus
             .read16(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
-        self.advance(read.cycles);
+        self.advance_data(address, read.cycles);
         Timed { value: read.value, cycles: read.cycles }
     }
     fn load8(&mut self, address: u32, sequential: bool) -> Timed<u8> {
         let read = self
             .bus
             .read8(address, cpu_access(AccessKind::Data, sequential), self.scheduler);
-        self.advance(read.cycles);
+        self.advance_data(address, read.cycles);
         Timed { value: read.value, cycles: read.cycles }
     }
     fn store32(&mut self, address: u32, value: u32, sequential: bool) -> u32 {
@@ -123,7 +134,7 @@ impl CpuMemory for CpuBus<'_> {
             .write32(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
         self.trace_write(address, value, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
-        self.advance(cycles);
+        self.advance_data(address, cycles);
         cycles
     }
     fn store16(&mut self, address: u32, value: u16, sequential: bool) -> u32 {
@@ -132,7 +143,7 @@ impl CpuMemory for CpuBus<'_> {
             .write16(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
         self.trace_write(address, value as u32, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
-        self.advance(cycles);
+        self.advance_data(address, cycles);
         cycles
     }
     fn store8(&mut self, address: u32, value: u8, sequential: bool) -> u32 {
@@ -141,7 +152,7 @@ impl CpuMemory for CpuBus<'_> {
             .write8(address, value, cpu_access(AccessKind::Data, sequential), self.scheduler);
         self.trace_write(address, value as u32, write.scheduling_changed);
         let cycles = write.cycles + self.bus.take_dma_stall_cycles() as u32;
-        self.advance(cycles);
+        self.advance_data(address, cycles);
         cycles
     }
     fn internal(&mut self, cycles: u32) {

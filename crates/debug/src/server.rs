@@ -328,7 +328,10 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
                 .enumerate()
                 .map(|(i, b)| json!({"index": i, "enabled": b.enabled, "priority": b.priority, "kind": format!("{:?}", b.kind)}))
                 .collect();
-            json!({"mode": v.current_mode(), "dispcnt": v.read_dispcnt(), "frame": v.frame(), "backgrounds": bgs})
+            let r = &v.registers;
+            json!({"mode": v.current_mode(), "dispcnt": v.read_dispcnt(), "frame": v.frame(), "backgrounds": bgs,
+                   "win_h": r.win_h, "win_v": r.win_v, "winin": r.winin, "winout": r.winout,
+                   "bldcnt": r.bldcnt, "mosaic": r.mosaic})
         }
         "video.framebuffer" => {
             let mut rgba = Vec::with_capacity(240 * 160 * 4);

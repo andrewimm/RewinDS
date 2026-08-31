@@ -185,8 +185,13 @@ impl Bus {
                 // enabled; data reads (and all reads when disabled) pay the raw
                 // wait-stated ROM timing.
                 let cycles = if access.kind == AccessKind::Instruction && self.prefetch.enabled() {
-                    self.prefetch_code_cost(addr >> 24, width, access.sequence)
+                    self.prefetch_code_cost(addr, width)
                 } else {
+                    // A data read from the cartridge steals the ROM bus from the
+                    // prefetcher, dropping its buffered opcodes.
+                    if access.kind == AccessKind::Data {
+                        self.prefetch.on_cart_data_access();
+                    }
                     self.rom_cycles(addr >> 24, width, access.sequence)
                 };
                 if !rom_accessible(access.master) {
@@ -303,26 +308,17 @@ impl Bus {
 
     /// Cycles for a prefetched instruction fetch from ROM. A 32-bit ARM opcode is
     /// two halfwords; the second is always sequential.
-    fn prefetch_code_cost(
-        &mut self,
-        region: u32,
-        width: AccessWidth,
-        sequence: AccessSequence,
-    ) -> u32 {
-        let (nonseq, seq) = self.ws_waits(ws_index(region));
+    fn prefetch_code_cost(&mut self, addr: u32, width: AccessWidth) -> u32 {
+        let (nonseq, seq) = self.ws_waits(ws_index(addr >> 24));
         let halfword_cost = 1 + seq;
-        let mut first = if sequence == AccessSequence::Sequential {
-            self.prefetch.fetch_sequential()
-        } else {
-            // A branch flushes the buffer; the fetched opcode pays the full
-            // non-sequential access while the prefetcher restarts.
-            self.prefetch.restart(halfword_cost);
-            1 + nonseq
-        };
+        let nonseq_cost = 1 + nonseq;
+        // An ARM word opcode is two halfwords; the second always continues the
+        // stream sequentially from the first.
+        let mut cost = self.prefetch.access(addr, halfword_cost, nonseq_cost);
         if width == AccessWidth::Word {
-            first += self.prefetch.fetch_sequential();
+            cost += self.prefetch.access(addr.wrapping_add(2), halfword_cost, nonseq_cost);
         }
-        first
+        cost
     }
 
     /// Advance the ROM prefetcher during `idle` guest cycles the CPU is not using
