@@ -88,6 +88,11 @@ impl Cart {
         self.chip_id = 0xC2 | (size_byte << 8) | (flags << 24);
     }
 
+    /// The cartridge's ROM chip ID (the boot-info footer mirrors it into RAM).
+    pub fn chip_id(&self) -> u32 {
+        self.chip_id
+    }
+
     // --- register access ----------------------------------------------------
 
     pub fn read_auxspicnt(&self) -> u16 {

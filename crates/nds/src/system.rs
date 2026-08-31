@@ -60,6 +60,9 @@ pub struct Machine {
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
+    /// `POSTFLG` (`0x4000300`) per core: bit 0 = boot completed. Retail games
+    /// refuse to run while it reads 0; direct boot sets it (GBATEK).
+    pub(crate) postflg: [u8; 2],
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
@@ -79,6 +82,7 @@ impl Machine {
             ipc: Ipc::new(),
             cart: Cart::new(),
             keyinput: 0x03FF, // all released
+            postflg: [0, 0],
             clock: [0; 2],
         }
     }
@@ -225,6 +229,7 @@ impl Machine {
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
             0x0400_0214 => self.interrupts[c].iflags(),
+            0x0400_0300 => self.postflg[c] as u32,
             0x0410_0000 => self.ipc.recv(core, &mut self.interrupts),
             0x0410_0010 => {
                 // Gamecard data port: stream a word; the last word of a block
@@ -322,6 +327,11 @@ impl Machine {
             0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
             0x0400_0210 => self.interrupts[c].set_ie(value),
             0x0400_0214 => self.interrupts[c].acknowledge(value),
+            0x0400_0300 => {
+                // POSTFLG: bit 0 latches set (cannot be cleared); NDS9 bit 1 is R/W.
+                let mask = if core == Core::Arm9 { 0b11 } else { 0b01 };
+                self.postflg[c] |= value as u8 & mask;
+            }
             _ => {}
         }
     }
@@ -517,6 +527,9 @@ impl System {
             self.machine
                 .data_write(Core::Arm9, 0x027F_FE00 + i as u32, byte as u32, 1);
         }
+        // Rebuild the firmware boot-info footer + user settings + POSTFLG that
+        // retail games expect the firmware to have established.
+        self.seed_firmware_state(rom, &header);
         // Seed CP15 to the TCM state the ARM9 BIOS establishes, which BIOS-less
         // homebrew relies on (armwrestler's stack lives in DTCM and its startup
         // never configures CP15): DTCM 16 KB at 0x0080_0000 and ITCM 32 KB at 0,
@@ -533,6 +546,61 @@ impl System {
         self.arm7.set_pc(header.arm7_entry);
         self.arm7.set_register(13, 0x0380_FD80);
         Ok(())
+    }
+
+    /// Rebuild the firmware-established boot state a retail game expects (GBATEK
+    /// "DS Firmware User Settings" and the `27FFxxx` footer): the gamecard chip ID
+    /// and header CRCs mirrored into the footer at `0x27FF800`/`0x27FFC00`, the
+    /// inter-core boot handshake words, the boot indicator, and the user's touch/
+    /// language/clock settings at `0x27FFC80`. Also sets `POSTFLG` on both cores.
+    fn seed_firmware_state(&mut self, rom: &[u8], header: &crate::boot::Header) {
+        let chip_id = self.machine.cart.chip_id();
+        let u16_at = |off: usize| u16::from_le_bytes([rom[off], rom[off + 1]]) as u32;
+        let header_crc = u16_at(0x15E); // hdr[15Eh]: cart header CRC
+        let secure_crc = u16_at(0x06C); // hdr[06Ch]: secure-area CRC
+        const NDS7_BIOS_CRC: u32 = 0x5835; // constant (GBATEK)
+
+        let mut w = |addr: u32, value: u32, bytes: u32| {
+            self.machine.data_write(Core::Arm9, addr, value, bytes);
+        };
+
+        // Footer at 0x27FF800 ("from BIOS boot code").
+        w(0x027F_F800, chip_id, 4); // Chip ID 1
+        w(0x027F_F804, chip_id, 4); // Chip ID 2
+        w(0x027F_F808, header_crc, 2); // Header CRC (verified)
+        w(0x027F_F80A, secure_crc, 2); // Secure-area CRC
+        w(0x027F_F80C, 0, 2); // Missing/bad CRC: okay
+        w(0x027F_F80E, 0, 2); // Secure area bad: okay
+        w(0x027F_F810, 0xFFFF, 2); // Boot handler task number (idle at cart boot)
+        w(0x027F_F816, 0, 2); // RTC status: okay
+
+        // Footer at 0x27FF850/860 ("from firmware boot code"), incl. the inter-core
+        // boot handshake the two crt0s check.
+        w(0x027F_F850, NDS7_BIOS_CRC, 2);
+        w(0x027F_F860, header.arm7_ram_address, 4); // copy of cart[38h]
+        w(0x027F_F864, 0, 4); // Wifi user settings: okay
+        w(0x027F_F874, 0x359A, 2); // firmware part5 crc16 (constant)
+        w(0x027F_F880, 7, 4); // Message from NDS9 to NDS7 (cart-boot value)
+        w(0x027F_F884, 6, 4); // NDS7 boot task, also checked by NDS9
+        w(0x027F_F890, 0xB000_2A22, 4); // boot flags (cart-boot value)
+
+        // Footer at 0x27FFC00 (mirror of 0x27FF800 + firmware values).
+        w(0x027F_FC00, chip_id, 4);
+        w(0x027F_FC04, chip_id, 4);
+        w(0x027F_FC08, header_crc, 2);
+        w(0x027F_FC0A, secure_crc, 2);
+        w(0x027F_FC0C, 0, 2);
+        w(0x027F_FC0E, 0, 2);
+        w(0x027F_FC10, NDS7_BIOS_CRC, 2);
+        w(0x027F_FC40, 1, 2); // Boot Indicator = normal (required by some games)
+
+        // User settings copy at 0x27FFC80 (the 0x70 data bytes).
+        for (i, &byte) in crate::firmware::user_settings().iter().enumerate() {
+            w(0x027F_FC80 + i as u32, byte as u32, 1);
+        }
+
+        // Boot completed: retail games refuse to run while POSTFLG reads 0.
+        self.machine.postflg = [1, 1];
     }
 
     /// Copy a cartridge binary into a core's RAM, byte by byte through its map.
@@ -992,6 +1060,44 @@ mod tests {
         // Direct boot seeds the BIOS TCM state so BIOS-less homebrew's stack works.
         assert!(system.cp15().dtcm_enabled());
         assert_eq!(system.cp15().dtcm_base(), 0x0080_0000);
+    }
+
+    #[test]
+    fn direct_boot_seeds_firmware_state() {
+        fn put(rom: &mut [u8], off: usize, v: u32) {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x6000];
+        put(&mut rom, 0x20, 0x4000); // ARM9 rom offset
+        put(&mut rom, 0x24, 0x0200_0000); // entry
+        put(&mut rom, 0x28, 0x0200_0000); // ram
+        put(&mut rom, 0x2C, 4); // size
+        put(&mut rom, 0x30, 0x5000); // ARM7 rom offset
+        put(&mut rom, 0x34, 0x0210_0000);
+        put(&mut rom, 0x38, 0x0210_0000);
+        put(&mut rom, 0x3C, 4);
+        rom[0x15E..0x160].copy_from_slice(&0xABCDu16.to_le_bytes()); // header CRC
+        rom[0x6C..0x6E].copy_from_slice(&0x1234u16.to_le_bytes()); // secure CRC
+        // Park both cores immediately.
+        put(&mut rom, 0x4000, 0xEAFF_FFFE);
+        put(&mut rom, 0x5000, 0xEAFF_FFFE);
+
+        let mut system = System::new();
+        system.direct_boot(&rom).unwrap();
+
+        // POSTFLG set on both cores (games refuse to run otherwise).
+        assert_eq!(system.read(Core::Arm9, 0x0400_0300, 1) & 1, 1);
+        assert_eq!(system.read(Core::Arm7, 0x0400_0300, 1) & 1, 1);
+        // Boot indicator = normal; header/secure CRC mirrored into the footer.
+        assert_eq!(system.read(Core::Arm9, 0x027F_FC40, 2), 1);
+        assert_eq!(system.read(Core::Arm9, 0x027F_F808, 2), 0xABCD);
+        assert_eq!(system.read(Core::Arm9, 0x027F_F80A, 2), 0x1234);
+        // Inter-core boot handshake words.
+        assert_eq!(system.read(Core::Arm9, 0x027F_F880, 4), 7);
+        assert_eq!(system.read(Core::Arm9, 0x027F_F884, 4), 6);
+        // User settings: version 5, English + settings-okay flags, no prompt.
+        assert_eq!(system.read(Core::Arm9, 0x027F_FC80, 2), 5);
+        assert_eq!(system.read(Core::Arm9, 0x027F_FC80 + 0x64, 2) & 0x7, 1); // language English
     }
 
     #[test]

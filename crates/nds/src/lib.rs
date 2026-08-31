@@ -14,6 +14,7 @@ pub mod bus;
 pub mod cart;
 pub mod cp15;
 pub mod dma;
+pub mod firmware;
 pub mod interrupt;
 pub mod ipc;
 pub mod key1;
