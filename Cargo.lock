@@ -237,6 +237,14 @@ name = "emu-core"
 version = "0.1.0"
 
 [[package]]
+name = "emulator"
+version = "0.1.0"
+dependencies = [
+ "gba",
+ "ringbuf",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,10 +848,9 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "debug",
- "gba",
+ "emulator",
  "log",
  "minifb",
- "ringbuf",
 ]
 
 [[package]]

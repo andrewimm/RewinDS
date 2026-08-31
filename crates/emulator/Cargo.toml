@@ -1,0 +1,9 @@
+[package]
+name = "emulator"
+version = "0.1.0"
+edition = "2021"
+description = "Console-agnostic emulator facade (GBA today, NDS next) with an FFI-ready surface"
+
+[dependencies]
+gba = { path = "../gba" }
+ringbuf = "0.4"

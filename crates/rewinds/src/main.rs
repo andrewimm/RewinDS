@@ -1,16 +1,16 @@
 //! RewinDS desktop runner: boots a GBA BIOS (and an optional cartridge) into a
-//! window, mapping the host keyboard to the GBA keypad.
+//! window, mapping the host keyboard to console input.
 //!
-//! Presentation uses minifb — a simple CPU-blitted pixel buffer — as the first
-//! bootable milestone. The emulator core is backend-agnostic: it produces a
-//! 240x160 BGR555 framebuffer and consumes keypad input. A future wgpu renderer
-//! will replace only the window/present code in this file, reusing [`System`],
-//! [`System::run_frame`], [`System::framebuffer`], and the key map below.
+//! It is the *reference host* for the [`Emulator`] facade — a thin Rust app that
+//! drives the exact console-agnostic surface (load, run a frame, feed input, read
+//! screens, pull audio, exchange save bytes) that a native Swift app will drive
+//! through the C FFI. Presentation uses minifb, a simple CPU-blitted pixel buffer;
+//! a future wgpu renderer would replace only the window/present code here.
 
 mod audio;
 mod logging;
 
-use gba::{Cartridge, Key as Button, SaveType, System};
+use emulator::{button, Console, Emulator, Input, Load};
 use minifb::{Key, Scale, Window, WindowOptions};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -19,20 +19,20 @@ use std::time::{Duration, Instant};
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
 
-/// Host key → GBA button. Arrow keys drive the D-pad; X/Z are A/B (VBA layout);
-/// A/S are the L/R shoulders; Enter/Backspace are Start/Select. Hold Space to
-/// fast-forward.
-const KEY_MAP: &[(Key, Button)] = &[
-    (Key::X, Button::A),
-    (Key::Z, Button::B),
-    (Key::Enter, Button::Start),
-    (Key::Backspace, Button::Select),
-    (Key::Up, Button::Up),
-    (Key::Down, Button::Down),
-    (Key::Left, Button::Left),
-    (Key::Right, Button::Right),
-    (Key::A, Button::L),
-    (Key::S, Button::R),
+/// Host key → console button bit. Arrow keys drive the D-pad; X/Z are A/B (VBA
+/// layout); A/S are the L/R shoulders; Enter/Backspace are Start/Select. Hold
+/// Space to fast-forward.
+const KEY_MAP: &[(Key, u32)] = &[
+    (Key::X, button::A),
+    (Key::Z, button::B),
+    (Key::Enter, button::START),
+    (Key::Backspace, button::SELECT),
+    (Key::Up, button::UP),
+    (Key::Down, button::DOWN),
+    (Key::Left, button::LEFT),
+    (Key::Right, button::RIGHT),
+    (Key::A, button::L),
+    (Key::S, button::R),
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -54,37 +54,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         .first()
         .ok_or("usage: rewinds <bios.bin> [rom.gba] [--debug-port N]")?;
 
-    let mut system = System::new();
-    system.gba.bus.load_bios(&std::fs::read(bios_path)?);
+    let bios = std::fs::read(bios_path)?;
+    let rom = positional.get(1).map(std::fs::read).transpose()?;
+    let mut emulator = Emulator::load(Load {
+        console: Some(Console::Gba),
+        rom: rom.as_deref(),
+        bios: Some(&bios),
+    })?;
 
     // A loaded ROM brings a save backup: its type is detected from the ROM, an
     // optional `<rom>.sav.meta` sidecar may override it, and a `<rom>.sav` file
     // (raw chip dump, interoperable with other emulators) is restored if present.
+    // Persistence is the host's job — the emulator only exchanges the bytes.
     let mut save_paths: Option<(PathBuf, PathBuf)> = None;
     if let Some(rom_path) = positional.get(1) {
-        system.gba.bus.load_rom(std::fs::read(rom_path)?);
         let sav = Path::new(rom_path).with_extension("sav");
         let meta = {
             let mut m = sav.clone().into_os_string();
             m.push(".meta");
             PathBuf::from(m)
         };
-        if let Some(save_type) = read_meta_save_type(&meta) {
-            system.gba.bus.cartridge.set_save_type(save_type);
+        if let Some(name) = read_meta_save_type(&meta) {
+            emulator.set_save_type_by_name(&name);
         }
         if let Ok(bytes) = std::fs::read(&sav) {
-            system.gba.bus.cartridge.load_backup(&bytes);
+            emulator.load_save_data(&bytes);
         }
-        let save_type = system.gba.bus.cartridge.save_type();
-        log::info!("cartridge save: {} ({} bytes)", save_type.name(), save_type.backup_size());
+        log::info!("cartridge save: {}", emulator.save_type_name());
         save_paths = Some((sav, meta));
     }
 
-    // The CPU begins at the BIOS reset vector.
-    system.cpu.set_pc(0);
-
     // Headless debug-server mode: the client drives execution and inspects state.
+    // The debug server is a GBA-specific inspector for now, so it takes the
+    // concrete machine out of the facade.
     if let Some(port) = debug_port {
+        let system = emulator.into_gba().expect("debug server supports GBA only");
         debug::server::serve(system, port)?;
         return Ok(());
     }
@@ -100,67 +104,69 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     window.set_target_fps(60);
 
-    // Host audio output (silent if no device is available).
-    let mut audio = audio::Audio::new();
+    // Host audio output (silent if no device is available). Kept alive so the
+    // stream keeps playing.
+    let _audio = audio::Audio::open(&mut emulator);
 
-    // Reused each frame: the BGR555 framebuffer converted to minifb's 0x00RRGGBB.
+    // Reused each frame: the RGBA present buffer packed into minifb's 0x00RRGGBB.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
     // Flush the save at most a few times a second, only after the game writes it.
     const FLUSH_EVERY_FRAMES: u32 = 180;
     let mut frames_since_flush = 0u32;
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Mirror the host keyboard into the keypad each frame.
-        for &(host, button) in KEY_MAP {
-            system.set_key(button, window.is_key_down(host));
+        // Mirror the host keyboard into a single input snapshot each frame.
+        let mut input = Input::default();
+        for &(host, bit) in KEY_MAP {
+            input.set(bit, window.is_key_down(host));
         }
+        emulator.set_input(input);
 
-        // Debug mix mutes: F1 = DirectSound, F2 = PSG.
-        if window.is_key_pressed(Key::F1, minifb::KeyRepeat::No) {
-            let muted = system.gba.bus.io.apu.toggle_mute_directsound();
-            log::info!("DirectSound {}", if muted { "muted" } else { "unmuted" });
-        }
-        if window.is_key_pressed(Key::F2, minifb::KeyRepeat::No) {
-            let muted = system.gba.bus.io.apu.toggle_mute_psg();
-            log::info!("PSG {}", if muted { "muted" } else { "unmuted" });
-        }
-        // F3 = A/B the output low-pass filter.
-        if window.is_key_pressed(Key::F3, minifb::KeyRepeat::No) {
-            let on = system.gba.bus.io.apu.toggle_low_pass();
-            log::info!("low-pass filter {}", if on { "on" } else { "off" });
+        // Debug mix toggles (GBA-specific dev conveniences, via the escape hatch):
+        // F1 = DirectSound, F2 = PSG, F3 = output low-pass.
+        if let Some(system) = emulator.as_gba_mut() {
+            if window.is_key_pressed(Key::F1, minifb::KeyRepeat::No) {
+                let muted = system.gba.bus.io.apu.toggle_mute_directsound();
+                log::info!("DirectSound {}", if muted { "muted" } else { "unmuted" });
+            }
+            if window.is_key_pressed(Key::F2, minifb::KeyRepeat::No) {
+                let muted = system.gba.bus.io.apu.toggle_mute_psg();
+                log::info!("PSG {}", if muted { "muted" } else { "unmuted" });
+            }
+            if window.is_key_pressed(Key::F3, minifb::KeyRepeat::No) {
+                let on = system.gba.bus.io.apu.toggle_low_pass();
+                log::info!("low-pass filter {}", if on { "on" } else { "off" });
+            }
         }
 
         // Hold Space to fast-forward: run unthrottled for a display frame's worth
-        // of real time, presenting only the final frame and dropping audio (like
+        // of real time, presenting only the final frame and muting audio (like
         // VBA's speed-up). Otherwise run one frame at 60 fps with audio.
         let warp = window.is_key_down(Key::Space);
         window.set_target_fps(if warp { 10_000 } else { 60 });
+        emulator.set_audio_muted(warp);
         if warp {
             let deadline = Instant::now() + Duration::from_millis(14);
             loop {
-                system.run_frame();
-                let _ = system.take_audio(); // fast-forward is silent
+                emulator.run_frame();
                 if Instant::now() >= deadline {
                     break;
                 }
             }
         } else {
-            system.run_frame();
-            if let Some(a) = audio.as_mut() {
-                a.push(&system.take_audio());
-            }
+            emulator.run_frame();
         }
 
-        for (out, color) in buffer.iter_mut().zip(system.framebuffer()) {
-            let [r, g, b, _] = color.to_rgba8();
-            *out = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        let screen = emulator.screen(0).expect("GBA presents one screen");
+        for (out, px) in buffer.iter_mut().zip(screen.rgba.as_chunks::<4>().0) {
+            *out = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
         }
         window.update_with_buffer(&buffer, WIDTH, HEIGHT)?;
 
         if let Some((sav, meta)) = &save_paths {
             frames_since_flush += 1;
-            if frames_since_flush >= FLUSH_EVERY_FRAMES && system.gba.bus.cartridge.backup_dirty() {
-                if write_save(sav, meta, &system.gba.bus.cartridge).is_ok() {
-                    system.gba.bus.cartridge.clear_backup_dirty();
+            if frames_since_flush >= FLUSH_EVERY_FRAMES && emulator.save_dirty() {
+                if write_save(sav, meta, &emulator).is_ok() {
+                    emulator.clear_save_dirty();
                 }
                 frames_since_flush = 0;
             }
@@ -169,8 +175,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Final flush on exit so the last writes are not lost.
     if let Some((sav, meta)) = &save_paths {
-        if system.gba.bus.cartridge.backup_dirty() {
-            if let Err(e) = write_save(sav, meta, &system.gba.bus.cartridge) {
+        if emulator.save_dirty() {
+            if let Err(e) = write_save(sav, meta, &emulator) {
                 log::warn!("could not write save {}: {e}", sav.display());
             }
         }
@@ -178,27 +184,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Read the `save_type` override from a `.sav.meta` sidecar, if present and valid.
-fn read_meta_save_type(path: &Path) -> Option<SaveType> {
+/// Read the `save_type` override name from a `.sav.meta` sidecar, if present.
+fn read_meta_save_type(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let key = "\"save_type\"";
     let rest = &text[text.find(key)? + key.len()..];
     let start = rest.find('"')? + 1;
     let end = rest[start..].find('"')? + start;
-    SaveType::from_name(&rest[start..end])
+    Some(rest[start..end].to_string())
 }
 
 /// Write the raw `.sav` (chip dump) plus a small JSON sidecar recording the save
 /// type. Absent backups (empty dump) write nothing.
-fn write_save(sav: &Path, meta: &Path, cartridge: &Cartridge) -> std::io::Result<()> {
-    let bytes = cartridge.backup_bytes();
+fn write_save(sav: &Path, meta: &Path, emulator: &Emulator) -> std::io::Result<()> {
+    let bytes = emulator.save_data();
     if bytes.is_empty() {
         return Ok(());
     }
     std::fs::write(sav, bytes)?;
     std::fs::write(
         meta,
-        format!("{{\n  \"save_type\": \"{}\"\n}}\n", cartridge.save_type().name()),
+        format!("{{\n  \"save_type\": \"{}\"\n}}\n", emulator.save_type_name()),
     )?;
     Ok(())
 }

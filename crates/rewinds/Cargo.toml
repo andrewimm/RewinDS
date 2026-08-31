@@ -5,9 +5,8 @@ edition = "2021"
 description = "RewinDS emulator — desktop runner"
 
 [dependencies]
-gba = { path = "../gba" }
+emulator = { path = "../emulator" }
 debug = { path = "../debug" }
 minifb = "0.27"
 cpal = "0.15"
-ringbuf = "0.4"
 log = "0.4"
