@@ -17,7 +17,7 @@ use super::debug::sink::{NullSink, PixelRecorder, ProvenanceSink, ScanlineRecord
 use super::effects;
 use super::memory::PpuMemoryView;
 use super::priority;
-use super::state::{CandidatePixel, LatchedState, LayerId, HEIGHT, WIDTH};
+use super::state::{CandidatePixel, Color15, LatchedState, LayerId, HEIGHT, WIDTH};
 use super::Ppu;
 
 /// Build the structured latched-state summary for scanline `y`.
@@ -70,6 +70,15 @@ impl Ppu {
                 WIDTH
             };
             if x_start >= x_end {
+                continue;
+            }
+
+            // Forced blank (DISPCNT bit 7): the PPU drives white and touches no
+            // VRAM/palette/OAM. Fill the span and skip the compositor entirely.
+            if seg.state.forced_blank() {
+                for pixel in &mut self.framebuffer.pixels[row + x_start..row + x_end] {
+                    *pixel = Color15(0x7FFF);
+                }
                 continue;
             }
 

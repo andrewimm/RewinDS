@@ -899,11 +899,12 @@ mod tests {
         // Render line 0 at its HBlank.
         sys.advance_time(1006);
 
-        // Left of the split still shows BG2; right of it is force-blanked (backdrop).
+        // Left of the split still shows BG2; right of it is force-blanked, which the
+        // hardware drives white (0x7FFF) — not the backdrop.
         assert_eq!(sys.framebuffer()[0], Color15(0x03E0));
         assert_eq!(sys.framebuffer()[119], Color15(0x03E0));
-        assert_eq!(sys.framebuffer()[120], Color15(0x7C00));
-        assert_eq!(sys.framebuffer()[239], Color15(0x7C00));
+        assert_eq!(sys.framebuffer()[120], Color15(0x7FFF));
+        assert_eq!(sys.framebuffer()[239], Color15(0x7FFF));
     }
 
     #[test]

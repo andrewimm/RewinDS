@@ -203,6 +203,23 @@ mod tests {
         assert_eq!(ppu.framebuffer()[239], Color15(0x001F));
     }
 
+    /// Forced blank (DISPCNT bit 7) drives the whole line white, ignoring VRAM.
+    #[test]
+    fn forced_blank_outputs_white() {
+        let mut ppu = Ppu::new();
+        let mut mem = Memory::default();
+        // Mode 3, BG2 on, but forced blank set — VRAM content must not show.
+        ppu.write_dispcnt(0x0003 | (1 << 10) | (1 << 7));
+        mem.vram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes());
+        mem.palette[0..2].copy_from_slice(&0x001Fu16.to_le_bytes()); // backdrop red
+        ppu.latch_for_scanline();
+
+        let view = PpuMemoryView::new(&mem);
+        ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
+        assert_eq!(ppu.framebuffer()[0], Color15(0x7FFF)); // white, not BG2 nor backdrop
+        assert_eq!(ppu.framebuffer()[239], Color15(0x7FFF));
+    }
+
     /// Mode 3 samples direct color from VRAM into BG2.
     #[test]
     fn mode3_samples_direct_color_from_vram() {

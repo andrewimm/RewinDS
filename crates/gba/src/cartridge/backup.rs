@@ -1,16 +1,19 @@
 //! The backup-memory device: the save chip behind the GamePak SRAM region.
 
+use super::eeprom::Eeprom;
 use super::flash::{Flash, FlashSize};
 use super::sram::Sram;
 
-/// A cartridge's save chip. EEPROM is detected but not yet modeled (its serial
-/// protocol rides on DMA); it presents as absent for now.
+/// A cartridge's save chip. SRAM and Flash sit in the `0x0E000000` byte-bus region
+/// and are driven through [`read8`](Backup::read8)/[`write8`](Backup::write8);
+/// EEPROM instead rides the upper GamePak window as a bit stream (see [`Eeprom`]).
 #[derive(Clone, Debug)]
 pub enum Backup {
     /// No save chip: reads float to all-ones, writes are dropped.
     None,
     Sram(Sram),
     Flash(Flash),
+    Eeprom(Eeprom),
 }
 
 impl Backup {
@@ -22,11 +25,15 @@ impl Backup {
         Backup::Flash(Flash::new(size))
     }
 
-    /// Read a byte from the chip (the region is an 8-bit bus). An absent chip
-    /// reads all-ones.
+    pub fn eeprom() -> Self {
+        Backup::Eeprom(Eeprom::new())
+    }
+
+    /// Read a byte from the `0x0E000000` region (an 8-bit bus). An absent chip —
+    /// and EEPROM, which does not answer here — reads all-ones.
     pub fn read8(&self, addr: u32) -> u8 {
         match self {
-            Backup::None => 0xFF,
+            Backup::None | Backup::Eeprom(_) => 0xFF,
             Backup::Sram(s) => s.read8(addr),
             Backup::Flash(f) => f.read8(addr),
         }
@@ -34,7 +41,7 @@ impl Backup {
 
     pub fn write8(&mut self, addr: u32, value: u8) {
         match self {
-            Backup::None => {}
+            Backup::None | Backup::Eeprom(_) => {}
             Backup::Sram(s) => s.write8(addr, value),
             Backup::Flash(f) => f.write8(addr, value),
         }
@@ -46,6 +53,7 @@ impl Backup {
             Backup::None => &[],
             Backup::Sram(s) => s.bytes(),
             Backup::Flash(f) => f.bytes(),
+            Backup::Eeprom(e) => e.bytes(),
         }
     }
 
@@ -55,6 +63,7 @@ impl Backup {
             Backup::None => {}
             Backup::Sram(s) => s.load(data),
             Backup::Flash(f) => f.load(data),
+            Backup::Eeprom(e) => e.load(data),
         }
     }
 
@@ -64,6 +73,7 @@ impl Backup {
             Backup::None => false,
             Backup::Sram(s) => s.dirty(),
             Backup::Flash(f) => f.dirty(),
+            Backup::Eeprom(e) => e.dirty(),
         }
     }
 
@@ -72,6 +82,7 @@ impl Backup {
             Backup::None => {}
             Backup::Sram(s) => s.clear_dirty(),
             Backup::Flash(f) => f.clear_dirty(),
+            Backup::Eeprom(e) => e.clear_dirty(),
         }
     }
 }

@@ -197,6 +197,10 @@ impl Bus {
                 if !rom_accessible(access.master) {
                     return BusResult::plain(OPEN_BUS, cycles);
                 }
+                // EEPROM answers as a bit-serial device in the upper GamePak window.
+                if self.cartridge.is_eeprom_at(addr) {
+                    return BusResult::plain(u32::from(self.cartridge.eeprom_read()), cycles);
+                }
                 let off = (addr & 0x01FF_FFFF) as usize;
                 let value = if off + width.bytes() as usize <= self.cartridge.rom.len() {
                     read_le(&self.cartridge.rom, off, width)
@@ -280,7 +284,13 @@ impl Bus {
                 }
                 BusResult::plain((), cycles)
             }
-            0x08..=0x0D => BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence)),
+            0x08..=0x0D => {
+                // A write into the EEPROM window clocks one serial bit in (D0).
+                if self.cartridge.is_eeprom_at(addr) {
+                    self.cartridge.eeprom_write(value & 1 != 0);
+                }
+                BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence))
+            }
             0x0E | 0x0F => {
                 // The backup region is an 8-bit bus, CPU-only: DMA writes are
                 // dropped. A 16/32-bit store latches a single byte — the one the
@@ -747,6 +757,46 @@ mod tests {
         // ROM is read-only.
         b.write16(0x0800_0000, 0xFFFF, CPU, &mut s);
         assert_eq!(b.read16(0x0800_0000, CPU, &mut s).value, 0x2211);
+    }
+
+    #[test]
+    fn eeprom_round_trips_through_the_gamepak_window() {
+        let (mut b, mut s) = bus();
+        // A small ROM carrying the EEPROM ID → the whole 0x0D region is the window.
+        let mut rom = vec![0u8; 0x200];
+        rom[0x100..0x108].copy_from_slice(b"EEPROM_V");
+        b.load_rom(rom);
+        assert!(b.cartridge.is_eeprom_at(0x0D00_0000));
+
+        let win = 0x0D00_0000;
+        let clock_in = |b: &mut Bus, s: &mut Scheduler<EventKind>, bits: u128, n: u32| {
+            for i in (0..n).rev() {
+                b.write16(win, ((bits >> i) & 1) as u16, CPU, s);
+            }
+        };
+        // Write block 3 = 0xDEAD_BEEF_0000_0001: 1 0 | addr(6)=3 | data(64) | stop.
+        let payload: u64 = 0xDEAD_BEEF_0000_0001;
+        let mut cmd: u128 = 0b10;
+        cmd = (cmd << 6) | 3;
+        cmd = (cmd << 64) | payload as u128;
+        cmd <<= 1;
+        clock_in(&mut b, &mut s, cmd, 73);
+        assert_eq!(b.read16(win, CPU, &mut s).value, 1); // ready poll
+
+        // Read block 3: 1 1 | addr(6)=3 | stop, then 4 dummy + 64 data bits.
+        let mut rd: u128 = 0b11;
+        rd = (rd << 6) | 3;
+        rd <<= 1;
+        clock_in(&mut b, &mut s, rd, 9);
+        for _ in 0..4 {
+            b.read16(win, CPU, &mut s);
+        }
+        let mut got: u64 = 0;
+        for _ in 0..64 {
+            got = (got << 1) | b.read16(win, CPU, &mut s).value as u64;
+        }
+        assert_eq!(got, payload);
+        assert!(b.cartridge.backup_dirty());
     }
 
     #[test]

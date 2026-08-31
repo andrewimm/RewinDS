@@ -7,10 +7,12 @@
 //! is a stateful device (see [`Backup`]).
 
 mod backup;
+mod eeprom;
 mod flash;
 mod sram;
 
 pub use backup::Backup;
+pub use eeprom::Eeprom;
 pub use flash::{Flash, FlashSize};
 pub use sram::Sram;
 
@@ -21,9 +23,9 @@ pub enum SaveType {
     Sram,
     Flash64,
     Flash128,
-    /// EEPROM (512 B). Detected but not yet modeled; presents as [`Backup::None`].
+    /// EEPROM (512 B, 6-bit address). The default until a 14-bit command upgrades it.
     Eeprom512,
-    /// EEPROM (8 KiB). Detected but not yet modeled; presents as [`Backup::None`].
+    /// EEPROM (8 KiB, 14-bit address).
     Eeprom8k,
 }
 
@@ -67,10 +69,11 @@ impl SaveType {
 
     fn make_backup(self) -> Backup {
         match self {
-            SaveType::None | SaveType::Eeprom512 | SaveType::Eeprom8k => Backup::None,
+            SaveType::None => Backup::None,
             SaveType::Sram => Backup::sram(),
             SaveType::Flash64 => Backup::flash(FlashSize::K64),
             SaveType::Flash128 => Backup::flash(FlashSize::K128),
+            SaveType::Eeprom512 | SaveType::Eeprom8k => Backup::eeprom(),
         }
     }
 }
@@ -120,9 +123,47 @@ impl Cartridge {
         self.rom = rom;
     }
 
-    /// The detected (or overridden) save type.
+    /// The detected (or overridden) save type. For EEPROM the reported size tracks
+    /// the chip's live width, which is only pinned down once the game issues its
+    /// first (6- or 14-bit) command — so the `.sav`/`.meta` reflect reality.
     pub fn save_type(&self) -> SaveType {
+        if let Backup::Eeprom(e) = &self.backup {
+            return if e.size() > 0x200 { SaveType::Eeprom8k } else { SaveType::Eeprom512 };
+        }
         self.save_type
+    }
+
+    /// The base of the EEPROM window in the upper GamePak region. Carts of 16 MiB or
+    /// less answer across all of `0x0D000000..=0x0DFFFFFF`; larger carts (whose ROM
+    /// reaches into that region) confine EEPROM to the top 256 bytes.
+    fn eeprom_window_start(&self) -> u32 {
+        if self.rom.len() > 0x0100_0000 {
+            0x0DFF_FF00
+        } else {
+            0x0D00_0000
+        }
+    }
+
+    /// Whether `addr` (already region-`0x0D`) selects the EEPROM chip.
+    pub fn is_eeprom_at(&self, addr: u32) -> bool {
+        matches!(self.backup, Backup::Eeprom(_))
+            && addr >> 24 == 0x0D
+            && addr >= self.eeprom_window_start()
+    }
+
+    /// Clock one serial bit out of the EEPROM (result in D0).
+    pub fn eeprom_read(&mut self) -> u16 {
+        match &mut self.backup {
+            Backup::Eeprom(e) => e.read_bit(),
+            _ => 1,
+        }
+    }
+
+    /// Clock one serial bit into the EEPROM (from D0 of a DMA write).
+    pub fn eeprom_write(&mut self, bit: bool) {
+        if let Backup::Eeprom(e) = &mut self.backup {
+            e.write_bit(bit);
+        }
     }
 
     /// Force a save type, replacing the backup with a fresh chip of that type.
