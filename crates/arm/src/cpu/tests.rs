@@ -5,12 +5,17 @@ use super::{Bus, Cpu, Mode, Timed};
 /// A flat little-endian memory implementing the CPU [`Bus`].
 struct TestBus {
     memory: Vec<u8>,
+    /// A single fake coprocessor (number 15) for MRC/MCR tests: `MCR` stores its
+    /// word here and `MRC` reads it back. `None` models a machine with no
+    /// coprocessor, so the transfers trap as Undefined.
+    coprocessor: Option<u32>,
 }
 
 impl TestBus {
     fn new(size: usize) -> Self {
         TestBus {
             memory: vec![0; size],
+            coprocessor: None,
         }
     }
 
@@ -94,6 +99,39 @@ impl Bus for TestBus {
         1
     }
     fn internal(&mut self, _cycles: u32) {}
+
+    fn coprocessor_write(
+        &mut self,
+        cp: u8,
+        _opcode1: u8,
+        _crn: u8,
+        _crm: u8,
+        _opcode2: u8,
+        value: u32,
+    ) -> bool {
+        if cp == 15 {
+            if let Some(slot) = self.coprocessor.as_mut() {
+                *slot = value;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn coprocessor_read(
+        &mut self,
+        cp: u8,
+        _opcode1: u8,
+        _crn: u8,
+        _crm: u8,
+        _opcode2: u8,
+    ) -> Option<u32> {
+        if cp == 15 {
+            self.coprocessor
+        } else {
+            None
+        }
+    }
 }
 
 /// Run `cpu` until `r15` reaches `stop`, or `budget` steps elapse.
@@ -649,6 +687,96 @@ fn ldr_pc_interworks_on_v5_only() {
     assert_eq!(v5.register(15) & !1, 0x200);
     let v4 = run(super::ArmVersion::Armv4T);
     assert!(!v4.cpsr().thumb()); // stayed ARM
+}
+
+#[test]
+fn ldrd_strd_move_register_pairs_on_v5() {
+    use super::ArmVersion::Armv5TE;
+    // ldrd r0, [r2] — loads r0 from [r2] and r1 from [r2+4].
+    let mut bus = TestBus::new(0x200);
+    bus.load(0, &[0xE1C2_00D0]);
+    bus.load(0x100, &[0xAAAA_BBBB, 0xCCCC_DDDD]);
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(2, 0x100);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.register(0), 0xAAAA_BBBB);
+    assert_eq!(cpu.register(1), 0xCCCC_DDDD);
+
+    // strd r0, [r2] — stores r0 to [r2] and r1 to [r2+4].
+    let mut bus = TestBus::new(0x200);
+    bus.load(0, &[0xE1C2_00F0]);
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(2, 0x100);
+    cpu.set_register(0, 0x1234_5678);
+    cpu.set_register(1, 0x9ABC_DEF0);
+    cpu.step(&mut bus);
+    assert_eq!(bus.read(0x100, 4), 0x1234_5678);
+    assert_eq!(bus.read(0x104, 4), 0x9ABC_DEF0);
+}
+
+#[test]
+fn ldrd_preindexed_writeback_updates_base() {
+    use super::ArmVersion::Armv5TE;
+    // ldrd r4, [r2, #8]! — base advances by 8, loading r4/r5 from [r2+8]/[r2+12].
+    let mut bus = TestBus::new(0x200);
+    bus.load(0, &[0xE1E2_40D8]);
+    bus.load(0x108, &[0x1111_2222, 0x3333_4444]);
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(2, 0x100);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.register(4), 0x1111_2222);
+    assert_eq!(cpu.register(5), 0x3333_4444);
+    assert_eq!(cpu.register(2), 0x108); // writeback
+}
+
+#[test]
+fn ldrd_traps_as_undefined_on_v4t() {
+    // LDRD is not an instruction on ARMv4T — it must not write the pair.
+    let mut bus = TestBus::new(0x200);
+    bus.load(0, &[0xE1C2_00D0]);
+    bus.load(0x100, &[0xAAAA_BBBB, 0xCCCC_DDDD]);
+    let mut cpu = Cpu::with_version(super::ArmVersion::Armv4T);
+    cpu.set_register(0, 0xDEAD);
+    cpu.set_register(2, 0x100);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.register(0), 0xDEAD); // untouched — trapped, not executed
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+}
+
+#[test]
+fn mcr_mrc_move_words_through_a_coprocessor_on_v5() {
+    use super::ArmVersion::Armv5TE;
+    let mut bus = TestBus::new(0x100);
+    bus.coprocessor = Some(0); // a coprocessor is present
+    // mcr p15, 0, r1, c1, c0, 0  then  mrc p15, 0, r2, c1, c0, 0
+    bus.load(0, &[0xEE01_1F10, 0xEE11_2F10]);
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(1, 0xCAFE_F00D);
+    cpu.step(&mut bus); // MCR: r1 -> coprocessor
+    cpu.step(&mut bus); // MRC: coprocessor -> r2
+    assert_eq!(bus.coprocessor, Some(0xCAFE_F00D));
+    assert_eq!(cpu.register(2), 0xCAFE_F00D);
+}
+
+#[test]
+fn coprocessor_transfer_traps_when_absent_or_on_v4t() {
+    // No coprocessor present: MCR raises the Undefined Instruction trap.
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xEE01_1F10]); // mcr p15, 0, r1, c1, c0, 0
+    let mut cpu = Cpu::with_version(super::ArmVersion::Armv5TE);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+
+    // On ARMv4T the encoding is not an instruction at all, even with a
+    // coprocessor wired up — it must trap rather than transfer.
+    let mut bus = TestBus::new(0x100);
+    bus.coprocessor = Some(0);
+    bus.load(0, &[0xEE01_1F10]);
+    let mut cpu = Cpu::new(); // v4T
+    cpu.set_register(1, 0x1234);
+    cpu.step(&mut bus);
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+    assert_eq!(bus.coprocessor, Some(0)); // untouched — trapped, not transferred
 }
 
 #[test]

@@ -32,6 +32,10 @@ pub enum ArmOperation {
 
     SingleTransfer(SingleTransfer),
     HalfwordTransfer(HalfwordTransfer),
+
+    /// ARMv5TE-only doubleword transfer; traps as Undefined on an ARMv4T core.
+    DoublewordTransfer(DoublewordTransfer),
+
     BlockTransfer(BlockTransfer),
     Swap(Swap),
 
@@ -39,6 +43,10 @@ pub enum ArmOperation {
     BranchExchange(BranchExchange),
     BranchLinkExchange(BranchLinkExchange),
     Breakpoint(Breakpoint),
+
+    /// `MRC`/`MCR` — ARM ↔ coprocessor register transfer (the ARM9's CP15 system
+    /// control interface). ARMv5TE-only; traps as Undefined on an ARMv4T core.
+    CoprocessorRegisterTransfer(CoprocessorRegisterTransfer),
 
     SoftwareInterrupt(SoftwareInterrupt),
 
@@ -96,6 +104,10 @@ impl ArmOperation {
             ArmOperation::SingleTransfer(op) => op.load && op.rd.is_pc(),
             ArmOperation::HalfwordTransfer(op) => op.load && op.rd.is_pc(),
             ArmOperation::Swap(op) => op.rd.is_pc(),
+            // `LDRD` targets an even/odd register pair, so a defined `LDRD`
+            // never writes r15 (an r14 base pair is architecturally
+            // unpredictable rather than a defined PC write).
+            ArmOperation::DoublewordTransfer(_) => false,
             ArmOperation::BlockTransfer(op) => op.load && op.register_list & (1 << 15) != 0,
 
             // Multiplies to r15 are unpredictable (not a defined PC write), MSR
@@ -106,6 +118,8 @@ impl ArmOperation {
             | ArmOperation::CountLeadingZeros(_)
             | ArmOperation::SaturatingArithmetic(_)
             | ArmOperation::HalfwordMultiply(_)
+            // `MRC` to r15 updates the condition flags (APSR), never the PC.
+            | ArmOperation::CoprocessorRegisterTransfer(_)
             | ArmOperation::Msr(_)
             | ArmOperation::Undefined { .. } => false,
         }
@@ -371,6 +385,25 @@ pub enum HalfwordOffset {
     Register(Register),
 }
 
+/// `LDRD`/`STRD` — doubleword (two-register) transfer (ARMv5TE). Moves the
+/// even/odd register pair `rd` and `rd`+1 as two words. Undefined on ARMv4T.
+///
+/// It shares the extra-load/store addressing shape with [`HalfwordTransfer`],
+/// but the load/store choice is *not* the usual `L` bit (which is 0 for both);
+/// it is the `H` bit of the `SH` field, captured here as `store`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoublewordTransfer {
+    /// `false` = `LDRD` (load), `true` = `STRD` (store).
+    pub store: bool,
+    pub pre_indexed: bool,
+    pub add: bool,
+    pub writeback: bool,
+    pub rn: Register,
+    /// The first (even) register of the pair; `rd`+1 is the second.
+    pub rd: Register,
+    pub offset: HalfwordOffset,
+}
+
 /// `LDM` / `STM` — block (multiple register) transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockTransfer {
@@ -435,6 +468,23 @@ pub struct BranchLinkExchange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Breakpoint {
     pub comment: u16,
+}
+
+/// `MRC`/`MCR` — move a word between an ARM register and a coprocessor register
+/// (ARMv5TE). The five coprocessor selectors (`cp_num` plus the two opcodes and
+/// two coprocessor-register fields) name a location within the coprocessor; the
+/// `arm` crate stays device-agnostic and forwards them through the `Bus`. `CDP`,
+/// `LDC`, `STC`, `MCRR`, and `MRRC` are not modelled (CP15 does not use them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoprocessorRegisterTransfer {
+    /// `true` = `MRC` (coprocessor → ARM register), `false` = `MCR`.
+    pub load: bool,
+    pub cp_num: u8,
+    pub opcode1: u8,
+    pub opcode2: u8,
+    pub crn: u8,
+    pub crm: u8,
+    pub rd: Register,
 }
 
 /// `SWI` — software interrupt.

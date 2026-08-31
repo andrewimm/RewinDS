@@ -3,8 +3,9 @@
 use crate::disasm::{condition_suffix, immediate, reg, register_list, signed_immediate};
 use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
-    DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
-    DspMulOp, Multiply, MultiplyLong, Operand2, SaturatingOp, Shift, ShiftKind, ShiftSource,
+    DataProcessingOpcode, DoublewordTransfer, DspMulOp, HalfwordKind, HalfwordOffset,
+    HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, Operand2, SaturatingOp, Shift,
+    ShiftKind, ShiftSource,
     SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 
@@ -53,12 +54,25 @@ pub fn format_arm(inst: &ArmInstruction) -> String {
         }
         ArmOperation::SingleTransfer(op) => format_single_transfer(op, cond),
         ArmOperation::HalfwordTransfer(op) => format_halfword_transfer(op, cond),
+        ArmOperation::DoublewordTransfer(op) => format_doubleword_transfer(op, cond),
         ArmOperation::BlockTransfer(op) => format_block_transfer(op, cond),
         ArmOperation::Swap(op) => format_swap(op, cond),
         ArmOperation::Branch(op) => format_branch(op, cond),
         ArmOperation::BranchExchange(op) => format_branch_exchange(op, cond),
         ArmOperation::BranchLinkExchange(op) => format!("blx\t#{}", op.offset),
         ArmOperation::Breakpoint(op) => format!("bkpt\t#0x{:04x}", op.comment),
+        ArmOperation::CoprocessorRegisterTransfer(op) => {
+            let mnemonic = if op.load { "mrc" } else { "mcr" };
+            format!(
+                "{mnemonic}{cond}\tp{}, {}, {}, c{}, c{}, {}",
+                op.cp_num,
+                op.opcode1,
+                reg(op.rd),
+                op.crn,
+                op.crm,
+                op.opcode2
+            )
+        }
         ArmOperation::SoftwareInterrupt(op) => format_software_interrupt(op, cond),
         ArmOperation::Mrs(op) => format_mrs(op, cond),
         ArmOperation::Msr(op) => format_msr(op, cond),
@@ -261,6 +275,28 @@ fn format_halfword_address(op: &HalfwordTransfer) -> String {
     } else {
         format!("[{}], {offset}", reg(op.rn))
     }
+}
+
+fn format_doubleword_transfer(op: &DoublewordTransfer, cond: &str) -> String {
+    let ldst = if op.store { "strd" } else { "ldrd" };
+    let zero_offset = matches!(op.offset, HalfwordOffset::Immediate(0));
+    let offset = match &op.offset {
+        HalfwordOffset::Immediate(imm) => signed_immediate(*imm as u32, op.add),
+        HalfwordOffset::Register(rm) => {
+            format!("{}{}", if op.add { "" } else { "-" }, reg(*rm))
+        }
+    };
+    let address = if op.pre_indexed {
+        if zero_offset && !op.writeback {
+            format!("[{}]", reg(op.rn))
+        } else {
+            let wb = if op.writeback { "!" } else { "" };
+            format!("[{}, {offset}]{wb}", reg(op.rn))
+        }
+    } else {
+        format!("[{}], {offset}", reg(op.rn))
+    };
+    format!("{ldst}{cond}\t{}, {address}", reg(op.rd))
 }
 
 fn format_block_transfer(op: &BlockTransfer, cond: &str) -> String {

@@ -18,8 +18,9 @@ use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, BranchLinkExchange,
-    Breakpoint, CountLeadingZeros, DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind,
-    HalfwordMultiply, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
+    Breakpoint, CoprocessorRegisterTransfer, CountLeadingZeros, DataProcessing,
+    DataProcessingOpcode, DoublewordTransfer, DspMulOp, HalfwordKind, HalfwordMultiply,
+    HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
     SaturatingArithmetic, SaturatingOp, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
@@ -69,6 +70,8 @@ fn decode_operation(raw: u32) -> ArmOperation {
         decode_multiply(raw)
     } else if matches_multiply_long(raw) {
         decode_multiply_long(raw)
+    } else if matches_doubleword_transfer(raw) {
+        decode_doubleword_transfer(raw)
     } else if matches_halfword_transfer(raw) {
         decode_halfword_transfer(raw)
     } else {
@@ -182,6 +185,14 @@ fn matches_multiply_long(raw: u32) -> bool {
 /// excluded here (and matched earlier), so this predicate is order-independent.
 fn matches_halfword_transfer(raw: u32) -> bool {
     (raw & 0x0E00_0090) == 0x0000_0090 && (raw & 0x0000_0060) != 0
+}
+
+/// `LDRD`/`STRD` (ARMv5TE): the extra-load/store slot with `L` (bit 20) = 0 and
+/// `S` (bit 6) = 1, i.e. `SH` = 10 (`LDRD`) or 11 (`STRD`). It must be tried
+/// before [`matches_halfword_transfer`], which would otherwise capture these as
+/// nonexistent "store signed byte/halfword".
+fn matches_doubleword_transfer(raw: u32) -> bool {
+    (raw & 0x0E10_00D0) == 0x0000_00D0
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +346,29 @@ fn decode_halfword_transfer(raw: u32) -> ArmOperation {
     })
 }
 
+/// `LDRD` / `STRD` — doubleword (register-pair) transfer. Same addressing shape
+/// as a halfword transfer; the `H` bit (bit 5) selects load vs store.
+fn decode_doubleword_transfer(raw: u32) -> ArmOperation {
+    let immediate = raw & (1 << 22) != 0;
+    let offset = if immediate {
+        let hi = (raw >> 8) & 0xF;
+        let lo = raw & 0xF;
+        HalfwordOffset::Immediate(((hi << 4) | lo) as u8)
+    } else {
+        HalfwordOffset::Register(Register::new(raw as u8))
+    };
+
+    ArmOperation::DoublewordTransfer(DoublewordTransfer {
+        store: raw & (1 << 5) != 0,
+        pre_indexed: raw & (1 << 24) != 0,
+        add: raw & (1 << 23) != 0,
+        writeback: raw & (1 << 21) != 0,
+        rn: Register::new((raw >> 16) as u8),
+        rd: Register::new((raw >> 12) as u8),
+        offset,
+    })
+}
+
 /// Decode the `SH` field (bits 6..5) of a halfword/signed transfer. `SH == 00`
 /// is the swap encoding and is matched before reaching here.
 fn decode_halfword_kind(bits: u32) -> HalfwordKind {
@@ -424,13 +458,30 @@ fn decode_breakpoint(raw: u32) -> ArmOperation {
 }
 
 fn decode_swi_or_coprocessor(raw: u32) -> ArmOperation {
-    // Bits 27..24 == 1111 is `SWI`; otherwise this is coprocessor space
-    // (CDP/MRC/MCR), which we do not model.
+    // Bits 27..24 == 1111 is `SWI`. Otherwise bits 27..24 == 1110 is coprocessor
+    // space: bit 4 set is a register transfer (`MRC`/`MCR`, the CP15 interface);
+    // bit 4 clear is `CDP`, which CP15 does not use and which traps.
     if (raw & 0x0F00_0000) == 0x0F00_0000 {
         decode_software_interrupt(raw)
+    } else if raw & (1 << 4) != 0 {
+        decode_coprocessor_register_transfer(raw)
     } else {
         ArmOperation::Undefined { raw }
     }
+}
+
+/// `MRC` / `MCR` — `cond 1110 opc1 L CRn Rd cp_num opc2 1 CRm`. Bit 20 (`L`)
+/// selects `MRC` (load, from coprocessor) vs `MCR` (store, to coprocessor).
+fn decode_coprocessor_register_transfer(raw: u32) -> ArmOperation {
+    ArmOperation::CoprocessorRegisterTransfer(CoprocessorRegisterTransfer {
+        load: raw & (1 << 20) != 0,
+        cp_num: ((raw >> 8) & 0xF) as u8,
+        opcode1: ((raw >> 21) & 0x7) as u8,
+        opcode2: ((raw >> 5) & 0x7) as u8,
+        crn: ((raw >> 16) & 0xF) as u8,
+        crm: (raw & 0xF) as u8,
+        rd: Register::new((raw >> 12) as u8),
+    })
 }
 
 /// `SWI` — software interrupt. Bits 23..0 are the comment field, ignored by the
@@ -495,6 +546,59 @@ mod tests {
         assert!(matches_halfword_transfer(0xE1D1_00F0)); // LDRSH r0, [r1]
         // SWP has SH == 00 and must not be treated as a halfword transfer.
         assert!(!matches_halfword_transfer(0xE104_3092));
+    }
+
+    #[test]
+    fn doubleword_transfer_is_matched_and_decodes() {
+        // LDRD/STRD (L=0, SH=10/11) must be caught before the halfword matcher,
+        // which would otherwise treat them as nonexistent signed stores.
+        assert!(matches_doubleword_transfer(0xE1C2_00D0)); // LDRD r0, [r2]
+        assert!(matches_doubleword_transfer(0xE1C2_00F0)); // STRD r0, [r2]
+        // The L=1 signed loads are halfword transfers, not doubleword.
+        assert!(!matches_doubleword_transfer(0xE1D1_00D0)); // LDRSB
+        assert!(!matches_doubleword_transfer(0xE1D1_00F0)); // LDRSH
+
+        let ArmOperation::DoublewordTransfer(ldrd) = decode_arm(0xE1C2_00D0).operation else {
+            panic!("expected LDRD");
+        };
+        assert!(!ldrd.store);
+        assert_eq!(ldrd.rd, Register::new(0));
+        assert_eq!(ldrd.rn, Register::new(2));
+
+        let ArmOperation::DoublewordTransfer(strd) = decode_arm(0xE1C2_00F0).operation else {
+            panic!("expected STRD");
+        };
+        assert!(strd.store);
+    }
+
+    #[test]
+    fn coprocessor_register_transfer_decodes() {
+        // mcr p15, 0, r1, c1, c0, 0
+        let ArmOperation::CoprocessorRegisterTransfer(mcr) = decode_arm(0xEE01_1F10).operation
+        else {
+            panic!("expected MCR");
+        };
+        assert!(!mcr.load);
+        assert_eq!(mcr.cp_num, 15);
+        assert_eq!(mcr.opcode1, 0);
+        assert_eq!(mcr.opcode2, 0);
+        assert_eq!(mcr.crn, 1);
+        assert_eq!(mcr.crm, 0);
+        assert_eq!(mcr.rd, Register::new(1));
+
+        // mrc p15, 0, r2, c1, c0, 0 — same location, L bit set.
+        let ArmOperation::CoprocessorRegisterTransfer(mrc) = decode_arm(0xEE11_2F10).operation
+        else {
+            panic!("expected MRC");
+        };
+        assert!(mrc.load);
+        assert_eq!(mrc.rd, Register::new(2));
+
+        // CDP (bit 4 clear) is not modelled and stays Undefined.
+        assert!(matches!(
+            decode_arm(0xEE01_1F00).operation,
+            ArmOperation::Undefined { .. }
+        ));
     }
 
     #[test]

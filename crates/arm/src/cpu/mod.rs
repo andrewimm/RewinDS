@@ -18,10 +18,10 @@ use crate::condition::Condition;
 use crate::decode::{decode_arm, decode_thumb};
 use crate::instruction::arm::{
     ArmOperation, BlockTransfer, Branch, BranchExchange, BranchLinkExchange, Breakpoint,
-    CountLeadingZeros, DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind,
-    HalfwordMultiply, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
-    Operand2, SaturatingArithmetic, SaturatingOp, ShiftKind, ShiftSource, SingleOffset,
-    SingleTransfer, SoftwareInterrupt, Swap,
+    CoprocessorRegisterTransfer, CountLeadingZeros, DataProcessing, DataProcessingOpcode,
+    DoublewordTransfer, DspMulOp, HalfwordKind, HalfwordMultiply, HalfwordOffset, HalfwordTransfer,
+    Mrs, Msr, MsrSource, Multiply, MultiplyLong, Operand2, SaturatingArithmetic, SaturatingOp,
+    ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -432,8 +432,12 @@ impl Cpu {
             ArmOperation::BranchExchange(op) => self.execute_branch_exchange(op),
             ArmOperation::BranchLinkExchange(op) => self.execute_blx_immediate(op),
             ArmOperation::Breakpoint(op) => self.execute_breakpoint(op),
+            ArmOperation::CoprocessorRegisterTransfer(op) => {
+                self.execute_coprocessor_register_transfer(op, bus)
+            }
             ArmOperation::SingleTransfer(op) => self.execute_single_transfer(op, bus),
             ArmOperation::HalfwordTransfer(op) => self.execute_halfword_transfer(op, bus),
+            ArmOperation::DoublewordTransfer(op) => self.execute_doubleword_transfer(op, bus),
             ArmOperation::BlockTransfer(op) => self.execute_block_transfer(op, bus),
             ArmOperation::Swap(op) => self.execute_swap(op, bus),
             ArmOperation::Multiply(op) => self.execute_multiply(op, bus),
@@ -564,6 +568,44 @@ impl Cpu {
             let cycles = bus.store16(address, self.reg(op.rd) as u16, false);
             self.cycles += cycles as u64;
             self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+        }
+    }
+
+    /// `LDRD`/`STRD` (ARMv5TE): load or store the even/odd register pair `rd`,
+    /// `rd`+1 as two words at `address` and `address`+4. Undefined on ARMv4T.
+    fn execute_doubleword_transfer<B: Bus>(&mut self, op: DoublewordTransfer, bus: &mut B) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        self.data_access = true;
+        let base = self.reg(op.rn);
+        let offset = match op.offset {
+            HalfwordOffset::Immediate(imm) => imm as u32,
+            HalfwordOffset::Register(rm) => self.reg(rm),
+        };
+        let offset_addr = if op.add {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+        let address = if op.pre_indexed { offset_addr } else { base };
+        let high_reg = Register::new(op.rd.index() as u8 + 1);
+
+        if op.store {
+            let low = self.reg(op.rd);
+            let high = self.reg(high_reg);
+            let c1 = bus.store32(address, low, false);
+            let c2 = bus.store32(address.wrapping_add(4), high, true);
+            self.cycles += (c1 + c2) as u64;
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+        } else {
+            let low = bus.load32(address, false);
+            let high = bus.load32(address.wrapping_add(4), true);
+            self.cycles += (low.cycles + high.cycles) as u64;
+            self.internal_cycles(bus, 1);
+            self.apply_writeback(op.pre_indexed, op.writeback, op.rn, offset_addr);
+            self.set_reg(op.rd, low.value);
+            self.set_reg(high_reg, high.value);
         }
     }
 
@@ -886,6 +928,40 @@ impl Cpu {
         }
         let return_address = self.r[15].wrapping_add(4);
         self.enter_exception(0x0C, Mode::Abort, return_address, false);
+    }
+
+    /// `MRC`/`MCR` (ARMv5TE): move a word between an ARM register and a
+    /// coprocessor register, forwarded to the machine's coprocessor(s) through
+    /// the bus. An access no coprocessor accepts raises the Undefined Instruction
+    /// trap, exactly as an absent coprocessor would on hardware. Undefined on
+    /// ARMv4T.
+    fn execute_coprocessor_register_transfer<B: Bus>(
+        &mut self,
+        op: CoprocessorRegisterTransfer,
+        bus: &mut B,
+    ) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        if op.load {
+            match bus.coprocessor_read(op.cp_num, op.opcode1, op.crn, op.crm, op.opcode2) {
+                // `MRC` to r15 loads the condition flags from bits 31..28 (the
+                // APSR form), not the PC; CP15 never targets r15.
+                Some(value) if op.rd.is_pc() => {
+                    self.cpsr.set_n(value & (1 << 31) != 0);
+                    self.cpsr.set_z(value & (1 << 30) != 0);
+                    self.cpsr.set_c(value & (1 << 29) != 0);
+                    self.cpsr.set_v(value & (1 << 28) != 0);
+                }
+                Some(value) => self.set_reg(op.rd, value),
+                None => self.execute_undefined(),
+            }
+        } else {
+            let value = self.reg(op.rd);
+            if !bus.coprocessor_write(op.cp_num, op.opcode1, op.crn, op.crm, op.opcode2, value) {
+                self.execute_undefined();
+            }
+        }
     }
 
     fn execute_data_processing(&mut self, op: DataProcessing) {

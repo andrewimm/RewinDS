@@ -33,4 +33,34 @@ pub trait Bus {
     /// Consume `cycles` internal (non-bus) cycles — the CPU's I-cycles, during
     /// which a machine may advance a ROM prefetcher.
     fn internal(&mut self, cycles: u32);
+
+    /// `MCR` — move `value` from an ARM register into the coprocessor register
+    /// named by `cp`/`opcode1`/`crn`/`crm`/`opcode2`. Returns `true` if a
+    /// coprocessor accepted the write; `false` raises the Undefined Instruction
+    /// trap, as on hardware with no such coprocessor. The default has none.
+    fn coprocessor_write(
+        &mut self,
+        _cp: u8,
+        _opcode1: u8,
+        _crn: u8,
+        _crm: u8,
+        _opcode2: u8,
+        _value: u32,
+    ) -> bool {
+        false
+    }
+
+    /// `MRC` — read the coprocessor register named by the selectors into an ARM
+    /// register. `None` raises the Undefined Instruction trap. The default core
+    /// exposes no coprocessors.
+    fn coprocessor_read(
+        &mut self,
+        _cp: u8,
+        _opcode1: u8,
+        _crn: u8,
+        _crm: u8,
+        _opcode2: u8,
+    ) -> Option<u32> {
+        None
+    }
 }
