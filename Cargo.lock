@@ -627,6 +627,10 @@ dependencies = [
 [[package]]
 name = "nds"
 version = "0.1.0"
+dependencies = [
+ "arm",
+ "emu-core",
+]
 
 [[package]]
 name = "nix"

@@ -9,6 +9,11 @@
 //! which the ARM9 drives through `MCR`/`MRC` to place the tightly coupled
 //! memories in the memory map.
 
+pub mod bus;
 pub mod cp15;
+pub mod memory;
+pub mod system;
 
 pub use cp15::Cp15;
+pub use memory::{Core, Memory};
+pub use system::{Machine, NdsEvent, System};

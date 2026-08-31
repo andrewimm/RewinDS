@@ -5,3 +5,5 @@ edition = "2021"
 description = "Nintendo DS hardware semantics"
 
 [dependencies]
+arm = { path = "../arm" }
+emu-core = { path = "../emu-core" }
