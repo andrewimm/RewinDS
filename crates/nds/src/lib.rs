@@ -11,6 +11,7 @@
 
 pub mod boot;
 pub mod bus;
+pub mod cart;
 pub mod cp15;
 pub mod dma;
 pub mod interrupt;
@@ -23,6 +24,7 @@ pub mod timer;
 pub mod vram;
 
 pub use boot::{BootError, Header};
+pub use cart::Cart;
 pub use cp15::Cp15;
 pub use dma::{Dma, DmaTiming};
 pub use interrupt::{Interrupts, IrqSource};

@@ -17,6 +17,7 @@ use arm::cpu::{ArmVersion, Cpu};
 use emu_core::{EventContext, EventHandler, Scheduler, Timestamp};
 
 use crate::bus::NdsCpuBus;
+use crate::cart::Cart;
 use crate::dma::Dma;
 use crate::interrupt::Interrupts;
 use crate::ipc::Ipc;
@@ -54,6 +55,8 @@ pub struct Machine {
     pub(crate) vram: Vram,
     pub(crate) ppu: Ppu,
     pub(crate) ipc: Ipc,
+    /// The gamecard slot: runtime ROM/filesystem streaming.
+    pub(crate) cart: Cart,
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
@@ -74,6 +77,7 @@ impl Machine {
             vram: Vram::new(),
             ppu: Ppu::new(),
             ipc: Ipc::new(),
+            cart: Cart::new(),
             keyinput: 0x03FF, // all released
             clock: [0; 2],
         }
@@ -115,7 +119,13 @@ impl Machine {
         let mut source = ch.internal_source();
         let mut dest = ch.internal_dest();
         for _ in 0..ch.internal_count() {
-            let value = self.data_read(core, source, bytes);
+            // A cart-mode DMA sources the gamecard data port, which is served (and
+            // advanced) by the cartridge controller rather than the memory map.
+            let value = if source == crate::cart::DATA_PORT {
+                self.cart.read_data()
+            } else {
+                self.data_read(core, source, bytes)
+            };
             self.data_write(core, dest, value, bytes);
             source = source.wrapping_add(source_step);
             dest = dest.wrapping_add(dest_step);
@@ -123,6 +133,52 @@ impl Machine {
         self.dma[c].channels[channel].complete(source, dest);
         if ch.irq_on_end() {
             self.interrupts[c].request(crate::dma::irq_source(channel));
+        }
+    }
+
+    /// A ROMCTRL block start launched a gamecard transfer on `core`: drain it via
+    /// any enabled cart-mode DMA channel (games read the cart by DMA), then raise
+    /// the transfer-complete IRQ if the block finished and `AUXSPICNT` enables it.
+    /// A game using manual (polled) reads finishes the block in [`Self::io_read`]
+    /// instead, which raises the IRQ the same way.
+    fn start_cart_transfer(&mut self, core: Core) {
+        let c = core.index();
+        for channel in 0..4 {
+            if self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9) {
+                self.run_dma_channel(core, channel);
+            }
+        }
+        if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
+            self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
+        }
+    }
+
+    /// Route a write to the gamecard registers (`40001A0h`..`40001BFh`). ROMCTRL is
+    /// read-modify-written so any access width works; a start bit launches the
+    /// transfer. The command buffer takes byte writes; the KEY2 seed ports are
+    /// accepted and ignored (the cartridge serves plaintext — see [`crate::cart`]).
+    fn write_gamecard(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
+        match addr {
+            0x0400_01A0 => self.cart.write_auxspicnt(value as u16), // AUXSPIDATA (A2) unmodelled
+            0x0400_01A4..=0x0400_01A7 => {
+                // Merge into the stored config, then honour a start bit.
+                let shift = (addr - 0x0400_01A4) * 8;
+                let width_mask: u64 = (1u64 << (bytes * 8)) - 1;
+                let mask = (width_mask << shift) as u32;
+                let merged = (self.cart.romctrl_config() & !mask) | ((value << shift) & mask);
+                if self.cart.write_romctrl(merged) {
+                    self.start_cart_transfer(core);
+                }
+            }
+            0x0400_01A8..=0x0400_01AF => {
+                for i in 0..bytes {
+                    let idx = (addr + i - 0x0400_01A8) as usize;
+                    self.cart.write_command_byte(idx, (value >> (8 * i)) as u8);
+                }
+            }
+            0x0400_01B0 => self.cart.write_seed(0, value),
+            0x0400_01B4 => self.cart.write_seed(1, value),
+            _ => {} // seed upper halves (B8/BA), AUXSPIDATA: ignored
         }
     }
 
@@ -164,10 +220,21 @@ impl Machine {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
+            0x0400_01A0 => self.cart.read_auxspicnt() as u32,
+            0x0400_01A4 => self.cart.read_romctrl(),
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
             0x0400_0214 => self.interrupts[c].iflags(),
             0x0410_0000 => self.ipc.recv(core, &mut self.interrupts),
+            0x0410_0010 => {
+                // Gamecard data port: stream a word; the last word of a block
+                // completes the transfer and raises the IRQ (manual-read path).
+                let word = self.cart.read_data();
+                if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
+                    self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
+                }
+                word
+            }
             0x0400_0241 if core == Core::Arm7 => self.memory.wramcnt as u32,
             _ => 0,
         }
@@ -228,6 +295,11 @@ impl Machine {
                     }
                 }
             }
+            return;
+        }
+        // Gamecard slot: AUXSPICNT/ROMCTRL/command/seed ports.
+        if (0x0400_01A0..0x0400_01C0).contains(&addr) {
+            self.write_gamecard(core, addr, value, bytes);
             return;
         }
         // Engine A 2D register block (BGxCNT..BLDY), ARM9 only.
@@ -404,6 +476,10 @@ impl System {
     /// the rest (CP15/TCM, banked stacks, I/O).
     pub fn direct_boot(&mut self, rom: &[u8]) -> Result<(), crate::boot::BootError> {
         let header = crate::boot::Header::parse(rom)?;
+
+        // Insert the cartridge so the game can stream the rest of its ROM at
+        // runtime (the main data area is identical before/after secure-area decrypt).
+        self.machine.cart.insert(rom);
 
         // A commercial ROM keeps its ARM9 boot code in the secure area, whose first
         // 2 KB may be KEY1-encrypted. Decrypt into an owned copy only when the ID
@@ -720,6 +796,69 @@ mod tests {
             assert_eq!(system.interrupts(core).iflags(), IrqSource::Dma0.mask());
             assert_eq!(system.io_read(core, 0x0400_00BA, 2) & (1 << 15), 0);
         }
+    }
+
+    #[test]
+    fn cart_dma_reads_streams_rom_and_raises_transfer_irq() {
+        use crate::IrqSource;
+        let mut system = System::new();
+
+        // A cartridge with a recognisable pattern in the main data area (>= 0x8000).
+        let mut rom = vec![0u8; 0x9000];
+        for (i, b) in rom[0x8000..0x8200].iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        system.machine.cart.insert(&rom);
+
+        // ARM9 arms the gamecard transfer IRQ and its interrupt controller.
+        system.io_write(Core::Arm9, 0x0400_01A0, (1 << 15) | (1 << 14), 2); // AUXSPICNT: slot + IRQ
+        system.io_write(Core::Arm9, 0x0400_0210, IrqSource::Gamecard.mask(), 4); // IE
+        system.io_write(Core::Arm9, 0x0400_0208, 1, 4); // IME
+
+        // A cart-mode DMA: fixed source = data port, dest = Main RAM, 0x80 words,
+        // 32-bit, source-fixed, ARM9 start mode 5 (bits 11-13), enabled.
+        let cnt_h: u32 = (1 << 15) | (1 << 10) | (2 << 7) | (5 << 11);
+        system.io_write(Core::Arm9, 0x0400_00B0, crate::cart::DATA_PORT, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0200_0000, 4); // DAD
+        system.io_write(Core::Arm9, 0x0400_00B8, 0x80, 2); // count = 0x200 bytes
+        system.io_write(Core::Arm9, 0x0400_00BA, cnt_h, 2); // enabled, waits for cart start
+        // Not auto-run: the channel is armed but idle until the block starts.
+        assert_eq!(system.memory().main[0], 0);
+
+        // Command B7, read from ROM address 0x8000 (MSB-first in the 8-byte buffer:
+        // byte0=B7, byte3=0x80 -> address param 0x00008000).
+        let command = 0xB7u32 | (0x80 << 24);
+        system.io_write(Core::Arm9, 0x0400_01A8, command, 4);
+        system.io_write(Core::Arm9, 0x0400_01AC, 0, 4);
+        // ROMCTRL: 0x200-byte block (field 1), start.
+        system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (1 << 24), 4);
+
+        // The whole block streamed into Main RAM, byte-for-byte from ROM[0x8000..].
+        assert_eq!(&system.memory().main[..0x200], &rom[0x8000..0x8200]);
+        // The block completed: busy clear and the transfer-complete IRQ pending.
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
+        assert_eq!(system.interrupts(Core::Arm9).iflags(), IrqSource::Gamecard.mask());
+    }
+
+    #[test]
+    fn cart_manual_read_polls_and_completes() {
+        let mut system = System::new();
+        let mut rom = vec![0u8; 0x9000];
+        rom[0x8000..0x8008].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        system.machine.cart.insert(&rom);
+
+        system.io_write(Core::Arm9, 0x0400_01A0, 1 << 15, 2); // slot enable, no IRQ
+        let command = 0xB7u32 | (0x80 << 24);
+        system.io_write(Core::Arm9, 0x0400_01A8, command, 4);
+        system.io_write(Core::Arm9, 0x0400_01AC, 0, 4);
+        // 4-byte block (field 7), start.
+        system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (7 << 24), 4);
+
+        // DRQ set, one manual word available, matching ROM[0x8000..0x8004].
+        assert_ne!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 23), 0);
+        assert_eq!(system.io_read(Core::Arm9, 0x0410_0010, 4), 0x0403_0201);
+        // Block drained: no longer busy.
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
     }
 
     #[test]

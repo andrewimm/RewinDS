@@ -28,6 +28,8 @@ pub enum IrqSource {
     IpcSendEmpty = 17,
     /// The local receive FIFO became non-empty (with its IRQ enabled).
     IpcRecvNotEmpty = 18,
+    /// A gamecard block transfer completed (`AUXSPICNT` bit 14 enables it).
+    Gamecard = 19,
 }
 
 impl IrqSource {

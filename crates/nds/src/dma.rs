@@ -72,6 +72,21 @@ impl DmaChannel {
         self.control & (1 << 9) != 0
     }
 
+    /// Whether this channel is enabled and set to gamecard (cart-slot) DMA timing,
+    /// which the cartridge controller triggers on a ROMCTRL block start. The start
+    /// mode is a 3-bit field on the ARM9 (mode 5) and 2-bit on the ARM7 (mode 2)
+    /// — distinct from the GBA-shaped [`DmaChannel::timing`] used by the other
+    /// modes (GBATEK "DS DMA Transfers").
+    pub fn is_cart_dma(&self, arm9: bool) -> bool {
+        let enabled = self.control & (1 << 15) != 0;
+        let cart = if arm9 {
+            (self.control >> 11) & 7 == 5
+        } else {
+            (self.control >> 12) & 3 == 2
+        };
+        enabled && cart
+    }
+
     pub fn irq_on_end(&self) -> bool {
         self.control & (1 << 14) != 0
     }
