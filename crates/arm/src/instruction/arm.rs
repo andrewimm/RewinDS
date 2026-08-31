@@ -25,6 +25,10 @@ pub enum ArmOperation {
     Multiply(Multiply),
     MultiplyLong(MultiplyLong),
 
+    /// ARMv5TE-only arithmetic; traps as Undefined on an ARMv4T core.
+    CountLeadingZeros(CountLeadingZeros),
+    SaturatingArithmetic(SaturatingArithmetic),
+
     SingleTransfer(SingleTransfer),
     HalfwordTransfer(HalfwordTransfer),
     BlockTransfer(BlockTransfer),
@@ -88,9 +92,12 @@ impl ArmOperation {
             ArmOperation::BlockTransfer(op) => op.load && op.register_list & (1 << 15) != 0,
 
             // Multiplies to r15 are unpredictable (not a defined PC write), MSR
-            // targets a status register, and Undefined writes nothing itself.
+            // targets a status register, the ARMv5 arithmetic ops to r15 are
+            // unpredictable, and Undefined writes nothing itself.
             ArmOperation::Multiply(_)
             | ArmOperation::MultiplyLong(_)
+            | ArmOperation::CountLeadingZeros(_)
+            | ArmOperation::SaturatingArithmetic(_)
             | ArmOperation::Msr(_)
             | ArmOperation::Undefined { .. } => false,
         }
@@ -226,6 +233,39 @@ pub struct MultiplyLong {
     pub rd_lo: Register,
     pub rs: Register,
     pub rm: Register,
+}
+
+// ---------------------------------------------------------------------------
+// ARMv5TE arithmetic (ARM9)
+// ---------------------------------------------------------------------------
+
+/// `CLZ` — count leading zeros of `rm` into `rd` (0..=32). ARMv5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountLeadingZeros {
+    pub rd: Register,
+    pub rm: Register,
+}
+
+/// The four saturating add/subtract operations (`QADD`/`QSUB`/`QDADD`/`QDSUB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaturatingOp {
+    QAdd,  // Rd = Rm + Rn
+    QSub,  // Rd = Rm - Rn
+    QDAdd, // Rd = Rm + Rn*2
+    QDSub, // Rd = Rm - Rn*2
+}
+
+/// `QADD` / `QSUB` / `QDADD` / `QDSUB` — signed saturating arithmetic. The result
+/// clamps to the signed 32-bit range and any saturation sets the sticky `Q` flag.
+/// The `QD` variants first double `rn` (also saturating). ARMv5TE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaturatingArithmetic {
+    pub op: SaturatingOp,
+    pub rd: Register,
+    /// First operand (bits 3..0) — the value added to / subtracted from.
+    pub rm: Register,
+    /// Second operand (bits 19..16) — doubled first in the `QD` variants.
+    pub rn: Register,
 }
 
 // ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@ use crate::disasm::{condition_suffix, immediate, reg, register_list, signed_imme
 use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
     DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
-    Multiply, MultiplyLong, Operand2, Shift, ShiftKind, ShiftSource, SingleOffset, SingleTransfer,
-    SoftwareInterrupt, Swap,
+    Multiply, MultiplyLong, Operand2, SaturatingOp, Shift, ShiftKind, ShiftSource, SingleOffset,
+    SingleTransfer, SoftwareInterrupt, Swap,
 };
 
 /// Render a decoded ARM instruction as assembly text.
@@ -15,6 +15,18 @@ pub fn format_arm(inst: &ArmInstruction) -> String {
         ArmOperation::DataProcessing(op) => format_data_processing(op, cond),
         ArmOperation::Multiply(op) => format_multiply(op, cond),
         ArmOperation::MultiplyLong(op) => format_multiply_long(op, cond),
+        ArmOperation::CountLeadingZeros(op) => {
+            format!("clz{cond}\t{}, {}", reg(op.rd), reg(op.rm))
+        }
+        ArmOperation::SaturatingArithmetic(op) => {
+            let mnem = match op.op {
+                SaturatingOp::QAdd => "qadd",
+                SaturatingOp::QSub => "qsub",
+                SaturatingOp::QDAdd => "qdadd",
+                SaturatingOp::QDSub => "qdsub",
+            };
+            format!("{mnem}{cond}\t{}, {}, {}", reg(op.rd), reg(op.rm), reg(op.rn))
+        }
         ArmOperation::SingleTransfer(op) => format_single_transfer(op, cond),
         ArmOperation::HalfwordTransfer(op) => format_halfword_transfer(op, cond),
         ArmOperation::BlockTransfer(op) => format_block_transfer(op, cond),

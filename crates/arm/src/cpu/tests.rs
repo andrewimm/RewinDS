@@ -456,6 +456,76 @@ fn sum_loop() {
     assert_eq!(cpu.register(1), 4);
 }
 
+/// Execute a single ARM instruction `encoding` on a fresh core of `version`, with
+/// the given `(register, value)` setup applied first.
+fn run_one(version: super::ArmVersion, encoding: u32, setup: &[(usize, u32)]) -> Cpu {
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[encoding]);
+    let mut cpu = Cpu::with_version(version);
+    for &(reg, value) in setup {
+        cpu.set_register(reg, value);
+    }
+    cpu.step(&mut bus);
+    cpu
+}
+
+#[test]
+fn clz_counts_leading_zeros_on_v5() {
+    // clz r0, r1
+    let cpu = run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0x0000_FFFF)]);
+    assert_eq!(cpu.register(0), 16);
+    assert_eq!(run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0)]).register(0), 32);
+    assert_eq!(run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0x8000_0000)]).register(0), 0);
+}
+
+#[test]
+fn clz_traps_as_undefined_on_v4t() {
+    // On ARMv4T the CLZ encoding is not an instruction — it must not write rd.
+    let cpu = run_one(super::ArmVersion::Armv4T, 0xE16F_0F11, &[(0, 0xDEAD), (1, 0x0000_FFFF)]);
+    assert_eq!(cpu.register(0), 0xDEAD); // untouched — trapped, not executed
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+}
+
+#[test]
+fn qadd_qsub_saturate_and_set_q() {
+    use super::ArmVersion::Armv5TE;
+    // qadd r0, r1, r2  (r0 = r1 + r2)
+    let ok = run_one(Armv5TE, 0xE102_0051, &[(1, 5), (2, 3)]);
+    assert_eq!(ok.register(0), 8);
+    assert!(!ok.cpsr().q());
+    // Overflow past i32::MAX saturates and sets Q.
+    let sat = run_one(Armv5TE, 0xE102_0051, &[(1, 0x7FFF_FFFF), (2, 1)]);
+    assert_eq!(sat.register(0), 0x7FFF_FFFF);
+    assert!(sat.cpsr().q());
+    // qsub r0, r1, r2  (r0 = r1 - r2), underflow past i32::MIN saturates.
+    let sub = run_one(Armv5TE, 0xE122_0051, &[(1, 0x8000_0000), (2, 1)]);
+    assert_eq!(sub.register(0), 0x8000_0000);
+    assert!(sub.cpsr().q());
+}
+
+#[test]
+fn qdadd_qdsub_double_the_second_operand() {
+    use super::ArmVersion::Armv5TE;
+    // qdadd r0, r1, r2  (r0 = r1 + r2*2)
+    let ok = run_one(Armv5TE, 0xE142_0051, &[(1, 10), (2, 3)]);
+    assert_eq!(ok.register(0), 16); // 10 + 3*2
+    assert!(!ok.cpsr().q());
+    // Doubling itself saturates (0x40000000 * 2 overflows) → Q set.
+    let sat = run_one(Armv5TE, 0xE142_0051, &[(1, 0), (2, 0x4000_0000)]);
+    assert_eq!(sat.register(0), 0x7FFF_FFFF);
+    assert!(sat.cpsr().q());
+    // qdsub r0, r1, r2  (r0 = r1 - r2*2)
+    let sub = run_one(Armv5TE, 0xE162_0051, &[(1, 20), (2, 4)]);
+    assert_eq!(sub.register(0), 12); // 20 - 4*2
+}
+
+#[test]
+fn saturating_traps_as_undefined_on_v4t() {
+    let cpu = run_one(super::ArmVersion::Armv4T, 0xE102_0051, &[(0, 0xBEEF), (1, 5), (2, 3)]);
+    assert_eq!(cpu.register(0), 0xBEEF); // untouched
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+}
+
 #[test]
 fn cpu_version_defaults_to_v4t_and_selects_v5() {
     use super::ArmVersion;

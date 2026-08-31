@@ -17,9 +17,10 @@
 use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
-    ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
-    DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
-    Multiply, MultiplyLong, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros,
+    DataProcessing, DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr,
+    MsrSource, Multiply, MultiplyLong, SaturatingArithmetic, SaturatingOp, SingleOffset,
+    SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -38,6 +39,10 @@ pub fn decode_arm(raw: u32) -> ArmInstruction {
 fn decode_operation(raw: u32) -> ArmOperation {
     if matches_branch_exchange(raw) {
         decode_branch_exchange(raw)
+    } else if matches_clz(raw) {
+        decode_clz(raw)
+    } else if matches_saturating(raw) {
+        decode_saturating(raw)
     } else if matches_swap(raw) {
         decode_swap(raw)
     } else if matches_multiply(raw) {
@@ -73,9 +78,41 @@ fn matches_branch_exchange(raw: u32) -> bool {
     (raw & 0x0FFF_FFF0) == 0x012F_FF10
 }
 
+/// `CLZ Rd,Rm`: `cond 0001 0110 1111 Rd 1111 0001 Rm` (ARMv5).
+fn matches_clz(raw: u32) -> bool {
+    (raw & 0x0FFF_0FF0) == 0x016F_0F10
+}
+
+/// `QADD`/`QSUB`/`QDADD`/`QDSUB`: `cond 0001 0oo0 Rn Rd 0000 0101 Rm` (ARMv5TE).
+fn matches_saturating(raw: u32) -> bool {
+    (raw & 0x0F90_0FF0) == 0x0100_0050
+}
+
 /// `SWP`/`SWPB`: `cond 0001 0B00 Rn Rd 0000 1001 Rm`.
 fn matches_swap(raw: u32) -> bool {
     (raw & 0x0FB0_0FF0) == 0x0100_0090
+}
+
+fn decode_clz(raw: u32) -> ArmOperation {
+    ArmOperation::CountLeadingZeros(CountLeadingZeros {
+        rd: Register::new((raw >> 12) as u8),
+        rm: Register::new(raw as u8),
+    })
+}
+
+fn decode_saturating(raw: u32) -> ArmOperation {
+    let op = match (raw >> 21) & 0b11 {
+        0b00 => SaturatingOp::QAdd,
+        0b01 => SaturatingOp::QSub,
+        0b10 => SaturatingOp::QDAdd,
+        _ => SaturatingOp::QDSub,
+    };
+    ArmOperation::SaturatingArithmetic(SaturatingArithmetic {
+        op,
+        rd: Register::new((raw >> 12) as u8),
+        rm: Register::new(raw as u8),
+        rn: Register::new((raw >> 16) as u8),
+    })
 }
 
 /// `MUL`/`MLA`: `cond 0000 00AS Rd Rn Rs 1001 Rm`.

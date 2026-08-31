@@ -17,9 +17,10 @@ pub use bus::{Bus, Timed};
 use crate::condition::Condition;
 use crate::decode::{decode_arm, decode_thumb};
 use crate::instruction::arm::{
-    ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing, DataProcessingOpcode,
-    HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
-    Operand2, ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros, DataProcessing,
+    DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
+    Multiply, MultiplyLong, Operand2, SaturatingArithmetic, SaturatingOp, ShiftKind, ShiftSource,
+    SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -424,6 +425,8 @@ impl Cpu {
             ArmOperation::Swap(op) => self.execute_swap(op, bus),
             ArmOperation::Multiply(op) => self.execute_multiply(op, bus),
             ArmOperation::MultiplyLong(op) => self.execute_multiply_long(op, bus),
+            ArmOperation::CountLeadingZeros(op) => self.execute_clz(op),
+            ArmOperation::SaturatingArithmetic(op) => self.execute_saturating(op),
             ArmOperation::Mrs(op) => self.execute_mrs(op),
             ArmOperation::Msr(op) => self.execute_msr(op),
             ArmOperation::SoftwareInterrupt(op) => self.execute_software_interrupt(op),
@@ -710,6 +713,45 @@ impl Cpu {
         }
         let extra = 1 + if op.accumulate { 1 } else { 0 };
         self.internal_cycles(bus, multiply_cycles(rs) + extra);
+    }
+
+    /// `CLZ` (ARMv5): count leading zeros. Traps as undefined on an ARMv4T core.
+    fn execute_clz(&mut self, op: CountLeadingZeros) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        let value = self.reg(op.rm);
+        self.set_reg(op.rd, value.leading_zeros());
+    }
+
+    /// `QADD`/`QSUB`/`QDADD`/`QDSUB` (ARMv5TE): signed saturating arithmetic. Any
+    /// clamp to the 32-bit range sets the sticky `Q` flag. Undefined on ARMv4T.
+    fn execute_saturating(&mut self, op: SaturatingArithmetic) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        let rm = self.reg(op.rm) as i32;
+        let mut rn = self.reg(op.rn) as i32;
+        let mut saturated = false;
+        // The `QD` variants double the second operand first, saturating.
+        if matches!(op.op, SaturatingOp::QDAdd | SaturatingOp::QDSub) {
+            saturated |= rn.checked_add(rn).is_none();
+            rn = rn.saturating_add(rn);
+        }
+        let result = match op.op {
+            SaturatingOp::QAdd | SaturatingOp::QDAdd => {
+                saturated |= rm.checked_add(rn).is_none();
+                rm.saturating_add(rn)
+            }
+            SaturatingOp::QSub | SaturatingOp::QDSub => {
+                saturated |= rm.checked_sub(rn).is_none();
+                rm.saturating_sub(rn)
+            }
+        };
+        if saturated {
+            self.cpsr.set_q(true); // sticky — only MSR clears it
+        }
+        self.set_reg(op.rd, result as u32);
     }
 
     /// The offset for a single data transfer: an immediate, or a register with an
