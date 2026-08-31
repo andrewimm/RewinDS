@@ -11,9 +11,9 @@ use crate::debug::provenance::{
     AffineBgProvenance, AffineMatrix, AffineWrap, BackgroundId, RejectionReason, SourceProvenance,
 };
 use crate::debug::sink::ProvenanceSink;
-use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
+use crate::memory::{PpuMemoryView, VramLayout, PALETTE_BASE, VRAM_BASE};
 use crate::state::{
-    AffineReference, CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch, WIDTH,
+    AffineReference, CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch,
 };
 
 const CHARBLOCK_SIZE: u32 = 0x4000;
@@ -39,12 +39,15 @@ fn background_id(bg: usize) -> BackgroundId {
 
 /// Render affine background `bg` (2 or 3) for scanline `y`, given the internal
 /// reference point already advanced to this line.
+#[allow(clippy::too_many_arguments)]
 pub fn render_affine_scanline<S: ProvenanceSink>(
     bg: usize,
     y: u16,
     state: &LatchedState,
     reference: AffineReference,
     mem: &PpuMemoryView,
+    width: usize,
+    layout: VramLayout,
     scratch: &mut Scratch,
     sink: &mut S,
 ) {
@@ -54,8 +57,8 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
     let k = bg - 2; // affine parameter index: BG2 -> 0, BG3 -> 1
     let cnt = state.regs.bgcnt[bg];
     let priority = (cnt & 0x3) as u8;
-    let char_base = ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
-    let screen_base = ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
+    let char_base = layout.bg_char_base + ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
+    let screen_base = layout.bg_screen_base + ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
     let wrap = cnt & (1 << 13) != 0;
     let size_px = affine_size_pixels((cnt >> 14) & 0x3);
     let map_tiles = (size_px / 8) as u32;
@@ -74,7 +77,7 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
     let ref_x = reference.x - pb * vback;
     let ref_y = reference.y - pd * vback;
 
-    for x in 0..WIDTH {
+    for x in 0..width {
         let x_src = (x - x % mosaic_x) as i32;
         let tex_x = (ref_x + pa * x_src) >> 8;
         let tex_y = (ref_y + pc * x_src) >> 8;

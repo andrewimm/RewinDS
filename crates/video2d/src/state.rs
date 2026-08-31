@@ -10,10 +10,14 @@ use super::debug::provenance::WindowRegion;
 use super::obj::evaluate::SpriteInstance;
 use super::registers::Registers;
 
-/// Visible framebuffer width in pixels.
+/// Visible framebuffer width in pixels (the GBA screen; the DS is [`MAX_WIDTH`]).
 pub const WIDTH: usize = 240;
-/// Visible framebuffer height in scanlines.
+/// Visible framebuffer height in scanlines (the GBA screen).
 pub const HEIGHT: usize = 160;
+/// The widest screen any consumer renders (the DS's 256). Per-scanline scratch is
+/// sized to this so one buffer serves both machines; the active width (from the
+/// framebuffer) bounds the pixels actually touched.
+pub const MAX_WIDTH: usize = 256;
 
 /// A native GBA color: 15-bit BGR555 packed into a `u16` (bit 15 unused). This is
 /// the emulator's canonical color; conversion to a host format happens only at the
@@ -117,7 +121,7 @@ impl CandidatePixel {
 /// marks a transparent pixel, which never becomes a candidate.
 #[derive(Clone, Debug)]
 pub struct LayerLine {
-    pub pixels: [Option<CandidatePixel>; WIDTH],
+    pub pixels: [Option<CandidatePixel>; MAX_WIDTH],
 }
 
 impl Default for LayerLine {
@@ -138,15 +142,15 @@ impl LayerLine {
 /// coverage mask that object-window sprites contribute (consumed by windowing).
 #[derive(Clone, Debug)]
 pub struct ObjLine {
-    pub pixels: [Option<CandidatePixel>; WIDTH],
-    pub window: [bool; WIDTH],
+    pub pixels: [Option<CandidatePixel>; MAX_WIDTH],
+    pub window: [bool; MAX_WIDTH],
 }
 
 impl Default for ObjLine {
     fn default() -> Self {
         ObjLine {
             pixels: std::array::from_fn(|_| None),
-            window: [false; WIDTH],
+            window: [false; MAX_WIDTH],
         }
     }
 }
@@ -188,15 +192,15 @@ impl Default for WindowMask {
 /// The resolved window mask and region for every pixel of a scanline.
 #[derive(Clone, Debug)]
 pub struct WindowLine {
-    pub mask: [WindowMask; WIDTH],
-    pub region: [WindowRegion; WIDTH],
+    pub mask: [WindowMask; MAX_WIDTH],
+    pub region: [WindowRegion; MAX_WIDTH],
 }
 
 impl Default for WindowLine {
     fn default() -> Self {
         WindowLine {
-            mask: [WindowMask::all_visible(); WIDTH],
-            region: [WindowRegion::Outside; WIDTH],
+            mask: [WindowMask::all_visible(); MAX_WIDTH],
+            region: [WindowRegion::Outside; MAX_WIDTH],
         }
     }
 }
@@ -226,17 +230,30 @@ impl Scratch {
     }
 }
 
-/// The 240×160 output image in canonical BGR555.
+/// The output image in canonical BGR555, sized to its consumer's screen. The
+/// active `width` bounds every renderer loop and is the row stride; `height` is
+/// the scanline count.
 #[derive(Clone, Debug)]
 pub struct Framebuffer {
     pub pixels: Box<[Color15]>,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Framebuffer {
+    pub fn new(width: usize, height: usize) -> Self {
+        Framebuffer {
+            pixels: vec![Color15::default(); width * height].into_boxed_slice(),
+            width,
+            height,
+        }
+    }
 }
 
 impl Default for Framebuffer {
+    /// The GBA screen (240×160).
     fn default() -> Self {
-        Framebuffer {
-            pixels: vec![Color15::default(); WIDTH * HEIGHT].into_boxed_slice(),
-        }
+        Framebuffer::new(WIDTH, HEIGHT)
     }
 }
 

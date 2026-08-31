@@ -6,7 +6,7 @@
 //! window is enabled in `DISPCNT`, every layer is visible everywhere.
 
 use super::debug::provenance::WindowRegion;
-use super::state::{LatchedState, ObjLine, WindowLine, WindowMask, HEIGHT, WIDTH};
+use super::state::{LatchedState, ObjLine, WindowLine, WindowMask};
 
 /// Expand the six per-region enable bits (BG0-3, OBJ, effects) into a mask.
 fn mask_from_bits(bits: u16) -> WindowMask {
@@ -42,7 +42,14 @@ fn in_span(coord: u16, bound: u16, edge: u16) -> bool {
 }
 
 /// Resolve the window mask for every pixel of scanline `y`.
-pub fn compute_line(y: u16, state: &LatchedState, obj: &ObjLine, out: &mut WindowLine) {
+pub fn compute_line(
+    y: u16,
+    state: &LatchedState,
+    obj: &ObjLine,
+    width: usize,
+    height: usize,
+    out: &mut WindowLine,
+) {
     let regs = &state.regs;
     let win0_on = regs.dispcnt & (1 << 13) != 0;
     let win1_on = regs.dispcnt & (1 << 14) != 0;
@@ -55,17 +62,17 @@ pub fn compute_line(y: u16, state: &LatchedState, obj: &ObjLine, out: &mut Windo
         return;
     }
 
-    let win0_row = win0_on && in_span(y, regs.win_v[0], HEIGHT as u16);
-    let win1_row = win1_on && in_span(y, regs.win_v[1], HEIGHT as u16);
+    let win0_row = win0_on && in_span(y, regs.win_v[0], height as u16);
+    let win1_row = win1_on && in_span(y, regs.win_v[1], height as u16);
     let win0_mask = mask_from_bits(regs.winin & 0x3F);
     let win1_mask = mask_from_bits((regs.winin >> 8) & 0x3F);
     let outside_mask = mask_from_bits(regs.winout & 0x3F);
     let objwin_mask = mask_from_bits((regs.winout >> 8) & 0x3F);
 
-    for x in 0..WIDTH {
-        let (region, mask) = if win0_row && in_span(x as u16, regs.win_h[0], WIDTH as u16) {
+    for x in 0..width {
+        let (region, mask) = if win0_row && in_span(x as u16, regs.win_h[0], width as u16) {
             (WindowRegion::Win0, win0_mask)
-        } else if win1_row && in_span(x as u16, regs.win_h[1], WIDTH as u16) {
+        } else if win1_row && in_span(x as u16, regs.win_h[1], width as u16) {
             (WindowRegion::Win1, win1_mask)
         } else if objwin_on && obj.window[x] {
             (WindowRegion::ObjWindow, objwin_mask)
@@ -111,7 +118,7 @@ mod tests {
         let state = LatchedState::default(); // DISPCNT window bits clear
         let obj = ObjLine::default();
         let mut line = WindowLine::default();
-        compute_line(0, &state, &obj, &mut line);
+        compute_line(0, &state, &obj, 240, 160, &mut line);
         assert!(line.mask[0].bg.iter().all(|&b| b));
         assert!(line.mask[239].obj);
     }

@@ -20,7 +20,15 @@ impl Ppu {
         if self.segments.is_empty() {
             self.latch_for_scanline();
         }
-        video2d::render_scanline(&mut self.framebuffer, &self.segments, &mut self.scratch, y, mem, sink);
+        video2d::render_scanline(
+            &mut self.framebuffer,
+            &self.segments,
+            &mut self.scratch,
+            y,
+            mem,
+            video2d::VramLayout::gba(),
+            sink,
+        );
     }
 
     /// The normal frame-loop entry: draw the current visible scanline with no

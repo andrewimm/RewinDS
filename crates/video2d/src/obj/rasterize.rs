@@ -10,11 +10,9 @@ use super::evaluate::{SpriteInstance, SpriteList};
 use crate::debug::explain::CandidateExplanation;
 use crate::debug::provenance::{ObjColorMode, ObjMode, ObjProvenance, SourceProvenance};
 use crate::debug::sink::ProvenanceSink;
-use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::state::{CandidatePixel, LatchedState, LayerId, ObjLine, PixelFlags, WIDTH};
+use crate::memory::{PpuMemoryView, VramLayout, PALETTE_BASE, VRAM_BASE};
+use crate::state::{CandidatePixel, LatchedState, LayerId, ObjLine, PixelFlags};
 
-/// VRAM offset of the OBJ character (tile) region.
-const OBJ_TILE_BASE: u32 = 0x1_0000;
 /// Palette entries 0..=255 are backgrounds; OBJ palettes start at entry 256.
 const OBJ_PALETTE_BASE: usize = 256;
 
@@ -28,7 +26,13 @@ fn affine_params(mem: &PpuMemoryView, group: u8) -> (i32, i32, i32, i32) {
 
 /// Where a texel `(tx, ty)` within a sprite lives: its tile number and the byte
 /// address of the texel, honoring 1D/2D mapping and color depth.
-fn texel_address(sprite: &SpriteInstance, tx: u32, ty: u32, one_dim: bool) -> (u16, u32) {
+fn texel_address(
+    sprite: &SpriteInstance,
+    tx: u32,
+    ty: u32,
+    one_dim: bool,
+    obj_tile_base: u32,
+) -> (u16, u32) {
     let is_8bpp = matches!(sprite.color_mode, ObjColorMode::Bpp8);
     let units_per_tile = if is_8bpp { 2 } else { 1 };
     let tiles_wide = (sprite.width / 8) as u32;
@@ -37,7 +41,7 @@ fn texel_address(sprite: &SpriteInstance, tx: u32, ty: u32, one_dim: bool) -> (u
     let tile_number =
         (sprite.tile_number as u32 + tile_row * row_stride + tile_col * units_per_tile) & 0x3FF;
 
-    let tile_base = OBJ_TILE_BASE + tile_number * 32;
+    let tile_base = obj_tile_base + tile_number * 32;
     let (px, py) = (tx % 8, ty % 8);
     let byte_offset = if is_8bpp {
         tile_base + py * 8 + px
@@ -103,10 +107,13 @@ fn texture_coord(sprite: &SpriteInstance, col: u16, line: i32, mem: &PpuMemoryVi
 }
 
 /// Rasterize the evaluated sprites for scanline `y` into the OBJ line.
+#[allow(clippy::too_many_arguments)]
 pub fn rasterize<S: ProvenanceSink>(
     y: u16,
     state: &LatchedState,
     mem: &PpuMemoryView,
+    width: usize,
+    layout: VramLayout,
     sprites: &SpriteList,
     obj: &mut ObjLine,
     sink: &mut S,
@@ -127,7 +134,7 @@ pub fn rasterize<S: ProvenanceSink>(
 
         for col in 0..sprite.box_width {
             let screen_x = (sprite.x + col as i32) & 0x1FF;
-            if screen_x >= WIDTH as i32 {
+            if screen_x >= width as i32 {
                 continue;
             }
             let sx = screen_x as usize;
@@ -140,7 +147,8 @@ pub fn rasterize<S: ProvenanceSink>(
             let Some((tx, ty)) = texture_coord(sprite, col_src, line_src, mem) else {
                 continue;
             };
-            let (tile_number, byte_offset) = texel_address(sprite, tx, ty, one_dim);
+            let (tile_number, byte_offset) =
+                texel_address(sprite, tx, ty, one_dim, layout.obj_tile_base);
             let texel = sample_texel(sprite, byte_offset, tx, mem);
             if texel == 0 {
                 continue; // transparent texel contributes nothing
@@ -189,7 +197,7 @@ pub fn rasterize<S: ProvenanceSink>(
                         local_x: tx as u16,
                         local_y: ty as u16,
                         tile_number,
-                        tile_address: VRAM_BASE + OBJ_TILE_BASE + tile_number as u32 * 32,
+                        tile_address: VRAM_BASE + layout.obj_tile_base + tile_number as u32 * 32,
                         tile_byte_address: VRAM_BASE + byte_offset,
                         palette_index: texel,
                         palette_address: PALETTE_BASE + entry as u32 * 2,
@@ -252,7 +260,7 @@ mod tests {
         let sprites = vec![square_sprite(8, ObjMode::ObjWindow)];
         let mut obj = ObjLine::default();
 
-        rasterize(0, &state, &view, &sprites, &mut obj, &mut NullSink);
+        rasterize(0, &state, &view, 240, VramLayout::gba(), &sprites, &mut obj, &mut NullSink);
         assert!(obj.window[0]); // mask set
         assert!(obj.pixels[0].is_none()); // no visible color
     }
@@ -262,9 +270,9 @@ mod tests {
     fn tile_row_stride_differs_between_1d_and_2d() {
         let sprite = square_sprite(16, ObjMode::Normal); // 16×16 = 2×2 tiles, 4bpp
         // Texel (0, 8) is the first texel of tile row 1.
-        let (tile_1d, _) = texel_address(&sprite, 0, 8, true);
+        let (tile_1d, _) = texel_address(&sprite, 0, 8, true, 0x1_0000);
         assert_eq!(tile_1d, 2); // row stride = tiles_wide(2) * 1
-        let (tile_2d, _) = texel_address(&sprite, 0, 8, false);
+        let (tile_2d, _) = texel_address(&sprite, 0, 8, false, 0x1_0000);
         assert_eq!(tile_2d, 32); // row stride = 32
     }
 }

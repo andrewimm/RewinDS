@@ -11,8 +11,8 @@ use crate::debug::provenance::{
     BackgroundId, BgColorMode, RejectionReason, SourceProvenance, TextBgProvenance,
 };
 use crate::debug::sink::ProvenanceSink;
-use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::state::{CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch, WIDTH};
+use crate::memory::{PpuMemoryView, VramLayout, PALETTE_BASE, VRAM_BASE};
+use crate::state::{CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch};
 
 /// Bytes per screenblock (32×32 tilemap entries × 2 bytes).
 const SCREENBLOCK_SIZE: u32 = 0x800;
@@ -39,11 +39,14 @@ fn background_id(bg: usize) -> BackgroundId {
 }
 
 /// Render text background `bg`'s pixels for scanline `y` into its scratch line.
+#[allow(clippy::too_many_arguments)]
 pub fn render_text_scanline<S: ProvenanceSink>(
     bg: usize,
     y: u16,
     state: &LatchedState,
     mem: &PpuMemoryView,
+    width: usize,
+    layout: VramLayout,
     scratch: &mut Scratch,
     sink: &mut S,
 ) {
@@ -52,9 +55,9 @@ pub fn render_text_scanline<S: ProvenanceSink>(
     }
     let cnt = state.regs.bgcnt[bg];
     let priority = (cnt & 0x3) as u8;
-    let char_base = ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
+    let char_base = layout.bg_char_base + ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
     let is_8bpp = cnt & (1 << 7) != 0;
-    let screen_base = ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
+    let screen_base = layout.bg_screen_base + ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
     let (tiles_w, tiles_h) = map_dimensions((cnt >> 14) & 0x3);
     let (bg_w, bg_h) = (tiles_w * 8, tiles_h * 8);
     let screenblocks_wide = tiles_w / 32;
@@ -70,7 +73,7 @@ pub fn render_text_scanline<S: ProvenanceSink>(
     let in_tile_y = source_y % 8;
     let layer = LayerId::bg(bg);
 
-    for x in 0..WIDTH {
+    for x in 0..width {
         let x_snapped = x - (x % mosaic_x);
         let source_x = (x_snapped + hofs) & (bg_w - 1);
         let tile_x = source_x / 8;

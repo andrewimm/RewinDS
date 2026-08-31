@@ -23,6 +23,9 @@ pub struct TestPpu {
     pub framebuffer: Framebuffer,
     pub scratch: Scratch,
     pub segments: Vec<ScanlineSegment>,
+    /// The VRAM base layout (defaults to the GBA's); tests set it to exercise the
+    /// DS-style base offsets.
+    pub layout: crate::memory::VramLayout,
 }
 
 impl TestPpu {
@@ -56,7 +59,15 @@ impl TestPpu {
         if self.segments.is_empty() {
             self.latch_for_scanline();
         }
-        scanline::render_scanline(&mut self.framebuffer, &self.segments, &mut self.scratch, y, mem, sink);
+        scanline::render_scanline(
+            &mut self.framebuffer,
+            &self.segments,
+            &mut self.scratch,
+            y,
+            mem,
+            self.layout,
+            sink,
+        );
     }
 
     pub fn framebuffer(&self) -> &[Color15] {

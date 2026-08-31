@@ -9,7 +9,7 @@ pub mod evaluate;
 pub mod rasterize;
 
 use super::debug::sink::ProvenanceSink;
-use super::memory::PpuMemoryView;
+use super::memory::{PpuMemoryView, VramLayout};
 use super::state::{LatchedState, Scratch};
 
 /// Evaluate and rasterize this scanline's sprites into `scratch`.
@@ -17,6 +17,8 @@ pub fn generate<S: ProvenanceSink>(
     y: u16,
     state: &LatchedState,
     mem: &PpuMemoryView,
+    width: usize,
+    layout: VramLayout,
     scratch: &mut Scratch,
     sink: &mut S,
 ) {
@@ -24,7 +26,7 @@ pub fn generate<S: ProvenanceSink>(
         return;
     }
     evaluate::evaluate_scanline(y, state, mem, &mut scratch.sprites);
-    rasterize::rasterize(y, state, mem, &scratch.sprites, &mut scratch.obj, sink);
+    rasterize::rasterize(y, state, mem, width, layout, &scratch.sprites, &mut scratch.obj, sink);
 }
 
 #[cfg(test)]

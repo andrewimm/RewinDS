@@ -7,6 +7,39 @@
 
 use super::state::Color15;
 
+/// Where a background's tile/map data and the OBJ tiles sit within the VRAM slice.
+///
+/// The GBA has one contiguous VRAM region with OBJ tiles at a fixed `0x1_0000`
+/// offset and no global base. The DS Engine A adds a `DISPCNT`-derived character
+/// and screen base to every background and keeps OBJ tiles in a separate region;
+/// the DS caller assembles a contiguous view and reports the offsets here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VramLayout {
+    /// Added to every background's `BGxCNT` character-block base.
+    pub bg_char_base: u32,
+    /// Added to every background's `BGxCNT` screen-block base.
+    pub bg_screen_base: u32,
+    /// Byte offset of the OBJ tile region within the VRAM slice.
+    pub obj_tile_base: u32,
+}
+
+impl VramLayout {
+    /// The GBA layout: no global BG base, OBJ tiles at `0x1_0000`.
+    pub const fn gba() -> Self {
+        VramLayout {
+            bg_char_base: 0,
+            bg_screen_base: 0,
+            obj_tile_base: 0x1_0000,
+        }
+    }
+}
+
+impl Default for VramLayout {
+    fn default() -> Self {
+        VramLayout::gba()
+    }
+}
+
 /// Base guest address of palette RAM.
 pub const PALETTE_BASE: u32 = 0x0500_0000;
 /// Base guest address of VRAM.
