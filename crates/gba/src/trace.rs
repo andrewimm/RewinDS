@@ -68,6 +68,7 @@ pub(crate) fn describe_event(kind: &EventKind) -> String {
         EventKind::Timer(TimerEvent::Overflow { timer, .. }) => format!("{timer:?} overflow"),
         EventKind::Ppu(PpuEvent::HBlank) => "PPU HBlank".to_string(),
         EventKind::Ppu(PpuEvent::LineStart) => "PPU scanline start".to_string(),
+        EventKind::Apu(crate::event::ApuEvent::Sample) => "APU sample".to_string(),
     }
 }
 

@@ -7,6 +7,8 @@
 //! will replace only the window/present code in this file, reusing [`System`],
 //! [`System::run_frame`], [`System::framebuffer`], and the key map below.
 
+mod audio;
+
 use gba::{Cartridge, Key as Button, SaveType, System};
 use minifb::{Key, Scale, Window, WindowOptions};
 use std::error::Error;
@@ -93,6 +95,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     window.set_target_fps(60);
 
+    // Host audio output (silent if no device is available).
+    let mut audio = audio::Audio::new();
+
     // Reused each frame: the BGR555 framebuffer converted to minifb's 0x00RRGGBB.
     let mut buffer = vec![0u32; WIDTH * HEIGHT];
     // Flush the save at most a few times a second, only after the game writes it.
@@ -105,6 +110,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         system.run_frame();
+
+        if let Some(a) = audio.as_mut() {
+            a.push(&system.take_audio());
+        }
 
         for (out, color) in buffer.iter_mut().zip(system.framebuffer()) {
             let [r, g, b, _] = color.to_rgba8();

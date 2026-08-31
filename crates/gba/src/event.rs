@@ -12,6 +12,14 @@ use crate::timer::TimerId;
 pub enum EventKind {
     Timer(TimerEvent),
     Ppu(PpuEvent),
+    Apu(ApuEvent),
+}
+
+/// Audio events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApuEvent {
+    /// Emit one output sample by mixing the current channel state.
+    Sample,
 }
 
 /// PPU timing events. The display runs continuously, two events per scanline;

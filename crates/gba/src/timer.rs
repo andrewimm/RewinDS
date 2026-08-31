@@ -230,18 +230,21 @@ impl Timers {
 
     /// Handle a scheduled timer overflow: reload, request an IRQ, reschedule the
     /// next overflow, and drive any cascade — all at the event's timestamp.
+    /// Handle a scheduled overflow. Returns a bitmask of the timers that actually
+    /// overflowed (the direct one plus any driven by cascade), so callers can
+    /// clock DirectSound off timers 0 and 1.
     pub fn handle_overflow(
         &mut self,
         event: TimerEvent,
         irq: &mut InterruptController,
         ctx: &mut EventContext<'_, EventKind>,
-    ) {
+    ) -> u8 {
         let TimerEvent::Overflow { timer, generation } = event;
         let index = timer.index();
 
         // Ignore an event left stale by a reconfiguration.
         if self.timers[index].generation != generation {
-            return;
+            return 0;
         }
 
         {
@@ -256,13 +259,14 @@ impl Timers {
             }
         }
 
-        self.cascade_from(index, irq);
+        (1 << index) | self.cascade_from(index, irq)
     }
 
     /// Propagate a cascade: increment the next timer if it is in count-up mode,
     /// and continue up the chain for as long as each increment overflows. All of
     /// this happens at the originating overflow's instant.
-    fn cascade_from(&mut self, source: usize, irq: &mut InterruptController) {
+    fn cascade_from(&mut self, source: usize, irq: &mut InterruptController) -> u8 {
+        let mut mask = 0u8;
         let mut source = source;
         while source + 1 < self.timers.len() {
             let next = source + 1;
@@ -276,11 +280,13 @@ impl Timers {
                 break;
             }
             t.counter = t.reload;
+            mask |= 1 << next;
             if t.irq_enabled {
                 irq.request(TimerId::from_index(next).irq_source());
             }
             source = next;
         }
+        mask
     }
 }
 

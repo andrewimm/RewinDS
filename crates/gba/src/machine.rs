@@ -5,9 +5,10 @@
 //! that a device can schedule follow-up events through the event context, and so
 //! the CPU can thread it into bus writes, without a self-borrow.
 
+use crate::apu::CYCLES_PER_SAMPLE;
 use crate::bus::Bus;
 use crate::dma::DmaTiming;
-use crate::event::{EventKind, PpuEvent};
+use crate::event::{ApuEvent, EventKind, PpuEvent};
 use crate::io::PowerState;
 use emu_core::{EventContext, EventHandler};
 
@@ -55,8 +56,27 @@ impl EventHandler<EventKind> for Gba {
     fn handle(&mut self, event: EventKind, ctx: &mut EventContext<'_, EventKind>) {
         match event {
             EventKind::Timer(event) => {
-                let io = &mut self.bus.io;
-                io.timers.handle_overflow(event, &mut io.irq, ctx);
+                let fired = {
+                    let io = &mut self.bus.io;
+                    io.timers.handle_overflow(event, &mut io.irq, ctx)
+                };
+                // Timers 0 and 1 clock the DirectSound FIFOs; a drained FIFO pulls
+                // a DMA refill.
+                for id in 0..2usize {
+                    if fired & (1 << id) != 0 {
+                        let refill = self.bus.io.apu.on_timer_overflow(id);
+                        for (fifo, &need) in refill.iter().enumerate() {
+                            if need {
+                                self.bus.trigger_fifo_dma(fifo, ctx.scheduler);
+                            }
+                        }
+                    }
+                }
+            }
+            EventKind::Apu(ApuEvent::Sample) => {
+                self.bus.io.apu.generate_sample();
+                ctx.scheduler
+                    .schedule_after(CYCLES_PER_SAMPLE, EventKind::Apu(ApuEvent::Sample));
             }
             EventKind::Ppu(event) => {
                 {

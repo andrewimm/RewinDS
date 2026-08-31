@@ -424,6 +424,45 @@ impl Bus {
         ran
     }
 
+    /// Refill DirectSound FIFO `fifo` (0 = A at `0x0A0`, 1 = B at `0x0A4`) by
+    /// running whichever of DMA1/DMA2 is armed on that address with Special
+    /// timing. A sound-FIFO DMA always moves four 32-bit words to the fixed FIFO
+    /// address, ignoring the count/word-size registers.
+    pub fn trigger_fifo_dma(&mut self, fifo: usize, scheduler: &mut Scheduler<EventKind>) {
+        let dest = 0x0400_00A0 + fifo as u32 * 4;
+        for i in 1..=2 {
+            let channel = &self.io.dma.channels[i];
+            if channel.enabled
+                && channel.timing() == DmaTiming::Special
+                && channel.masked_dest() == dest
+            {
+                self.run_fifo_transfer(i, dest, scheduler);
+            }
+        }
+    }
+
+    fn run_fifo_transfer(&mut self, i: usize, dest: u32, scheduler: &mut Scheduler<EventKind>) {
+        let channel = self.io.dma.channels[i];
+        let source_step = channel.source_step();
+        let mut source = channel.internal_source;
+        let mut sequence = AccessSequence::NonSequential;
+        let mut transfer_cycles: u64 = 0;
+        for _ in 0..4 {
+            let access = Access::dma(i as u8, AccessKind::Data, sequence);
+            let read = self.read32(source, access, scheduler);
+            let write = self.write32(dest, read.value, access, scheduler);
+            transfer_cycles += (read.cycles + write.cycles) as u64;
+            source = source.wrapping_add(source_step);
+            sequence = AccessSequence::Sequential;
+        }
+        transfer_cycles += 2;
+        self.dma_stall_cycles += transfer_cycles;
+        self.io.dma.channels[i].internal_source = source; // dest is fixed; DMA stays armed
+        if self.io.dma.channels[i].irq_on_end() {
+            self.io.irq.request(dma_irq_source(i));
+        }
+    }
+
     /// Perform channel `i`'s transfer as a bus master. The whole transfer runs at
     /// the current instant; guest cycles are not yet charged (see [`crate::dma`]).
     fn run_dma_channel(&mut self, i: usize, scheduler: &mut Scheduler<EventKind>) {

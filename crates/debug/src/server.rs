@@ -393,6 +393,12 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             let irq = &system.gba.bus.io.irq;
             json!({"ie": irq.ie(), "if": irq.iflags(), "ime": irq.ime(), "pending": irq.pending()})
         }
+        "audio.take" => {
+            let samples = system.take_audio();
+            let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            let nonzero = samples.iter().filter(|&&s| s != 0).count();
+            json!({"count": samples.len(), "peak": peak, "nonzero": nonzero})
+        }
         "input.set" => {
             let name = params.get("key").and_then(Value::as_str).unwrap_or("");
             let pressed = params.get("pressed").and_then(Value::as_bool).unwrap_or(true);

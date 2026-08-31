@@ -27,6 +27,8 @@ pub struct System {
     video_debug: VideoInstrumentation,
     /// Whether the continuous LCD scanline schedule has been started.
     lcd_started: bool,
+    /// Whether the continuous audio sample schedule has been started.
+    apu_started: bool,
 }
 
 /// Cycles in one scanline (see [`crate::ppu::timing`]).
@@ -232,12 +234,30 @@ impl System {
         self.gba.bus.io.video.start(now, &mut self.scheduler);
     }
 
+    /// Begin the continuous audio-sample schedule: one output frame every
+    /// [`crate::apu::CYCLES_PER_SAMPLE`] cycles, mixing the current channel state.
+    pub fn start_apu(&mut self) {
+        if self.apu_started {
+            return;
+        }
+        self.apu_started = true;
+        self.scheduler
+            .schedule_after(crate::apu::CYCLES_PER_SAMPLE, EventKind::Apu(crate::event::ApuEvent::Sample));
+    }
+
+    /// Drain the audio samples generated since the last call — interleaved stereo
+    /// `i16` frames — for the host to play.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.gba.bus.io.apu.take_samples()
+    }
+
     /// Run the machine until the PPU completes the current frame (its 160 visible
     /// scanlines have all been drawn, at the start of the vertical blank). Starts
     /// the LCD if it is not already running. After this returns, [`Self::framebuffer`]
     /// holds the finished frame.
     pub fn run_frame(&mut self) {
         self.start_lcd();
+        self.start_apu();
         let start = self.gba.bus.io.video.frame();
         // Advance a scanline at a time until the frame counter ticks. The cap is a
         // safety net against a stalled timeline (a hung CPU with no events).
@@ -303,6 +323,7 @@ impl System {
         // The LCD runs from power-on; ensure its schedule exists so stepping and
         // frame-running behave identically.
         self.start_lcd();
+        self.start_apu();
         let can_run_cpu = !self.gba.is_low_power()
             && self
                 .scheduler
