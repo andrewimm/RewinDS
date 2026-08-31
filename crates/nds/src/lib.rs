@@ -15,6 +15,7 @@ pub mod cp15;
 pub mod dma;
 pub mod interrupt;
 pub mod ipc;
+pub mod key1;
 pub mod memory;
 pub mod ppu;
 pub mod system;

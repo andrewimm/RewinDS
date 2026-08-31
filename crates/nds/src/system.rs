@@ -404,6 +404,24 @@ impl System {
     /// the rest (CP15/TCM, banked stacks, I/O).
     pub fn direct_boot(&mut self, rom: &[u8]) -> Result<(), crate::boot::BootError> {
         let header = crate::boot::Header::parse(rom)?;
+
+        // A commercial ROM keeps its ARM9 boot code in the secure area, whose first
+        // 2 KB may be KEY1-encrypted. Decrypt into an owned copy only when the ID
+        // shows work is pending (an already-boot-ready dump skips the 128 MB copy).
+        let mut decrypted: Option<Vec<u8>> = None;
+        if crate::key1::secure_area_present(header.arm9_rom_offset)
+            && rom.len() >= crate::key1::SECURE_AREA_START + crate::key1::SECURE_AREA_ENC_LEN
+            && crate::key1::secure_area_needs_work(
+                &rom[crate::key1::SECURE_AREA_START..crate::key1::SECURE_AREA_START + 8],
+            )
+        {
+            let keytable = self.machine.memory.key1_keytable().to_vec();
+            let mut buf = rom.to_vec();
+            let _state = crate::key1::process_secure_area(&mut buf, header.gamecode, &keytable);
+            decrypted = Some(buf);
+        }
+        let rom: &[u8] = decrypted.as_deref().unwrap_or(rom);
+
         self.load_binary(
             Core::Arm9,
             rom,

@@ -1,14 +1,18 @@
 //! Direct boot: start a `.nds` image without the firmware sequence.
 //!
-//! Instead of emulating the BIOS/firmware handshake (which needs the KEY1/KEY2
-//! cartridge crypto — deferred), direct boot does what the firmware would: copy
-//! the ARM9 and ARM7 binaries from the cartridge to their RAM addresses, seed the
-//! CPU entry points and stacks, and jump. The header layout follows GBATEK's
-//! "DS Cartridge Header".
+//! Instead of emulating the full BIOS/firmware handshake, direct boot does what the
+//! firmware would: copy the ARM9 and ARM7 binaries from the cartridge to their RAM
+//! addresses, seed the CPU entry points and stacks, and jump. The header layout
+//! follows GBATEK's "DS Cartridge Header". When a commercial ROM keeps its ARM9 boot
+//! code in the encrypted secure area, [`crate::key1`] decrypts it first; the
+//! KEY2 bus-transport cipher belongs to the (future) cartridge command controller,
+//! not to loading the image.
 
 /// The direct-boot fields of a `.nds` header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
+    /// Gamecode at `[0Ch]` (the KEY1 idcode; `#### ` for homebrew).
+    pub gamecode: u32,
     pub arm9_rom_offset: u32,
     pub arm9_entry: u32,
     pub arm9_ram_address: u32,
@@ -42,6 +46,7 @@ impl Header {
         }
         let u32_at = |off: usize| u32::from_le_bytes(rom[off..off + 4].try_into().unwrap());
         let header = Header {
+            gamecode: u32_at(0x0C),
             arm9_rom_offset: u32_at(0x20),
             arm9_entry: u32_at(0x24),
             arm9_ram_address: u32_at(0x28),

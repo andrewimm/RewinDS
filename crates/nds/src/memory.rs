@@ -113,6 +113,14 @@ impl Memory {
         self.arm7_bios[..n].copy_from_slice(&data[..n]);
     }
 
+    /// The 0x1048-byte KEY1 (Blowfish) key table embedded in the ARM7 BIOS at
+    /// `0x30..0x1078` (GBATEK "DS Encryption by Gamecode/Idcode (KEY1)"). All-zero
+    /// until a BIOS is loaded, which callers treat as "no keytable".
+    pub fn key1_keytable(&self) -> &[u8] {
+        &self.arm7_bios[crate::key1::KEYTABLE_BIOS_OFFSET
+            ..crate::key1::KEYTABLE_BIOS_OFFSET + crate::key1::KEYTABLE_LEN]
+    }
+
     // --- reads --------------------------------------------------------------
 
     pub fn read8(&self, core: Core, addr: u32, instruction: bool, cp15: &Cp15) -> u8 {
