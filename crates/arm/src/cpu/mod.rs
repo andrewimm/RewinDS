@@ -716,9 +716,14 @@ impl Cpu {
             self.internal_cycles(bus, 1);
         }
         if op.writeback {
-            // For LDM, a base loaded from memory keeps the loaded value.
-            let base_loaded = op.load && op.register_list & (1 << op.rn.index()) != 0;
-            if !base_loaded {
+            // An LDM base that appears in the register list keeps its loaded value
+            // — the load overwrites the writeback — UNLESS it is the lowest
+            // register, which is loaded first and then overwritten by the
+            // writeback (STM always writes back; its base is never "loaded").
+            let base_index = op.rn.index();
+            let base_loaded = op.load && op.register_list & (1 << base_index) != 0;
+            let base_is_lowest = op.register_list.trailing_zeros() as usize == base_index;
+            if !base_loaded || base_is_lowest {
                 self.set_reg(op.rn, writeback_value);
             }
         }

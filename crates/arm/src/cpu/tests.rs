@@ -780,6 +780,30 @@ fn coprocessor_transfer_traps_when_absent_or_on_v4t() {
 }
 
 #[test]
+fn ldm_base_in_list_writeback_position_dependent() {
+    // The armwrestler LDM cases: a base that appears in the list keeps its loaded
+    // value, EXCEPT when it is the lowest register (loaded first, then overwritten
+    // by the writeback). Memory: 0x11223344 @ 0x100, 0x55667788 @ 0x104.
+    let make = |encoding: u32| {
+        let mut bus = TestBus::new(0x200);
+        bus.load(0, &[encoding]);
+        bus.load(0x100, &[0x1122_3344, 0x5566_7788]);
+        let mut cpu = Cpu::new();
+        cpu.set_register(3, 0xFC); // base = 0x100 - 4 (LDMIB pre-increments to 0x100)
+        cpu.step(&mut bus);
+        cpu
+    };
+    // LDMIB r3!,{r3,r5}: base r3 is the lowest → writeback wins (0xFC + 2*4 = 0x104).
+    let c = make(0xE9B3_0028);
+    assert_eq!(c.register(3), 0x104);
+    assert_eq!(c.register(5), 0x5566_7788);
+    // LDMIB r3!,{r2,r3}: base r3 is not the lowest → the loaded value wins.
+    let c = make(0xE9B3_000C);
+    assert_eq!(c.register(2), 0x1122_3344);
+    assert_eq!(c.register(3), 0x5566_7788);
+}
+
+#[test]
 fn cpu_version_defaults_to_v4t_and_selects_v5() {
     use super::ArmVersion;
     assert_eq!(Cpu::new().version(), ArmVersion::Armv4T);
