@@ -42,6 +42,11 @@ pub enum PpuEvent {
 pub struct Ppu {
     /// `DISPCNT` — Engine A control (ARM9).
     dispcnt: u32,
+    /// The Engine A 2D register block (`0x008`-`0x054`), shared in layout with the
+    /// GBA so the extracted `video2d` renderer consumes it directly. The full
+    /// tiled BG/OBJ render is wired once `video2d` is generalized for the DS's
+    /// dimensions and banked VRAM; today this captures the state and the backdrop.
+    registers: video2d::Registers,
     /// `DISPSTAT` per core (each core has its own blank-IRQ enables).
     dispstat: [u16; 2],
     vcount: u16,
@@ -61,6 +66,7 @@ impl Ppu {
     pub fn new() -> Self {
         Ppu {
             dispcnt: 0,
+            registers: video2d::Registers::default(),
             dispstat: [0; 2],
             vcount: 0,
             frame: 0,
@@ -93,6 +99,20 @@ impl Ppu {
         } else {
             self.dispcnt = (self.dispcnt & !0xFFFF) | (value & 0xFFFF);
         }
+        // Mirror the low half into the shared register snapshot (the DS shares the
+        // GBA's low DISPCNT bits: BG mode and per-layer enables).
+        self.registers.dispcnt = self.dispcnt as u16;
+    }
+
+    /// Write into the Engine A 2D register block (`BGxCNT` … `BLDY`, offset
+    /// relative to `0x0400_0000`), routed to the shared `video2d` register layout.
+    pub fn write_register(&mut self, offset: u32, value: u16, mask: u16) {
+        self.registers.write16(offset, value, mask);
+    }
+
+    /// Read back from the Engine A 2D register block.
+    pub fn read_register(&self, offset: u32) -> u16 {
+        self.registers.read16(offset)
     }
 
     /// Read `DISPSTAT` for a core: the live blank/match flags merged with its
@@ -136,6 +156,7 @@ impl Ppu {
         event: PpuEvent,
         irqs: &mut [Interrupts; 2],
         vram: &Vram,
+        palette: &[u8],
         ctx: &mut EventContext<'_, NdsEvent>,
     ) {
         match event {
@@ -151,7 +172,7 @@ impl Ppu {
 
                 if self.vcount == HEIGHT as u16 {
                     // Entering V-blank: render the finished frame and signal.
-                    self.render_frame(vram);
+                    self.render_frame(vram, palette);
                     self.frame += 1;
                     for (c, irq) in irqs.iter_mut().enumerate() {
                         if self.dispstat[c] & (1 << 3) != 0 {
@@ -176,18 +197,24 @@ impl Ppu {
         }
     }
 
-    /// Produce the frame. Only the direct "VRAM display" mode is implemented;
-    /// graphics mode (BG/OBJ) renders black until the `video2d` renderer lands.
-    fn render_frame(&mut self, vram: &Vram) {
-        let display_mode = (self.dispcnt >> 16) & 3;
-        if display_mode == 2 {
-            // Blit an LCDC VRAM block (A–D) as a 15-bit bitmap.
-            let block = ((self.dispcnt >> 18) & 3) as usize;
-            for (i, px) in self.framebuffer.iter_mut().enumerate() {
-                *px = vram.block_read16(block, i * 2);
+    /// Produce the frame from the Engine A display mode (`DISPCNT` bits 16-17).
+    fn render_frame(&mut self, vram: &Vram, palette: &[u8]) {
+        match (self.dispcnt >> 16) & 3 {
+            // Graphics: full BG/OBJ compositing awaits the `video2d` generalization
+            // (DS dimensions + banked VRAM); present the backdrop (BG palette 0).
+            1 => {
+                let backdrop = u16::from_le_bytes([palette[0], palette[1]]);
+                self.framebuffer.fill(backdrop);
             }
-        } else {
-            self.framebuffer.fill(0);
+            // Direct "VRAM display": blit an LCDC VRAM block (A–D) as a bitmap.
+            2 => {
+                let block = ((self.dispcnt >> 18) & 3) as usize;
+                for (i, px) in self.framebuffer.iter_mut().enumerate() {
+                    *px = vram.block_read16(block, i * 2);
+                }
+            }
+            // Display off, or main-memory FIFO (unmodelled): black.
+            _ => self.framebuffer.fill(0),
         }
     }
 }

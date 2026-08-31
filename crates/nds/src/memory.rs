@@ -45,6 +45,10 @@ pub const ITCM: usize = 32 * 1024;
 pub const DTCM: usize = 16 * 1024;
 pub const ARM9_BIOS: usize = 32 * 1024;
 pub const ARM7_BIOS: usize = 16 * 1024;
+/// Standard palette RAM (Engine A/B BG+OBJ), `0x0500_0000`.
+pub const PALETTE: usize = 2 * 1024;
+/// Object attribute memory (Engine A/B), `0x0700_0000`.
+pub const OAM: usize = 2 * 1024;
 
 /// A backing store a resolved address lands in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +60,8 @@ enum Slot {
     Dtcm,
     Arm9Bios,
     Arm7Bios,
+    Palette,
+    Oam,
 }
 
 /// The DS memory image: all backing stores plus the `WRAMCNT` split.
@@ -67,6 +73,8 @@ pub struct Memory {
     pub dtcm: Box<[u8]>,
     pub arm9_bios: Box<[u8]>,
     pub arm7_bios: Box<[u8]>,
+    pub palette: Box<[u8]>,
+    pub oam: Box<[u8]>,
     /// `WRAMCNT` (ARM9 `4000247h`): bits 0-1 select the Shared WRAM split.
     pub wramcnt: u8,
 }
@@ -87,6 +95,8 @@ impl Memory {
             dtcm: vec![0; DTCM].into_boxed_slice(),
             arm9_bios: vec![0; ARM9_BIOS].into_boxed_slice(),
             arm7_bios: vec![0; ARM7_BIOS].into_boxed_slice(),
+            palette: vec![0; PALETTE].into_boxed_slice(),
+            oam: vec![0; OAM].into_boxed_slice(),
             wramcnt: 0,
         }
     }
@@ -132,6 +142,10 @@ impl Memory {
 
     pub fn write8(&mut self, core: Core, addr: u32, value: u8, cp15: &Cp15) {
         if let Some((slot, off)) = self.map(core, addr, false, cp15) {
+            // 8-bit writes to palette and OAM are ignored on the DS (as with VRAM).
+            if matches!(slot, Slot::Palette | Slot::Oam) {
+                return;
+            }
             if let Some((s, mask)) = self.slot_mut(slot) {
                 s[off & mask] = value;
             }
@@ -182,6 +196,8 @@ impl Memory {
         match addr >> 24 {
             0x02 => Some((Slot::Main, addr as usize)),
             0x03 => self.map_wram(core, addr),
+            0x05 if core == Core::Arm9 => Some((Slot::Palette, addr as usize)),
+            0x07 if core == Core::Arm9 => Some((Slot::Oam, addr as usize)),
             0x00 if core == Core::Arm7 => Some((Slot::Arm7Bios, addr as usize)),
             0xFF if core == Core::Arm9 && addr >= 0xFFFF_0000 => {
                 Some((Slot::Arm9Bios, (addr - 0xFFFF_0000) as usize))
@@ -242,6 +258,8 @@ impl Memory {
             Slot::Dtcm => &self.dtcm,
             Slot::Arm9Bios => &self.arm9_bios,
             Slot::Arm7Bios => &self.arm7_bios,
+            Slot::Palette => &self.palette,
+            Slot::Oam => &self.oam,
         };
         (s, s.len() - 1)
     }
@@ -255,6 +273,8 @@ impl Memory {
             Slot::Arm7Wram => &mut self.arm7_wram,
             Slot::Itcm => &mut self.itcm,
             Slot::Dtcm => &mut self.dtcm,
+            Slot::Palette => &mut self.palette,
+            Slot::Oam => &mut self.oam,
             Slot::Arm9Bios | Slot::Arm7Bios => return None,
         };
         let mask = s.len() - 1;

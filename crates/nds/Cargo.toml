@@ -7,3 +7,4 @@ description = "Nintendo DS hardware semantics"
 [dependencies]
 arm = { path = "../arm" }
 emu-core = { path = "../emu-core" }
+video2d = { path = "../video2d" }

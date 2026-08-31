@@ -144,6 +144,15 @@ impl Machine {
             let control = self.dma[c].read_register(addr & 0xFF) as u32;
             return if bytes == 4 { control << 16 } else { control };
         }
+        if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
+            let base = addr - 0x0400_0000;
+            let low = self.ppu.read_register(base) as u32;
+            return if bytes == 4 {
+                low | (self.ppu.read_register(base + 2) as u32) << 16
+            } else {
+                low
+            };
+        }
         match addr {
             0x0400_0000 => self.ppu.dispcnt(),
             0x0400_0004 => self.ppu.read_dispstat(c) as u32,
@@ -216,6 +225,17 @@ impl Machine {
             }
             return;
         }
+        // Engine A 2D register block (BGxCNT..BLDY), ARM9 only.
+        if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
+            let base = addr - 0x0400_0000;
+            if bytes == 4 {
+                self.ppu.write_register(base, value as u16, 0xFFFF);
+                self.ppu.write_register(base + 2, (value >> 16) as u16, 0xFFFF);
+            } else {
+                self.ppu.write_register(base, value as u16, 0xFFFF);
+            }
+            return;
+        }
         match addr {
             0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(value, bytes),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
@@ -250,8 +270,14 @@ impl EventHandler<NdsEvent> for Machine {
                 self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
             }
             NdsEvent::Ppu(event) => {
-                // `ppu`, `interrupts`, and `vram` are disjoint fields.
-                self.ppu.handle_event(event, &mut self.interrupts, &self.vram, ctx);
+                // `ppu`, `interrupts`, `vram`, and `memory` are disjoint fields.
+                self.ppu.handle_event(
+                    event,
+                    &mut self.interrupts,
+                    &self.vram,
+                    &self.memory.palette,
+                    ctx,
+                );
             }
         }
     }
@@ -654,6 +680,26 @@ mod tests {
         assert_eq!(fb[0], 0);
         assert_eq!(fb[100], 100);
         assert_eq!(fb[0x1234], 0x1234);
+    }
+
+    #[test]
+    fn engine_a_captures_registers_and_renders_backdrop() {
+        let mut system = System::new();
+        // Write the Engine A 2D register block: BG0CNT (0x4000008) priority + a
+        // BLDCNT (0x4000050). These land in the shared video2d::Registers.
+        system.io_write(Core::Arm9, 0x0400_0008, 0x1234, 2); // BG0CNT
+        system.io_write(Core::Arm9, 0x0400_0050, 0x00FF, 2); // BLDCNT
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_0008, 2), 0x1234);
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_0050, 2), 0x00FF);
+
+        // A red backdrop in Engine A BG palette entry 0, graphics display mode.
+        system.write(Core::Arm9, 0x0500_0000, 0x001F, 2); // BGR555 red
+        system.io_write(Core::Arm9, 0x0400_0000, 1 << 16, 4); // DISPCNT: graphics mode
+        system.run_frame();
+
+        // The whole top screen shows the backdrop color.
+        let fb = system.framebuffer();
+        assert!(fb.iter().all(|&p| p == 0x001F));
     }
 
     #[test]
