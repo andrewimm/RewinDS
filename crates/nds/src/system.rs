@@ -17,6 +17,8 @@ use arm::cpu::{ArmVersion, Cpu};
 use emu_core::{EventContext, EventHandler, Scheduler, Timestamp};
 
 use crate::bus::NdsCpuBus;
+use crate::interrupt::Interrupts;
+use crate::ipc::Ipc;
 use crate::memory::Core;
 use crate::{Cp15, Memory};
 
@@ -30,6 +32,9 @@ pub enum NdsEvent {}
 pub struct Machine {
     pub(crate) memory: Memory,
     pub(crate) cp15: Cp15,
+    /// Per-core interrupt controllers, indexed by [`Core::index`].
+    pub(crate) interrupts: [Interrupts; 2],
+    pub(crate) ipc: Ipc,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
@@ -41,35 +46,42 @@ impl Machine {
         Machine {
             memory: Memory::new(),
             cp15: Cp15::new(),
+            interrupts: [Interrupts::new(), Interrupts::new()],
+            ipc: Ipc::new(),
             clock: [0; 2],
         }
     }
 
-    /// Read from the ARM9/ARM7 I/O block. Only the M2.0 registers exist; the rest
-    /// reads as zero.
-    pub(crate) fn io_read(&self, core: Core, addr: u32, bytes: u32) -> u32 {
-        let mut value = 0;
-        for i in 0..bytes {
-            let a = addr + i;
-            // WRAMSTAT (ARM7, 4000241h) reflects the Shared WRAM split.
-            let byte = if core == Core::Arm7 && a == 0x0400_0241 {
-                self.memory.wramcnt
-            } else {
-                0
-            };
-            value |= (byte as u32) << (8 * i);
+    /// Read from a core's I/O block. Registers are handled at their natural width
+    /// (the CPU accesses them aligned); everything unmodelled reads as zero. Some
+    /// reads have side effects (dequeuing `IPCFIFORECV`), hence `&mut self`.
+    pub(crate) fn io_read(&mut self, core: Core, addr: u32, _bytes: u32) -> u32 {
+        let c = core.index();
+        match addr {
+            0x0400_0180 => self.ipc.read_sync(core) as u32,
+            0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
+            0x0400_0208 => self.interrupts[c].ime() as u32,
+            0x0400_0210 => self.interrupts[c].ie(),
+            0x0400_0214 => self.interrupts[c].iflags(),
+            0x0410_0000 => self.ipc.recv(core, &mut self.interrupts),
+            0x0400_0241 if core == Core::Arm7 => self.memory.wramcnt as u32,
+            _ => 0,
         }
-        value
     }
 
-    /// Write to the I/O block. Only `WRAMCNT` (ARM9, 4000247h) is modelled.
-    pub(crate) fn io_write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
-        for i in 0..bytes {
-            let a = addr + i;
-            let byte = (value >> (8 * i)) as u8;
-            if core == Core::Arm9 && a == 0x0400_0247 {
-                self.memory.wramcnt = byte & 3;
-            }
+    /// Write to a core's I/O block, handled at natural width; unmodelled writes
+    /// are ignored.
+    pub(crate) fn io_write(&mut self, core: Core, addr: u32, value: u32, _bytes: u32) {
+        let c = core.index();
+        match addr {
+            0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
+            0x0400_0184 => self.ipc.write_fifocnt(core, value as u16, &mut self.interrupts),
+            0x0400_0188 => self.ipc.send(core, value, &mut self.interrupts),
+            0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
+            0x0400_0210 => self.interrupts[c].set_ie(value),
+            0x0400_0214 => self.interrupts[c].acknowledge(value),
+            0x0400_0247 if core == Core::Arm9 => self.memory.wramcnt = value as u8 & 3,
+            _ => {}
         }
     }
 }
@@ -153,16 +165,37 @@ impl System {
         }
     }
 
-    /// Execute one instruction on `core` against its view of the machine.
+    /// Execute one instruction on `core` against its view of the machine, first
+    /// accepting a pending interrupt at the boundary if the core allows it.
     fn step_core(&mut self, core: Core) {
+        let asserted = self.machine.interrupts[core.index()].line_asserted();
+        let cpu = match core {
+            Core::Arm9 => &mut self.arm9,
+            Core::Arm7 => &mut self.arm7,
+        };
+        if asserted && cpu.irq_enabled() {
+            cpu.take_irq();
+        }
         let mut bus = NdsCpuBus {
             machine: &mut self.machine,
             core,
         };
-        match core {
-            Core::Arm9 => self.arm9.step(&mut bus),
-            Core::Arm7 => self.arm7.step(&mut bus),
-        }
+        cpu.step(&mut bus);
+    }
+
+    /// A core's interrupt controller, for inspection and test setup.
+    pub fn interrupts(&self, core: Core) -> &Interrupts {
+        &self.machine.interrupts[core.index()]
+    }
+
+    /// Perform an I/O write as `core` would (for driving devices in tests).
+    pub fn io_write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
+        self.machine.io_write(core, addr, value, bytes);
+    }
+
+    /// Perform an I/O read as `core` would.
+    pub fn io_read(&mut self, core: Core, addr: u32, bytes: u32) -> u32 {
+        self.machine.io_read(core, addr, bytes)
     }
 }
 
@@ -220,6 +253,60 @@ mod tests {
         assert_eq!(system.memory().main[0x0100], again.memory().main[0x0100]);
         assert_eq!(system.memory().main[0x0200], again.memory().main[0x0200]);
         assert_eq!(system.clock(Core::Arm7), again.clock(Core::Arm7));
+    }
+
+    #[test]
+    fn ipc_fifo_handshake_round_trips_through_the_timeline() {
+        use crate::IrqSource;
+        const FIFOCNT: u32 = 0x0400_0184;
+        const SEND: u32 = 0x0400_0188;
+        const RECV: u32 = 0x0410_0000;
+
+        let mut system = System::new();
+        // Both cores park in a self-branch and keep the timeline moving.
+        load_main(&mut system, 0x0000, &[0xEAFF_FFFE]); // arm9: b .
+        load_main(&mut system, 0x0040, &[0xEAFF_FFFE]); // arm7: b .
+        system.arm9.set_pc(0x0200_0000);
+        system.arm7.set_pc(0x0200_0040);
+
+        // Enable both FIFOs; the ARM7 also enables its receive-not-empty IRQ and
+        // arms its interrupt controller.
+        system.io_write(Core::Arm9, FIFOCNT, 1 << 15, 2);
+        system.io_write(Core::Arm7, FIFOCNT, (1 << 15) | (1 << 10), 2);
+        system.io_write(Core::Arm7, 0x0400_0210, IrqSource::IpcRecvNotEmpty.mask(), 4); // IE
+        system.io_write(Core::Arm7, 0x0400_0208, 1, 4); // IME
+
+        // ARM9 sends a request word; run the interleaved timeline forward.
+        system.io_write(Core::Arm9, SEND, 0x1234, 4);
+        system.run_until(200);
+
+        // The send raised the ARM7's receive interrupt, and it vectored to handle
+        // it (the boundary acceptance fired mid-timeline).
+        assert_eq!(system.arm7.mode(), Some(arm::cpu::Mode::Irq));
+        // The ARM7 reads the request and replies with value + 1.
+        assert_eq!(system.io_read(Core::Arm7, RECV, 4), 0x1234);
+        system.io_write(Core::Arm7, SEND, 0x1235, 4);
+        system.run_until(400);
+
+        // The ARM9 reads the reply back — a full round-trip.
+        assert_eq!(system.io_read(Core::Arm9, RECV, 4), 0x1235);
+    }
+
+    #[test]
+    fn ipc_sync_irq_crosses_from_arm9_to_arm7() {
+        use crate::IrqSource;
+        const SYNC: u32 = 0x0400_0180;
+
+        let mut system = System::new();
+        // The ARM7 enables the sync IRQ (IPCSYNC bit 14) and arms its controller.
+        system.io_write(Core::Arm7, SYNC, 1 << 14, 2);
+        system.io_write(Core::Arm7, 0x0400_0210, IrqSource::IpcSync.mask(), 4);
+        system.io_write(Core::Arm7, 0x0400_0208, 1, 4);
+        assert!(!system.interrupts(Core::Arm7).line_asserted());
+
+        // The ARM9 triggers a sync IRQ (bit 13) toward the ARM7.
+        system.io_write(Core::Arm9, SYNC, 1 << 13, 2);
+        assert!(system.interrupts(Core::Arm7).line_asserted());
     }
 
     #[test]

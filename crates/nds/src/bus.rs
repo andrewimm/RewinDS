@@ -42,7 +42,8 @@ impl NdsCpuBus<'_> {
         self.machine.clock[self.core.index()] += cycles as Timestamp * self.ticks_per_cycle();
     }
 
-    fn read(&self, address: u32, instruction: bool, bytes: u32) -> u32 {
+    fn read(&mut self, address: u32, instruction: bool, bytes: u32) -> u32 {
+        // I/O reads may have side effects (e.g. dequeuing an IPC FIFO).
         if is_io(address) {
             return self.machine.io_read(self.core, address, bytes);
         }

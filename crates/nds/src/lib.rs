@@ -11,9 +11,13 @@
 
 pub mod bus;
 pub mod cp15;
+pub mod interrupt;
+pub mod ipc;
 pub mod memory;
 pub mod system;
 
 pub use cp15::Cp15;
+pub use interrupt::{Interrupts, IrqSource};
+pub use ipc::Ipc;
 pub use memory::{Core, Memory};
 pub use system::{Machine, NdsEvent, System};
