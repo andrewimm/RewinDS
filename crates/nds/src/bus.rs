@@ -8,16 +8,17 @@
 //! ARM7 has no coprocessor, so they trap as Undefined via the trait defaults).
 
 use arm::cpu::{Bus, Timed};
-use emu_core::Timestamp;
+use emu_core::{Scheduler, Timestamp};
 
 use crate::memory::Core;
-use crate::system::Machine;
+use crate::system::{Machine, NdsEvent};
 
-/// One core's view of the DS machine for a single interpreter step. Milestones
-/// with devices that reschedule on MMIO writes will thread the shared scheduler
-/// through here too.
+/// One core's view of the DS machine for a single interpreter step. The shared
+/// scheduler rides along so that MMIO writes which reschedule (a timer control
+/// write) can reach it.
 pub(crate) struct NdsCpuBus<'a> {
     pub machine: &'a mut Machine,
+    pub scheduler: &'a mut Scheduler<NdsEvent>,
     pub core: Core,
 }
 
@@ -57,7 +58,8 @@ impl NdsCpuBus<'_> {
 
     fn write(&mut self, address: u32, value: u32, bytes: u32) {
         if is_io(address) {
-            self.machine.io_write(self.core, address, value, bytes);
+            self.machine
+                .io_write(self.core, address, value, bytes, self.scheduler);
             return;
         }
         // `memory` and `cp15` are disjoint fields, so the mutable memory borrow

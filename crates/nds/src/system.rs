@@ -20,12 +20,20 @@ use crate::bus::NdsCpuBus;
 use crate::interrupt::Interrupts;
 use crate::ipc::Ipc;
 use crate::memory::Core;
+use crate::timer::{TimerId, Timers};
 use crate::{Cp15, Memory};
 
-/// Events on the shared DS timeline. No device schedules events yet, so this is
-/// uninhabited; milestones that add timers/PPU/IPC give it variants.
+/// Events on the shared DS timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NdsEvent {}
+pub enum NdsEvent {
+    /// A timer reached its overflow on `core`. `generation` distinguishes it from
+    /// events left stale by a reconfiguration.
+    TimerOverflow {
+        core: Core,
+        timer: TimerId,
+        generation: u32,
+    },
+}
 
 /// Everything reachable through the bus: the memory image, CP15, the per-core
 /// local clocks, and (later) the devices. It is the timeline's [`EventHandler`].
@@ -34,6 +42,8 @@ pub struct Machine {
     pub(crate) cp15: Cp15,
     /// Per-core interrupt controllers, indexed by [`Core::index`].
     pub(crate) interrupts: [Interrupts; 2],
+    /// Per-core timer banks, indexed by [`Core::index`].
+    pub(crate) timers: [Timers; 2],
     pub(crate) ipc: Ipc,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
@@ -47,6 +57,7 @@ impl Machine {
             memory: Memory::new(),
             cp15: Cp15::new(),
             interrupts: [Interrupts::new(), Interrupts::new()],
+            timers: [Timers::new(Core::Arm9), Timers::new(Core::Arm7)],
             ipc: Ipc::new(),
             clock: [0; 2],
         }
@@ -55,8 +66,20 @@ impl Machine {
     /// Read from a core's I/O block. Registers are handled at their natural width
     /// (the CPU accesses them aligned); everything unmodelled reads as zero. Some
     /// reads have side effects (dequeuing `IPCFIFORECV`), hence `&mut self`.
-    pub(crate) fn io_read(&mut self, core: Core, addr: u32, _bytes: u32) -> u32 {
+    pub(crate) fn io_read(&mut self, core: Core, addr: u32, bytes: u32) -> u32 {
         let c = core.index();
+        // Timers: 0x4000100..0x4000110, four bytes each (L = counter, H = control).
+        if (0x0400_0100..0x0400_0110).contains(&addr) {
+            let now = self.clock[c];
+            let id = TimerId::from_index(((addr - 0x0400_0100) / 4) as usize);
+            let counter = self.timers[c].read_counter(id, now) as u32;
+            let control = self.timers[c].read_control(id) as u32;
+            return match (bytes, addr & 2 != 0) {
+                (4, _) => counter | (control << 16),
+                (_, true) => control,
+                (_, false) => counter,
+            };
+        }
         match addr {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
@@ -70,9 +93,30 @@ impl Machine {
     }
 
     /// Write to a core's I/O block, handled at natural width; unmodelled writes
-    /// are ignored.
-    pub(crate) fn io_write(&mut self, core: Core, addr: u32, value: u32, _bytes: u32) {
+    /// are ignored. Timer-control writes can schedule an overflow, so the shared
+    /// scheduler is threaded in.
+    pub(crate) fn io_write(
+        &mut self,
+        core: Core,
+        addr: u32,
+        value: u32,
+        bytes: u32,
+        scheduler: &mut Scheduler<NdsEvent>,
+    ) {
         let c = core.index();
+        if (0x0400_0100..0x0400_0110).contains(&addr) {
+            let now = self.clock[c];
+            let id = TimerId::from_index(((addr - 0x0400_0100) / 4) as usize);
+            match (bytes, addr & 2 != 0) {
+                (4, _) => {
+                    self.timers[c].write_reload(id, value as u16);
+                    self.timers[c].write_control(id, (value >> 16) as u16, now, scheduler);
+                }
+                (_, true) => self.timers[c].write_control(id, value as u16, now, scheduler),
+                (_, false) => self.timers[c].write_reload(id, value as u16),
+            }
+            return;
+        }
         match addr {
             0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self.ipc.write_fifocnt(core, value as u16, &mut self.interrupts),
@@ -87,9 +131,14 @@ impl Machine {
 }
 
 impl EventHandler<NdsEvent> for Machine {
-    fn handle(&mut self, event: NdsEvent, _ctx: &mut EventContext<'_, NdsEvent>) {
-        // Uninhabited today; `match` proves there is nothing to service yet.
-        match event {}
+    fn handle(&mut self, event: NdsEvent, ctx: &mut EventContext<'_, NdsEvent>) {
+        match event {
+            NdsEvent::TimerOverflow { core, timer, generation } => {
+                let c = core.index();
+                // `timers[c]` and `interrupts[c]` are disjoint fields.
+                self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
+            }
+        }
     }
 }
 
@@ -178,6 +227,7 @@ impl System {
         }
         let mut bus = NdsCpuBus {
             machine: &mut self.machine,
+            scheduler: &mut self.scheduler,
             core,
         };
         cpu.step(&mut bus);
@@ -190,7 +240,8 @@ impl System {
 
     /// Perform an I/O write as `core` would (for driving devices in tests).
     pub fn io_write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
-        self.machine.io_write(core, addr, value, bytes);
+        self.machine
+            .io_write(core, addr, value, bytes, &mut self.scheduler);
     }
 
     /// Perform an I/O read as `core` would.
@@ -307,6 +358,43 @@ mod tests {
         // The ARM9 triggers a sync IRQ (bit 13) toward the ARM7.
         system.io_write(Core::Arm9, SYNC, 1 << 13, 2);
         assert!(system.interrupts(Core::Arm7).line_asserted());
+    }
+
+    #[test]
+    fn timer_overflow_reloads_and_raises_a_per_core_irq() {
+        use crate::IrqSource;
+        // Timer 0 registers on each core: TM0CNT_L = 0x4000100, TM0CNT_H = 0x4000102.
+        let mut system = System::new();
+        // The ARM7 arms its controller for the Timer 0 interrupt.
+        system.io_write(Core::Arm7, 0x0400_0210, IrqSource::Timer0.mask(), 4); // IE
+        system.io_write(Core::Arm7, 0x0400_0208, 1, 4); // IME
+        // Reload 0xFFFF (overflows after one increment = 2 master ticks), F/1,
+        // IRQ enabled, start.
+        system.io_write(Core::Arm7, 0x0400_0100, 0xFFFF, 2);
+        system.io_write(Core::Arm7, 0x0400_0102, (1 << 7) | (1 << 6), 2);
+        assert_eq!(system.interrupts(Core::Arm7).iflags(), 0);
+
+        system.run_until(64);
+        // The overflow fired on the ARM7 (and only there) and reloaded.
+        assert_eq!(system.interrupts(Core::Arm7).iflags(), IrqSource::Timer0.mask());
+        assert_eq!(system.interrupts(Core::Arm9).iflags(), 0);
+        assert_eq!(system.io_read(Core::Arm7, 0x0400_0100, 2), 0xFFFF);
+    }
+
+    #[test]
+    fn cascade_chains_timer0_into_timer1() {
+        // Timer 0: reload 0xFFFF, F/1, running -> overflows every 2 master ticks.
+        // Timer 1: count-up (cascade) -> increments once per Timer 0 overflow.
+        let mut system = System::new();
+        system.io_write(Core::Arm9, 0x0400_0100, 0xFFFF, 2); // TM0 reload
+        system.io_write(Core::Arm9, 0x0400_0102, 1 << 7, 2); // TM0 start, F/1
+        system.io_write(Core::Arm9, 0x0400_0104, 0, 2); // TM1 reload 0
+        system.io_write(Core::Arm9, 0x0400_0106, (1 << 7) | (1 << 2), 2); // TM1 start + cascade
+
+        // After ~5 Timer 0 overflows (10 master ticks) Timer 1 should read ~5.
+        system.run_until(64);
+        let timer1 = system.io_read(Core::Arm9, 0x0400_0104, 2);
+        assert!(timer1 >= 4, "timer1 cascaded to {timer1}");
     }
 
     #[test]

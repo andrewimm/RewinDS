@@ -15,9 +15,11 @@ pub mod interrupt;
 pub mod ipc;
 pub mod memory;
 pub mod system;
+pub mod timer;
 
 pub use cp15::Cp15;
 pub use interrupt::{Interrupts, IrqSource};
 pub use ipc::Ipc;
 pub use memory::{Core, Memory};
 pub use system::{Machine, NdsEvent, System};
+pub use timer::{TimerId, Timers};
