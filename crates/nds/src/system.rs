@@ -423,6 +423,13 @@ impl System {
             self.machine
                 .data_write(Core::Arm9, 0x027F_FE00 + i as u32, byte as u32, 1);
         }
+        // Seed CP15 to the TCM state the ARM9 BIOS establishes, which BIOS-less
+        // homebrew relies on (armwrestler's stack lives in DTCM and its startup
+        // never configures CP15): DTCM 16 KB at 0x0080_0000 and ITCM 32 KB at 0,
+        // both enabled. Games that manage CP15 themselves overwrite this.
+        self.machine.cp15.write(0, 9, 1, 0, 0x0080_000A); // DTCM base 0x0080_0000, 16 KB
+        self.machine.cp15.write(0, 9, 1, 1, 0x0000_000C); // ITCM 32 KB (base fixed at 0)
+        self.machine.cp15.write(0, 1, 0, 0, (1 << 16) | (1 << 18)); // enable DTCM + ITCM
         // Give the ARM9 the Shared WRAM its stack sits in.
         self.machine.memory.wramcnt = 0;
         // Entry points and conventional system-mode stacks (the cores boot in
@@ -825,6 +832,9 @@ mod tests {
         assert_eq!(system.read(Core::Arm9, 0x0200_0300, 1), 0xA9);
         assert_eq!(system.read(Core::Arm7, 0x0200_0400, 1), 0x77);
         assert_eq!(system.arm9.register(15) & !3, 0x0200_000C); // parked at the B .
+        // Direct boot seeds the BIOS TCM state so BIOS-less homebrew's stack works.
+        assert!(system.cp15().dtcm_enabled());
+        assert_eq!(system.cp15().dtcm_base(), 0x0080_0000);
     }
 
     #[test]
