@@ -455,3 +455,27 @@ fn sum_loop() {
     assert_eq!(cpu.register(0), 6); // 1 + 2 + 3
     assert_eq!(cpu.register(1), 4);
 }
+
+#[test]
+fn cpu_version_defaults_to_v4t_and_selects_v5() {
+    use super::ArmVersion;
+    assert_eq!(Cpu::new().version(), ArmVersion::Armv4T);
+    assert!(!Cpu::new().version().is_v5());
+    let arm9 = Cpu::with_version(ArmVersion::Armv5TE);
+    assert_eq!(arm9.version(), ArmVersion::Armv5TE);
+    assert!(arm9.version().is_v5());
+}
+
+#[test]
+fn q_flag_round_trips_through_cpsr_bits() {
+    use super::Psr;
+    let mut psr = Psr::from_bits(0);
+    assert!(!psr.q());
+    psr.set_q(true);
+    assert!(psr.q());
+    assert_eq!(psr.bits() & (1 << 27), 1 << 27); // CPSR bit 27
+    // The Q flag survives a bits round-trip (so it rides SPSR save/restore).
+    assert!(Psr::from_bits(psr.bits()).q());
+    psr.set_q(false);
+    assert!(!psr.q());
+}

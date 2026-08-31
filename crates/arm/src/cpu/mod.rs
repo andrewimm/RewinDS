@@ -62,6 +62,26 @@ impl Mode {
     }
 }
 
+/// The ARM architecture variant a CPU core implements.
+///
+/// ARMv4T is the ARM7TDMI — the GBA's CPU, and the DS's ARM7. ARMv5TE is the
+/// ARM946E-S — the DS's ARM9 — a strict superset that adds `CLZ`, `BLX`, saturating
+/// and DSP multiply instructions, coprocessor access, and richer interworking. One
+/// interpreter serves both; this selects the handful of behaviours that differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ArmVersion {
+    #[default]
+    Armv4T,
+    Armv5TE,
+}
+
+impl ArmVersion {
+    /// Whether this core implements the ARMv5(TE) additions.
+    pub fn is_v5(self) -> bool {
+        matches!(self, ArmVersion::Armv5TE)
+    }
+}
+
 /// A program status register (CPSR or an SPSR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Psr(u32);
@@ -71,6 +91,10 @@ impl Psr {
     const Z: u32 = 1 << 30;
     const C: u32 = 1 << 29;
     const V: u32 = 1 << 28;
+    /// Sticky saturation flag, set by the ARMv5TE saturating/DSP instructions. It
+    /// is not present on ARMv4T (nothing there writes it), but lives in the same
+    /// CPSR bit so it rides through SPSR save/restore for free.
+    const Q: u32 = 1 << 27;
     const I: u32 = 1 << 7;
     const F: u32 = 1 << 6;
     const T: u32 = 1 << 5;
@@ -107,6 +131,9 @@ impl Psr {
     pub fn v(self) -> bool {
         self.flag(Self::V)
     }
+    pub fn q(self) -> bool {
+        self.flag(Self::Q)
+    }
     pub fn thumb(self) -> bool {
         self.flag(Self::T)
     }
@@ -128,6 +155,9 @@ impl Psr {
     }
     pub fn set_v(&mut self, v: bool) {
         self.set_flag(Self::V, v);
+    }
+    pub fn set_q(&mut self, v: bool) {
+        self.set_flag(Self::Q, v);
     }
     pub fn set_thumb(&mut self, v: bool) {
         self.set_flag(Self::T, v);
@@ -192,6 +222,10 @@ pub struct Cpu {
     /// Whether the current instruction performed a data access (which breaks the
     /// fetch sequence for the next opcode).
     data_access: bool,
+    /// The architecture variant this core implements. Gates the ARMv5TE-only
+    /// behaviours (interworking rules, and trapping v5 instructions as undefined on
+    /// ARMv4T). ARM7 cores keep the default [`ArmVersion::Armv4T`].
+    version: ArmVersion,
 }
 
 impl Default for Cpu {
@@ -201,7 +235,14 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    /// A fresh ARMv4T (ARM7TDMI) core — the GBA CPU and the DS's ARM7.
     pub fn new() -> Self {
+        Self::with_version(ArmVersion::Armv4T)
+    }
+
+    /// A fresh core of the given architecture variant. Use [`ArmVersion::Armv5TE`]
+    /// for the DS's ARM9 (ARM946E-S).
+    pub fn with_version(version: ArmVersion) -> Self {
         let mut cpsr = Psr::from_bits(0);
         cpsr.set_mode(Mode::System);
         Cpu {
@@ -214,7 +255,13 @@ impl Cpu {
             branched: false,
             sequential: false,
             data_access: false,
+            version,
         }
+    }
+
+    /// The architecture variant this core implements.
+    pub fn version(&self) -> ArmVersion {
+        self.version
     }
 
     /// The current operating mode.
