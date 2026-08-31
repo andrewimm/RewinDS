@@ -6,7 +6,6 @@
 //! timing (which does not apply to the PPU's own fetches).
 
 use super::state::Color15;
-use crate::bus::Memory;
 
 /// Base guest address of palette RAM.
 pub const PALETTE_BASE: u32 = 0x0500_0000;
@@ -23,12 +22,11 @@ pub struct PpuMemoryView<'a> {
 }
 
 impl<'a> PpuMemoryView<'a> {
-    pub fn new(memory: &'a Memory) -> Self {
-        PpuMemoryView {
-            vram: &memory.vram,
-            palette: &memory.palette,
-            oam: &memory.oam,
-        }
+    /// Build a view from the three region slices. The machine crate owns the
+    /// backing storage (its bus `Memory`, or the DS's banked VRAM) and supplies
+    /// the slices, keeping this renderer free of any bus dependency.
+    pub fn new(vram: &'a [u8], palette: &'a [u8], oam: &'a [u8]) -> Self {
+        PpuMemoryView { vram, palette, oam }
     }
 
     /// Read a little-endian halfword from VRAM at byte offset `off`.
@@ -62,5 +60,37 @@ impl<'a> PpuMemoryView<'a> {
     #[inline]
     pub fn oam16(&self, off: usize) -> u16 {
         u16::from_le_bytes([self.oam[off], self.oam[off + 1]])
+    }
+}
+
+/// A standalone owner of the three graphics regions (GBA sizes), for tests that
+/// used to build a view from the bus `Memory`. Mutate the public fields, then
+/// borrow a [`PpuMemoryView`] with [`Self::view`].
+#[cfg(test)]
+pub struct TestMemory {
+    pub vram: Vec<u8>,
+    pub palette: Vec<u8>,
+    pub oam: Vec<u8>,
+}
+
+#[cfg(test)]
+impl Default for TestMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl TestMemory {
+    pub fn new() -> Self {
+        TestMemory {
+            vram: vec![0; 0x1_8000],
+            palette: vec![0; 0x400],
+            oam: vec![0; 0x400],
+        }
+    }
+
+    pub fn view(&self) -> PpuMemoryView<'_> {
+        PpuMemoryView::new(&self.vram, &self.palette, &self.oam)
     }
 }

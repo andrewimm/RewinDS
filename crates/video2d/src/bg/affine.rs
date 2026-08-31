@@ -6,13 +6,13 @@
 //! no per-tile flip (orientation comes from the matrix). Coordinates outside the
 //! map either wrap or become transparent, per `BGxCNT` bit 13.
 
-use crate::ppu::debug::explain::CandidateExplanation;
-use crate::ppu::debug::provenance::{
+use crate::debug::explain::CandidateExplanation;
+use crate::debug::provenance::{
     AffineBgProvenance, AffineMatrix, AffineWrap, BackgroundId, RejectionReason, SourceProvenance,
 };
-use crate::ppu::debug::sink::ProvenanceSink;
-use crate::ppu::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::ppu::state::{
+use crate::debug::sink::ProvenanceSink;
+use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
+use crate::state::{
     AffineReference, CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch, WIDTH,
 };
 
@@ -174,12 +174,12 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
 
 #[cfg(test)]
 mod tests {
-    use crate::bus::Memory;
-    use crate::ppu::debug::provenance::{AffineWrap, SourceProvenance};
-    use crate::ppu::debug::sink::NullSink;
-    use crate::ppu::memory::{PpuMemoryView, VRAM_BASE};
-    use crate::ppu::state::{Color15, LayerId, WIDTH};
-    use crate::ppu::Ppu;
+    use crate::memory::TestMemory as Memory;
+    use crate::debug::provenance::{AffineWrap, SourceProvenance};
+    use crate::debug::sink::NullSink;
+    use crate::memory::VRAM_BASE;
+    use crate::state::{Color15, LayerId, WIDTH};
+    use crate::TestPpu as Ppu;
 
     fn set_palette(mem: &mut Memory, index: usize, color: u16) {
         mem.palette[index * 2..index * 2 + 2].copy_from_slice(&color.to_le_bytes());
@@ -207,7 +207,7 @@ mod tests {
         ppu.affine.bg2 = ppu.affine_reference_for_line(0, y);
         ppu.affine.bg3 = ppu.affine_reference_for_line(1, y);
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(mem);
+        let view = mem.view();
         ppu.render_scanline(y, &view, &mut NullSink);
     }
 
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn explain_reports_affine_transform_and_sources() {
         let (mut ppu, mem) = identity_scene();
-        let view = PpuMemoryView::new(&mem);
+        let view = mem.view();
         let explanation = ppu.explain_current_pixel(1, 0, &view).unwrap();
         let bg2 = explanation.candidate_for(LayerId::Bg2).expect("BG2 candidate");
         match bg2.provenance {

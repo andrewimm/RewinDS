@@ -5,10 +5,10 @@
 //! address into palette RAM / VRAM / OAM, so a future memory last-writer bridge
 //! can answer "who wrote that address, from what PC" with no change here.
 
-use crate::ppu::state::{AffineReference, Color15};
+use crate::state::{AffineReference, Color15};
 
 /// A background layer identity (backgrounds only; distinct from the compositor's
-/// [`LayerId`](crate::ppu::state::LayerId) which also names OBJ/backdrop).
+/// [`LayerId`](crate::state::LayerId) which also names OBJ/backdrop).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundId {
     Bg0,

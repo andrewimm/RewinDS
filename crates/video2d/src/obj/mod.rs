@@ -30,12 +30,11 @@ pub fn generate<S: ProvenanceSink>(
 #[cfg(test)]
 mod tests {
     use super::evaluate::evaluate_scanline;
-    use crate::bus::Memory;
-    use crate::ppu::debug::provenance::SourceProvenance;
-    use crate::ppu::debug::sink::NullSink;
-    use crate::ppu::memory::PpuMemoryView;
-    use crate::ppu::state::{Color15, LayerId};
-    use crate::ppu::Ppu;
+    use crate::memory::TestMemory as Memory;
+    use crate::debug::provenance::SourceProvenance;
+    use crate::debug::sink::NullSink;
+    use crate::state::{Color15, LayerId};
+    use crate::TestPpu as Ppu;
 
     /// OBJ enabled, 1D tile mapping, all backgrounds off.
     const OBJ_1D: u16 = (1 << 12) | (1 << 6);
@@ -53,7 +52,7 @@ mod tests {
 
     fn render0(ppu: &mut Ppu, mem: &Memory) {
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(mem);
+        let view = mem.view();
         ppu.render_scanline(0, &view, &mut NullSink);
     }
 
@@ -192,7 +191,7 @@ mod tests {
             set_oam(&mut mem, i, 1 << 14, 3 << 14, 1); // shape 1, size 3 -> 64×32
         }
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(&mem);
+        let view = mem.view();
         let mut out = Vec::new();
         evaluate_scanline(0, &ppu.latched, &view, &mut out);
         // floor(1210 / 64) = 18 sprites fit.
@@ -227,7 +226,7 @@ mod tests {
         set_oam(&mut mem, 7, 0, 0, 1); // sprite 7, tile 1
         mem.vram[0x10020] = 0x05;
 
-        let view = PpuMemoryView::new(&mem);
+        let view = mem.view();
         let explanation = ppu.explain_current_pixel(0, 0, &view).unwrap();
         let obj = explanation.candidate_for(LayerId::Obj).expect("OBJ candidate");
         match obj.provenance {

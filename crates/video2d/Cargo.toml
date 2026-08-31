@@ -1,0 +1,7 @@
+[package]
+name = "video2d"
+version = "0.1.0"
+edition = "2021"
+description = "Shared 2D software renderer for the GBA and NDS 2D engines"
+
+[dependencies]

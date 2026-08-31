@@ -80,11 +80,10 @@ pub fn compute_line(y: u16, state: &LatchedState, obj: &ObjLine, out: &mut Windo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::Memory;
-    use crate::ppu::debug::sink::NullSink;
-    use crate::ppu::memory::PpuMemoryView;
-    use crate::ppu::state::Color15;
-    use crate::ppu::Ppu;
+    use crate::memory::TestMemory as Memory;
+    use crate::debug::sink::NullSink;
+    use crate::state::Color15;
+    use crate::TestPpu as Ppu;
 
     #[test]
     fn in_span_normal_bounds() {
@@ -119,7 +118,7 @@ mod tests {
 
     fn render0(ppu: &mut Ppu, mem: &Memory) {
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(mem);
+        let view = mem.view();
         ppu.render_scanline(0, &view, &mut NullSink);
     }
 

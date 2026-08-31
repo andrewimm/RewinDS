@@ -6,13 +6,13 @@
 //! number/flip/palette from it, read the tile's texel (4bpp or 8bpp), and resolve
 //! it through the background palette. Texel 0 is transparent.
 
-use crate::ppu::debug::explain::CandidateExplanation;
-use crate::ppu::debug::provenance::{
+use crate::debug::explain::CandidateExplanation;
+use crate::debug::provenance::{
     BackgroundId, BgColorMode, RejectionReason, SourceProvenance, TextBgProvenance,
 };
-use crate::ppu::debug::sink::ProvenanceSink;
-use crate::ppu::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::ppu::state::{CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch, WIDTH};
+use crate::debug::sink::ProvenanceSink;
+use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
+use crate::state::{CandidatePixel, LatchedState, LayerId, PixelFlags, Scratch, WIDTH};
 
 /// Bytes per screenblock (32×32 tilemap entries × 2 bytes).
 const SCREENBLOCK_SIZE: u32 = 0x800;
@@ -162,12 +162,12 @@ pub fn render_text_scanline<S: ProvenanceSink>(
 
 #[cfg(test)]
 mod tests {
-    use crate::bus::Memory;
-    use crate::ppu::debug::provenance::SourceProvenance;
-    use crate::ppu::debug::sink::NullSink;
-    use crate::ppu::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-    use crate::ppu::state::{Color15, LayerId};
-    use crate::ppu::Ppu;
+    use crate::memory::TestMemory as Memory;
+    use crate::debug::provenance::SourceProvenance;
+    use crate::debug::sink::NullSink;
+    use crate::memory::{PALETTE_BASE, VRAM_BASE};
+    use crate::state::{Color15, LayerId};
+    use crate::TestPpu as Ppu;
 
     /// Write a 15-bit color into background palette entry `index`.
     fn set_palette(mem: &mut Memory, index: usize, color: u16) {
@@ -181,7 +181,7 @@ mod tests {
 
     fn render_line0(ppu: &mut Ppu, mem: &Memory) {
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(mem);
+        let view = mem.view();
         ppu.render_scanline(0, &view, &mut NullSink);
     }
 
@@ -319,7 +319,7 @@ mod tests {
         set_map_entry(&mut mem, 0, 1);
         mem.vram[0x4020] = 0x03; // texel 0 = 3
 
-        let view = PpuMemoryView::new(&mem);
+        let view = mem.view();
         let explanation = ppu.explain_current_pixel(0, 0, &view).unwrap();
         let bg0 = explanation.candidate_for(LayerId::Bg0).expect("BG0 candidate");
         match bg0.provenance {

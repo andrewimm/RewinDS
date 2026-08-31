@@ -18,7 +18,7 @@ pub use provenance::{
 };
 pub use sink::{NullSink, PixelRecorder, ProvenanceSink, ScanlineRecorder};
 
-use crate::ppu::state::LayerId;
+use crate::state::LayerId;
 
 /// A short, stable name for a layer, for text rendering of explanations.
 pub fn layer_name(layer: LayerId) -> &'static str {

@@ -5,9 +5,9 @@
 //! sprite-count/cycle limit and its rejections can be modeled and inspected
 //! without entangling them with texel sampling.
 
-use crate::ppu::debug::provenance::{ObjColorMode, ObjMode};
-use crate::ppu::memory::PpuMemoryView;
-use crate::ppu::state::LatchedState;
+use crate::debug::provenance::{ObjColorMode, ObjMode};
+use crate::memory::PpuMemoryView;
+use crate::state::LatchedState;
 
 /// A sprite found visible on the scanline being evaluated.
 #[derive(Clone, Copy, Debug)]

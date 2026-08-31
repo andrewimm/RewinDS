@@ -157,7 +157,7 @@ impl EffectResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ppu::state::PixelFlags;
+    use crate::state::PixelFlags;
 
     fn pixel(color: u16, layer: LayerId) -> CandidatePixel {
         CandidatePixel {

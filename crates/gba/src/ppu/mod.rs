@@ -8,20 +8,18 @@
 //! [`scanline`]. The renderer is driven from [`crate::machine`] at each visible
 //! line's HBlank via [`crate::bus::Bus::render_ppu_scanline`].
 
-pub mod bg;
-pub mod compositor;
-pub mod debug;
-pub mod effects;
+// Timing, register latching, the render orchestration, and the inspection API
+// stay here (they touch the scheduler, interrupts, and the aggregate). The pure
+// pixel pipeline lives in the `video2d` crate.
 pub mod inspect;
 pub mod latch;
-pub mod memory;
-pub mod obj;
-pub mod priority;
-pub mod registers;
 pub mod scanline;
-pub mod state;
 pub mod timing;
-pub mod window;
+
+// Re-export the shared renderer's modules so the existing `gba::ppu::{state,
+// registers, memory, debug, bg, obj, ...}` paths keep resolving for callers and
+// the debug crate.
+pub use video2d::{bg, compositor, debug, effects, memory, obj, priority, registers, state, window};
 
 use crate::event::{EventKind, PpuEvent};
 use crate::interrupt::InterruptController;
@@ -197,7 +195,7 @@ mod tests {
         mem.palette[0..2].copy_from_slice(&0x001Fu16.to_le_bytes());
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x001F));
         assert_eq!(ppu.framebuffer()[239], Color15(0x001F));
@@ -214,7 +212,7 @@ mod tests {
         mem.palette[0..2].copy_from_slice(&0x001Fu16.to_le_bytes()); // backdrop red
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x7FFF)); // white, not BG2 nor backdrop
         assert_eq!(ppu.framebuffer()[239], Color15(0x7FFF));
@@ -232,7 +230,7 @@ mod tests {
         mem.vram[off..off + 2].copy_from_slice(&0x03E0u16.to_le_bytes());
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[1], Color15(0x03E0));
     }
@@ -246,7 +244,7 @@ mod tests {
         let off = (5 * WIDTH + 10) * 2;
         mem.vram[off..off + 2].copy_from_slice(&0x7FFFu16.to_le_bytes());
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         let explanation = ppu.explain_current_pixel(10, 5, &view).unwrap();
         assert_eq!(explanation.final_color, Color15(0x7FFF));
         assert_eq!(explanation.video_mode, 3);
@@ -282,7 +280,7 @@ mod tests {
         mem.vram[1] = 0; // pixel (1,0) -> transparent
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
         assert_eq!(ppu.framebuffer()[1], Color15(0x7C00)); // transparent -> backdrop
@@ -299,7 +297,7 @@ mod tests {
         mem.vram[0] = 7; // frame 0 value, must be ignored
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x001F));
     }
@@ -314,7 +312,7 @@ mod tests {
         mem.vram[0..2].copy_from_slice(&0x03E0u16.to_le_bytes()); // pixel (0,0) = green
         ppu.latch_for_scanline();
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
         // x = 200 is beyond mode 5's 160-wide framebuffer -> backdrop.
@@ -337,7 +335,7 @@ mod tests {
         let off = 3 * WIDTH + 4; // pixel (4, 3)
         mem.vram[off] = 10;
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         let explanation = ppu.explain_current_pixel(4, 3, &view).unwrap();
         assert_eq!(explanation.final_color, Color15(0x7FFF));
         assert_eq!(explanation.video_mode, 4);
@@ -366,7 +364,7 @@ mod tests {
             mem.vram[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
         }
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         // x 0..4 all sample pixel 0 (red); x 4 begins a new block (its own color).
         for x in 0..4 {
@@ -386,7 +384,7 @@ mod tests {
         mem.vram[0..2].copy_from_slice(&0x0000u16.to_le_bytes()); // BG2 (0,0) black
 
         ppu.latch_for_scanline();
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         ppu.render_scanline(0, &view, &mut super::debug::sink::NullSink);
         assert_eq!(ppu.framebuffer()[0], Color15(0x7FFF)); // brightened black -> white
     }
@@ -396,7 +394,7 @@ mod tests {
     fn explain_rejects_out_of_range_pixel() {
         let mut ppu = Ppu::new();
         let mem = Memory::default();
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         assert!(matches!(
             ppu.explain_current_pixel(240, 0, &view),
             Err(debug::ExplainError::PixelOutsideFramebuffer { .. })

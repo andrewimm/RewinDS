@@ -11,7 +11,7 @@ use super::explain::{
     ScanlineStateExplanation, WindowExplanation,
 };
 use super::provenance::{RejectionReason, WindowRegion};
-use crate::ppu::state::{Color15, LayerId};
+use crate::state::{Color15, LayerId};
 
 /// The stages the renderer reports. Heavy payloads are passed as closures so a
 /// sink that ignores them pays nothing to build them.
@@ -82,7 +82,7 @@ impl PixelRecorder {
             result: Color15::default(),
         });
         let resolved = self.resolved.unwrap_or_else(|| {
-            let backdrop = crate::ppu::state::CandidatePixel::backdrop(effect.result);
+            let backdrop = crate::state::CandidatePixel::backdrop(effect.result);
             ResolvedExplanation {
                 top: backdrop,
                 second: backdrop,

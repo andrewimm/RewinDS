@@ -6,7 +6,7 @@
 //! never constructs them.
 
 use super::provenance::{BackgroundId, RejectionReason, SourceProvenance, WindowRegion};
-use crate::ppu::state::{CandidatePixel, Color15, LayerId};
+use crate::state::{CandidatePixel, Color15, LayerId};
 
 /// A frame identity, for the frame-indexed explain API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +149,6 @@ impl PixelExplanation {
 pub struct ScanlineExplanation {
     pub state: ScanlineStateExplanation,
     /// The sprites evaluated as visible on this scanline, in OAM order.
-    pub sprites: Vec<crate::ppu::obj::evaluate::SpriteInstance>,
+    pub sprites: Vec<crate::obj::evaluate::SpriteInstance>,
     pub final_line: Box<[Color15]>,
 }

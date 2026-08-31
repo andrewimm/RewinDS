@@ -215,7 +215,7 @@ mod tests {
         set_oam(&mut mem, 3, 0, 0, 1); // sprite 3, tile 1 at (0,0)
         mem.vram[0x10020] = 0x05;
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         let sprite = ppu.sprite_at(0, 0, &view).expect("sprite covers pixel");
         assert_eq!(sprite.oam_index, 3);
 
@@ -236,7 +236,7 @@ mod tests {
         set_oam(&mut mem, 0, 0, 0, 1); // on line 0
         set_oam(&mut mem, 1, 100, 0, 1); // Y=100, not on line 0
 
-        let view = PpuMemoryView::new(&mem);
+        let view = PpuMemoryView::new(&mem.vram, &mem.palette, &mem.oam);
         let sprites = ppu.sprites_on_scanline(0, &view);
         assert_eq!(sprites.len(), 1);
         assert_eq!(sprites[0].oam_index, 0);

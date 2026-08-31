@@ -3,7 +3,7 @@
 //!
 //! These are the lightweight types carried on the fast rendering path. They hold
 //! no provenance — a candidate pixel is just a color, a source layer, and a
-//! priority. The heavyweight explanation types live in [`crate::ppu::debug`] and
+//! priority. The heavyweight explanation types live in [`crate::debug`] and
 //! are only built when instrumentation is on.
 
 use super::debug::provenance::WindowRegion;

@@ -4,13 +4,13 @@
 //! candidates that flow through windowing, priority, and effects like any other
 //! source.
 
-use crate::ppu::debug::explain::CandidateExplanation;
-use crate::ppu::debug::provenance::{
+use crate::debug::explain::CandidateExplanation;
+use crate::debug::provenance::{
     BitmapBgProvenance, BitmapSample, RejectionReason, SourceProvenance,
 };
-use crate::ppu::debug::sink::ProvenanceSink;
-use crate::ppu::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::ppu::state::{CandidatePixel, Color15, LatchedState, LayerId, PixelFlags, Scratch, WIDTH};
+use crate::debug::sink::ProvenanceSink;
+use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
+use crate::state::{CandidatePixel, Color15, LatchedState, LayerId, PixelFlags, Scratch, WIDTH};
 
 /// The BG2 index into the scratch/priority machinery.
 const BG2: usize = 2;

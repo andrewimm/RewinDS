@@ -7,11 +7,11 @@
 //! bounding-box pixel through the affine matrix before sampling.
 
 use super::evaluate::{SpriteInstance, SpriteList};
-use crate::ppu::debug::explain::CandidateExplanation;
-use crate::ppu::debug::provenance::{ObjColorMode, ObjMode, ObjProvenance, SourceProvenance};
-use crate::ppu::debug::sink::ProvenanceSink;
-use crate::ppu::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
-use crate::ppu::state::{CandidatePixel, LatchedState, LayerId, ObjLine, PixelFlags, WIDTH};
+use crate::debug::explain::CandidateExplanation;
+use crate::debug::provenance::{ObjColorMode, ObjMode, ObjProvenance, SourceProvenance};
+use crate::debug::sink::ProvenanceSink;
+use crate::memory::{PpuMemoryView, PALETTE_BASE, VRAM_BASE};
+use crate::state::{CandidatePixel, LatchedState, LayerId, ObjLine, PixelFlags, WIDTH};
 
 /// VRAM offset of the OBJ character (tile) region.
 const OBJ_TILE_BASE: u32 = 0x1_0000;
@@ -208,11 +208,11 @@ pub fn rasterize<S: ProvenanceSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::Memory;
-    use crate::ppu::debug::provenance::ObjColorMode;
-    use crate::ppu::debug::sink::NullSink;
-    use crate::ppu::registers::Registers;
-    use crate::ppu::state::{LatchedState, ObjLine};
+    use crate::memory::TestMemory as Memory;
+    use crate::debug::provenance::ObjColorMode;
+    use crate::debug::sink::NullSink;
+    use crate::registers::Registers;
+    use crate::state::{LatchedState, ObjLine};
 
     fn square_sprite(size: u16, obj_mode: ObjMode) -> SpriteInstance {
         SpriteInstance {
@@ -243,7 +243,7 @@ mod tests {
     fn obj_window_sprite_sets_mask_not_color() {
         let mut mem = Memory::default();
         mem.vram[0x10000] = 0x05; // tile 0, texel (0,0) opaque
-        let view = PpuMemoryView::new(&mem);
+        let view = mem.view();
         let regs = Registers {
             dispcnt: (1 << 12) | (1 << 6),
             ..Default::default()

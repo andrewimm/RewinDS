@@ -356,7 +356,7 @@ impl Bus {
     /// so the borrow checker splits them — the renderer reads VRAM/palette/OAM
     /// through a read-only view while the PPU owns the framebuffer it writes.
     pub fn render_ppu_scanline(&mut self) {
-        let view = PpuMemoryView::new(&self.memory);
+        let view = PpuMemoryView::new(&self.memory.vram, &self.memory.palette, &self.memory.oam);
         self.io.video.render_current_scanline(&view);
     }
 
@@ -366,13 +366,13 @@ impl Bus {
         x: u16,
         y: u16,
     ) -> Result<PixelExplanation, ExplainError> {
-        let view = PpuMemoryView::new(&self.memory);
+        let view = PpuMemoryView::new(&self.memory.vram, &self.memory.palette, &self.memory.oam);
         self.io.video.explain_current_pixel(x, y, &view)
     }
 
     /// A whole-scanline debug summary (same split borrow).
     pub fn inspect_scanline(&mut self, y: u16) -> ScanlineExplanation {
-        let view = PpuMemoryView::new(&self.memory);
+        let view = PpuMemoryView::new(&self.memory.vram, &self.memory.palette, &self.memory.oam);
         self.io.video.inspect_scanline(y, &view)
     }
 
@@ -383,7 +383,7 @@ impl Bus {
         &mut self,
         f: impl FnOnce(&mut crate::ppu::Ppu, &PpuMemoryView<'_>) -> R,
     ) -> R {
-        let view = PpuMemoryView::new(&self.memory);
+        let view = PpuMemoryView::new(&self.memory.vram, &self.memory.palette, &self.memory.oam);
         f(&mut self.io.video, &view)
     }
 
