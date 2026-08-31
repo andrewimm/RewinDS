@@ -226,8 +226,12 @@ pub struct Cpu {
     data_access: bool,
     /// The architecture variant this core implements. Gates the ARMv5TE-only
     /// behaviours (interworking rules, and trapping v5 instructions as undefined on
-    /// ARMv4T). ARM7 cores keep the default [`ArmVersion::Armv4T`].
+    /// ArmV4T). ARM7 cores keep the default [`ArmVersion::Armv4T`].
     version: ArmVersion,
+    /// Base address the exception vectors are relative to: `0` for the low vectors
+    /// (`0x0000_0000`), or `0xFFFF_0000` for the high vectors an ARMv5 core selects
+    /// through its coprocessor. The machine keeps this in sync.
+    exception_base: u32,
 }
 
 impl Default for Cpu {
@@ -258,7 +262,14 @@ impl Cpu {
             sequential: false,
             data_access: false,
             version,
+            exception_base: 0,
         }
+    }
+
+    /// Set the exception-vector base (`0` = low vectors; `0xFFFF_0000` = high
+    /// vectors). Driven by the machine from CP15 on an ARMv5 core.
+    pub fn set_exception_base(&mut self, base: u32) {
+        self.exception_base = base;
     }
 
     /// The architecture variant this core implements.
@@ -1112,7 +1123,7 @@ impl Cpu {
         if disable_fiq {
             self.cpsr.set_fiq_disabled(true);
         }
-        self.r[15] = vector;
+        self.r[15] = self.exception_base.wrapping_add(vector);
         self.branched = true;
         self.sequential = false;
     }

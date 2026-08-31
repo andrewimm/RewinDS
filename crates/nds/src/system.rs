@@ -371,6 +371,16 @@ impl System {
     /// Execute one instruction on `core` against its view of the machine, first
     /// accepting a pending interrupt at the boundary if the core allows it.
     fn step_core(&mut self, core: Core) {
+        // The ARM9 selects high exception vectors (0xFFFF0000) through CP15; keep
+        // the core's base in sync so SWIs/IRQs reach the BIOS handlers.
+        if core == Core::Arm9 {
+            let base = if self.machine.cp15.high_exception_vectors() {
+                0xFFFF_0000
+            } else {
+                0
+            };
+            self.arm9.set_exception_base(base);
+        }
         let asserted = self.machine.interrupts[core.index()].line_asserted();
         let cpu = match core {
             Core::Arm9 => &mut self.arm9,
