@@ -6,7 +6,7 @@
 //! window is enabled in `DISPCNT`, every layer is visible everywhere.
 
 use super::debug::provenance::WindowRegion;
-use super::state::{LatchedState, ObjLine, WindowLine, WindowMask, WIDTH};
+use super::state::{LatchedState, ObjLine, WindowLine, WindowMask, HEIGHT, WIDTH};
 
 /// Expand the six per-region enable bits (BG0-3, OBJ, effects) into a mask.
 fn mask_from_bits(bits: u16) -> WindowMask {
@@ -22,17 +22,23 @@ fn mask_from_bits(bits: u16) -> WindowMask {
     }
 }
 
-/// Whether `coord` lies in the half-open span `[start, end)` packed into a window
-/// bound register (`start` in the high byte, `end` in the low byte). A span whose
-/// start exceeds its end wraps around, matching hardware.
-fn in_span(coord: u16, bound: u16) -> bool {
-    let start = bound >> 8;
-    let end = bound & 0xFF;
-    if start <= end {
-        coord >= start && coord < end
-    } else {
-        coord >= start || coord < end
+/// Whether `coord` lies in the half-open span packed into a window bound register:
+/// the first coordinate (leftmost/topmost) in the high byte, the second (rightmost
+/// or bottom-most, *plus one*) in the low byte.
+///
+/// Per GBATEK, a second coordinate past the screen edge (`X2>240` / `Y2>160`), or a
+/// first coordinate greater than the second (`X1>X2` / `Y1>Y2`), is a garbage value
+/// that hardware reinterprets as the second coordinate being the screen edge: the
+/// window then spans `[first, edge)`. Crucially it does **not** wrap around to zero —
+/// an earlier version modelled `first > second` as a wrapping span, which hid whole
+/// backgrounds whenever a game (e.g. Pokémon, Advance Wars) programmed such a bound.
+fn in_span(coord: u16, bound: u16, edge: u16) -> bool {
+    let first = bound >> 8;
+    let mut second = bound & 0xFF;
+    if second > edge || first > second {
+        second = edge;
     }
+    coord >= first && coord < second
 }
 
 /// Resolve the window mask for every pixel of scanline `y`.
@@ -49,17 +55,17 @@ pub fn compute_line(y: u16, state: &LatchedState, obj: &ObjLine, out: &mut Windo
         return;
     }
 
-    let win0_row = win0_on && in_span(y, regs.win_v[0]);
-    let win1_row = win1_on && in_span(y, regs.win_v[1]);
+    let win0_row = win0_on && in_span(y, regs.win_v[0], HEIGHT as u16);
+    let win1_row = win1_on && in_span(y, regs.win_v[1], HEIGHT as u16);
     let win0_mask = mask_from_bits(regs.winin & 0x3F);
     let win1_mask = mask_from_bits((regs.winin >> 8) & 0x3F);
     let outside_mask = mask_from_bits(regs.winout & 0x3F);
     let objwin_mask = mask_from_bits((regs.winout >> 8) & 0x3F);
 
     for x in 0..WIDTH {
-        let (region, mask) = if win0_row && in_span(x as u16, regs.win_h[0]) {
+        let (region, mask) = if win0_row && in_span(x as u16, regs.win_h[0], WIDTH as u16) {
             (WindowRegion::Win0, win0_mask)
-        } else if win1_row && in_span(x as u16, regs.win_h[1]) {
+        } else if win1_row && in_span(x as u16, regs.win_h[1], WIDTH as u16) {
             (WindowRegion::Win1, win1_mask)
         } else if objwin_on && obj.window[x] {
             (WindowRegion::ObjWindow, objwin_mask)
@@ -81,15 +87,24 @@ mod tests {
     use crate::ppu::Ppu;
 
     #[test]
-    fn in_span_covers_normal_and_wrapping_bounds() {
+    fn in_span_normal_bounds() {
         // Normal span [10, 20).
-        assert!(in_span(15, (10 << 8) | 20));
-        assert!(!in_span(20, (10 << 8) | 20));
-        assert!(!in_span(9, (10 << 8) | 20));
-        // Wrapping span: start 200 > end 30 -> [200, 256) U [0, 30).
-        assert!(in_span(220, (200 << 8) | 30));
-        assert!(in_span(10, (200 << 8) | 30));
-        assert!(!in_span(100, (200 << 8) | 30));
+        assert!(in_span(15, (10 << 8) | 20, 240));
+        assert!(!in_span(20, (10 << 8) | 20, 240));
+        assert!(!in_span(9, (10 << 8) | 20, 240));
+    }
+
+    #[test]
+    fn in_span_garbage_bounds_clamp_to_edge_not_wrap() {
+        // first (200) > second (30): hardware clamps second to the edge, giving
+        // [200, 240) — it does NOT wrap around to also cover [0, 30).
+        assert!(in_span(220, (200 << 8) | 30, 240)); // inside [200, 240)
+        assert!(in_span(239, (200 << 8) | 30, 240)); // still inside up to the edge
+        assert!(!in_span(10, (200 << 8) | 30, 240)); // would be covered by a wrap; must not be
+        assert!(!in_span(100, (200 << 8) | 30, 240));
+        // second past the edge is likewise clamped: [5, 240).
+        assert!(in_span(200, (5 << 8) | 250, 240));
+        assert!(!in_span(4, (5 << 8) | 250, 240));
     }
 
     #[test]

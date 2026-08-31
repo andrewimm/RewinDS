@@ -116,8 +116,12 @@ impl Registers {
             0x02A | 0x03A => Self::write_ref(&mut self.bg_ref_x[Self::affine_index(offset)], value, mask, true),
             0x02C | 0x03C => Self::write_ref(&mut self.bg_ref_y[Self::affine_index(offset)], value, mask, false),
             0x02E | 0x03E => Self::write_ref(&mut self.bg_ref_y[Self::affine_index(offset)], value, mask, true),
-            0x040 | 0x044 => self.win_h[((offset - 0x040) / 4) as usize] = merge(self.win_h[((offset - 0x040) / 4) as usize], value, mask),
-            0x042 | 0x046 => self.win_v[((offset - 0x042) / 4) as usize] = merge(self.win_v[((offset - 0x042) / 4) as usize], value, mask),
+            // Window bounds are grouped by axis, not by window: both horizontal
+            // registers precede both vertical ones (WIN0H, WIN1H, WIN0V, WIN1V).
+            0x040 => self.win_h[0] = merge(self.win_h[0], value, mask),
+            0x042 => self.win_h[1] = merge(self.win_h[1], value, mask),
+            0x044 => self.win_v[0] = merge(self.win_v[0], value, mask),
+            0x046 => self.win_v[1] = merge(self.win_v[1], value, mask),
             0x048 => self.winin = merge(self.winin, value, mask),
             0x04A => self.winout = merge(self.winout, value, mask),
             0x04C => self.mosaic = merge(self.mosaic, value, mask),
@@ -140,5 +144,25 @@ impl Registers {
             0x052 => self.bldalpha,
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Window bound registers are laid out by axis (WIN0H, WIN1H, WIN0V, WIN1V),
+    /// not interleaved by window. A prior mapping swapped WIN1H with WIN0V, which
+    /// blanked whole scanlines whenever a game (e.g. FireRed's letterboxed intro)
+    /// used WIN1's horizontal bound.
+    #[test]
+    fn window_bounds_route_by_axis() {
+        let mut r = Registers::default();
+        r.write16(0x040, 0x1122, 0xFFFF); // WIN0H
+        r.write16(0x042, 0x3344, 0xFFFF); // WIN1H
+        r.write16(0x044, 0x5566, 0xFFFF); // WIN0V
+        r.write16(0x046, 0x7788, 0xFFFF); // WIN1V
+        assert_eq!(r.win_h, [0x1122, 0x3344]);
+        assert_eq!(r.win_v, [0x5566, 0x7788]);
     }
 }
