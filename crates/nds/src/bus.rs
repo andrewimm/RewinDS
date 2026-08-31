@@ -10,7 +10,7 @@
 use arm::cpu::{Bus, Timed};
 use emu_core::{Scheduler, Timestamp};
 
-use crate::memory::Core;
+use crate::memory::{is_vram, Core};
 use crate::system::{Machine, NdsEvent};
 
 /// One core's view of the DS machine for a single interpreter step. The shared
@@ -48,6 +48,9 @@ impl NdsCpuBus<'_> {
         if is_io(address) {
             return self.machine.io_read(self.core, address, bytes);
         }
+        if is_vram(address) {
+            return self.machine.vram.read(address, bytes);
+        }
         let (mem, cp15) = (&self.machine.memory, &self.machine.cp15);
         match bytes {
             1 => mem.read8(self.core, address, instruction, cp15) as u32,
@@ -60,6 +63,10 @@ impl NdsCpuBus<'_> {
         if is_io(address) {
             self.machine
                 .io_write(self.core, address, value, bytes, self.scheduler);
+            return;
+        }
+        if is_vram(address) {
+            self.machine.vram.write(address, value, bytes);
             return;
         }
         // `memory` and `cp15` are disjoint fields, so the mutable memory borrow

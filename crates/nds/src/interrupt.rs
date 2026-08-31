@@ -18,6 +18,10 @@ pub enum IrqSource {
     Timer1 = 4,
     Timer2 = 5,
     Timer3 = 6,
+    Dma0 = 8,
+    Dma1 = 9,
+    Dma2 = 10,
+    Dma3 = 11,
     /// IPCSYNC remote-triggered interrupt.
     IpcSync = 16,
     /// The local send FIFO became empty (with its IRQ enabled).

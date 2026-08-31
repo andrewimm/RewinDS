@@ -32,6 +32,12 @@ impl Core {
     }
 }
 
+/// Whether an address falls in the `0x0600_0000` VRAM region (routed through the
+/// bank-mapping engine rather than this module's stores).
+pub const fn is_vram(addr: u32) -> bool {
+    addr >> 24 == 0x06
+}
+
 pub const MAIN_RAM: usize = 4 * 1024 * 1024;
 pub const SHARED_WRAM: usize = 32 * 1024;
 pub const ARM7_WRAM: usize = 64 * 1024;

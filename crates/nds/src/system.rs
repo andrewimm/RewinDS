@@ -17,10 +17,12 @@ use arm::cpu::{ArmVersion, Cpu};
 use emu_core::{EventContext, EventHandler, Scheduler, Timestamp};
 
 use crate::bus::NdsCpuBus;
+use crate::dma::Dma;
 use crate::interrupt::Interrupts;
 use crate::ipc::Ipc;
-use crate::memory::Core;
+use crate::memory::{is_vram, Core};
 use crate::timer::{TimerId, Timers};
+use crate::vram::Vram;
 use crate::{Cp15, Memory};
 
 /// Events on the shared DS timeline.
@@ -44,6 +46,9 @@ pub struct Machine {
     pub(crate) interrupts: [Interrupts; 2],
     /// Per-core timer banks, indexed by [`Core::index`].
     pub(crate) timers: [Timers; 2],
+    /// Per-core DMA controllers, indexed by [`Core::index`].
+    pub(crate) dma: [Dma; 2],
+    pub(crate) vram: Vram,
     pub(crate) ipc: Ipc,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
@@ -58,8 +63,57 @@ impl Machine {
             cp15: Cp15::new(),
             interrupts: [Interrupts::new(), Interrupts::new()],
             timers: [Timers::new(Core::Arm9), Timers::new(Core::Arm7)],
+            dma: [Dma::new(), Dma::new()],
+            vram: Vram::new(),
             ipc: Ipc::new(),
             clock: [0; 2],
+        }
+    }
+
+    /// A DMA/CPU data read through `core`'s map. VRAM routes through the bank
+    /// engine; instruction-fetch TCM rules do not apply.
+    pub(crate) fn data_read(&self, core: Core, addr: u32, bytes: u32) -> u32 {
+        if is_vram(addr) {
+            return self.vram.read(addr, bytes);
+        }
+        match bytes {
+            1 => self.memory.read8(core, addr, false, &self.cp15) as u32,
+            2 => self.memory.read16(core, addr, false, &self.cp15) as u32,
+            _ => self.memory.read32(core, addr, false, &self.cp15),
+        }
+    }
+
+    /// The write counterpart to [`Self::data_read`].
+    pub(crate) fn data_write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
+        if is_vram(addr) {
+            self.vram.write(addr, value, bytes);
+            return;
+        }
+        match bytes {
+            1 => self.memory.write8(core, addr, value as u8, &self.cp15),
+            2 => self.memory.write16(core, addr, value as u16, &self.cp15),
+            _ => self.memory.write32(core, addr, value, &self.cp15),
+        }
+    }
+
+    /// Run a DMA channel's transfer to completion as a bus master on `core`.
+    fn run_dma_channel(&mut self, core: Core, channel: usize) {
+        let c = core.index();
+        let ch = self.dma[c].channels[channel]; // config snapshot
+        let bytes = ch.unit_bytes();
+        let source_step = ch.source_step();
+        let dest_step = ch.dest_step();
+        let mut source = ch.internal_source();
+        let mut dest = ch.internal_dest();
+        for _ in 0..ch.internal_count() {
+            let value = self.data_read(core, source, bytes);
+            self.data_write(core, dest, value, bytes);
+            source = source.wrapping_add(source_step);
+            dest = dest.wrapping_add(dest_step);
+        }
+        self.dma[c].channels[channel].complete(source, dest);
+        if ch.irq_on_end() {
+            self.interrupts[c].request(crate::dma::irq_source(channel));
         }
     }
 
@@ -79,6 +133,11 @@ impl Machine {
                 (_, true) => control,
                 (_, false) => counter,
             };
+        }
+        // DMA registers: 0x40000B0..0x40000E0 (four channels, 12 bytes each).
+        if (0x0400_00B0..0x0400_00E0).contains(&addr) {
+            let control = self.dma[c].read_register(addr & 0xFF) as u32;
+            return if bytes == 4 { control << 16 } else { control };
         }
         match addr {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
@@ -117,6 +176,38 @@ impl Machine {
             }
             return;
         }
+        // DMA registers: writing DMAxCNT_H may arm an immediate transfer, which
+        // runs to completion here.
+        if (0x0400_00B0..0x0400_00E0).contains(&addr) {
+            let base = addr & 0xFF;
+            let armed = if bytes == 4 {
+                self.dma[c].write_register(base, value as u16);
+                self.dma[c].write_register(base + 2, (value >> 16) as u16)
+            } else {
+                self.dma[c].write_register(base, value as u16)
+            };
+            if let Some(channel) = armed {
+                self.run_dma_channel(core, channel);
+            }
+            return;
+        }
+        // The VRAMCNT_A..I block (with WRAMCNT sharing address 0x4000247), all
+        // byte registers on the ARM9. Decompose to bytes so any access width works.
+        if core == Core::Arm9 && (0x0400_0240..0x0400_024A).contains(&addr) {
+            for i in 0..bytes {
+                let a = addr + i;
+                let byte = (value >> (8 * i)) as u8;
+                match a {
+                    0x0400_0247 => self.memory.wramcnt = byte & 3,
+                    _ => {
+                        if let Some(bank) = vramcnt_bank(a) {
+                            self.vram.set_control(bank, byte);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         match addr {
             0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self.ipc.write_fifocnt(core, value as u16, &mut self.interrupts),
@@ -124,9 +215,19 @@ impl Machine {
             0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
             0x0400_0210 => self.interrupts[c].set_ie(value),
             0x0400_0214 => self.interrupts[c].acknowledge(value),
-            0x0400_0247 if core == Core::Arm9 => self.memory.wramcnt = value as u8 & 3,
             _ => {}
         }
+    }
+}
+
+/// The VRAM block a `VRAMCNT` address configures (A–G at `0x4000240`-`246`, then
+/// `0x4000247` is WRAMCNT, and H/I at `0x4000248`/`249`).
+fn vramcnt_bank(addr: u32) -> Option<usize> {
+    match addr {
+        0x0400_0240..=0x0400_0246 => Some((addr - 0x0400_0240) as usize), // A–G
+        0x0400_0248 => Some(7),                                           // H
+        0x0400_0249 => Some(8),                                           // I
+        _ => None,
     }
 }
 
@@ -247,6 +348,15 @@ impl System {
     /// Perform an I/O read as `core` would.
     pub fn io_read(&mut self, core: Core, addr: u32, bytes: u32) -> u32 {
         self.machine.io_read(core, addr, bytes)
+    }
+
+    /// Read memory/VRAM as `core`'s CPU would (I/O routes to [`Self::io_read`]).
+    pub fn read(&mut self, core: Core, addr: u32, bytes: u32) -> u32 {
+        if (0x0400_0000..0x0500_0000).contains(&addr) {
+            self.machine.io_read(core, addr, bytes)
+        } else {
+            self.machine.data_read(core, addr, bytes)
+        }
     }
 }
 
@@ -395,6 +505,71 @@ mod tests {
         system.run_until(64);
         let timer1 = system.io_read(Core::Arm9, 0x0400_0104, 2);
         assert!(timer1 >= 4, "timer1 cascaded to {timer1}");
+    }
+
+    #[test]
+    fn immediate_dma_copies_main_ram_on_both_cores() {
+        use crate::IrqSource;
+        // DMA0 registers: SAD 0x40000B0, DAD 0x40000B4, CNT_L 0x40000B8, CNT_H 0x40000BA.
+        // Control for a 32-bit, immediate, IRQ-on-end, enabled transfer:
+        const CNT_H: u32 = (1 << 15) | (1 << 14) | (1 << 10);
+
+        let run_on = |core: Core, src: u32, dst: u32| {
+            let mut system = System::new();
+            // Seed four words at the source.
+            let seed = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+            for (i, w) in seed.iter().enumerate() {
+                system.io_write(core, 0x0400_0210, IrqSource::Dma0.mask(), 4); // IE (idempotent)
+                system.memory().main[(src as usize & 0x3F_FFFF) + i * 4..][..4]
+                    .copy_from_slice(&w.to_le_bytes());
+            }
+            system.io_write(core, 0x0400_0208, 1, 4); // IME
+            system.io_write(core, 0x0400_00B0, src, 4); // SAD
+            system.io_write(core, 0x0400_00B4, dst, 4); // DAD
+            system.io_write(core, 0x0400_00B8, 4, 2); // count = 4 words
+            system.io_write(core, 0x0400_00BA, CNT_H, 2); // control -> runs now
+            system
+        };
+
+        // Copy 0x0200_0000 -> 0x0200_1000 on each core independently.
+        for core in [Core::Arm9, Core::Arm7] {
+            let mut system = run_on(core, 0x0200_0000, 0x0200_1000);
+            for i in 0..4u32 {
+                let word = u32::from_le_bytes(
+                    system.memory().main[0x1000 + i as usize * 4..][..4].try_into().unwrap(),
+                );
+                assert_eq!(word, [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444][i as usize]);
+            }
+            // Completion raised the DMA0 interrupt and disabled the channel.
+            assert_eq!(system.interrupts(core).iflags(), IrqSource::Dma0.mask());
+            assert_eq!(system.io_read(core, 0x0400_00BA, 2) & (1 << 15), 0);
+        }
+    }
+
+    #[test]
+    fn dma_transfers_main_ram_into_engine_a_bg_vram() {
+        // Configure VRAM block A as 2D Engine-A BG VRAM at 0x0600_0000, then DMA a
+        // small tile pattern from Main RAM into it — the point where DMA and the
+        // VRAM bank engine meet.
+        let mut system = System::new();
+        system.io_write(Core::Arm9, 0x0400_0240, 0x80 | 1, 1); // VRAMCNT_A: enable, MST 1
+
+        let pattern = [0x0A0A_0A0Au32, 0x0B0B_0B0B, 0x0C0C_0C0C, 0x0D0D_0D0D];
+        for (i, w) in pattern.iter().enumerate() {
+            system.memory().main[0x2000 + i * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        system.io_write(Core::Arm9, 0x0400_00B0, 0x0200_2000, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0600_0000, 4); // DAD -> Engine-A BG VRAM
+        system.io_write(Core::Arm9, 0x0400_00B8, 4, 2); // 4 words
+        system.io_write(Core::Arm9, 0x0400_00BA, (1 << 15) | (1 << 10), 2); // enable, 32-bit, immediate
+
+        // The words landed in VRAM (via block A) and read back through the map.
+        for (i, w) in pattern.iter().enumerate() {
+            assert_eq!(system.read(Core::Arm9, 0x0600_0000 + i as u32 * 4, 4), *w);
+        }
+        // Re-routing block A to LCDC exposes the same bytes at its LCDC address.
+        system.io_write(Core::Arm9, 0x0400_0240, 0x80, 1); // MST 0
+        assert_eq!(system.read(Core::Arm9, 0x0680_0000, 4), pattern[0]);
     }
 
     #[test]
