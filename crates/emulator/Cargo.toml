@@ -6,4 +6,5 @@ description = "Console-agnostic emulator facade (GBA today, NDS next) with an FF
 
 [dependencies]
 gba = { path = "../gba" }
+nds = { path = "../nds" }
 ringbuf = "0.4"

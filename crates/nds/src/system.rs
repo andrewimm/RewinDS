@@ -21,6 +21,7 @@ use crate::dma::Dma;
 use crate::interrupt::Interrupts;
 use crate::ipc::Ipc;
 use crate::memory::{is_vram, Core};
+use crate::ppu::{Ppu, PpuEvent};
 use crate::timer::{TimerId, Timers};
 use crate::vram::Vram;
 use crate::{Cp15, Memory};
@@ -35,6 +36,8 @@ pub enum NdsEvent {
         timer: TimerId,
         generation: u32,
     },
+    /// A 2D-engine scanline boundary (line start or H-blank).
+    Ppu(PpuEvent),
 }
 
 /// Everything reachable through the bus: the memory image, CP15, the per-core
@@ -49,6 +52,7 @@ pub struct Machine {
     /// Per-core DMA controllers, indexed by [`Core::index`].
     pub(crate) dma: [Dma; 2],
     pub(crate) vram: Vram,
+    pub(crate) ppu: Ppu,
     pub(crate) ipc: Ipc,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
@@ -65,6 +69,7 @@ impl Machine {
             timers: [Timers::new(Core::Arm9), Timers::new(Core::Arm7)],
             dma: [Dma::new(), Dma::new()],
             vram: Vram::new(),
+            ppu: Ppu::new(),
             ipc: Ipc::new(),
             clock: [0; 2],
         }
@@ -140,6 +145,9 @@ impl Machine {
             return if bytes == 4 { control << 16 } else { control };
         }
         match addr {
+            0x0400_0000 => self.ppu.dispcnt(),
+            0x0400_0004 => self.ppu.read_dispstat(c) as u32,
+            0x0400_0006 => self.ppu.vcount() as u32,
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0208 => self.interrupts[c].ime() as u32,
@@ -209,6 +217,8 @@ impl Machine {
             return;
         }
         match addr {
+            0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(value, bytes),
+            0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
             0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self.ipc.write_fifocnt(core, value as u16, &mut self.interrupts),
             0x0400_0188 => self.ipc.send(core, value, &mut self.interrupts),
@@ -238,6 +248,10 @@ impl EventHandler<NdsEvent> for Machine {
                 let c = core.index();
                 // `timers[c]` and `interrupts[c]` are disjoint fields.
                 self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
+            }
+            NdsEvent::Ppu(event) => {
+                // `ppu`, `interrupts`, and `vram` are disjoint fields.
+                self.ppu.handle_event(event, &mut self.interrupts, &self.vram, ctx);
             }
         }
     }
@@ -334,6 +348,34 @@ impl System {
         cpu.step(&mut bus);
     }
 
+    /// Begin the PPU's continuous scanline schedule (idempotent).
+    pub fn start_video(&mut self) {
+        self.machine.ppu.start(&mut self.scheduler);
+    }
+
+    /// Run until the 2D engine completes one frame (into the next V-blank).
+    pub fn run_frame(&mut self) {
+        self.start_video();
+        let start = self.machine.ppu.frame();
+        for _ in 0..(crate::ppu::HEIGHT as u64 + 100) {
+            if self.machine.ppu.frame() != start {
+                break;
+            }
+            let target = self.scheduler.now() + crate::ppu::CYCLES_PER_LINE;
+            self.run_until(target);
+        }
+    }
+
+    /// Engine A's current output image, in BGR555.
+    pub fn framebuffer(&self) -> &[u16] {
+        self.machine.ppu.framebuffer()
+    }
+
+    /// The completed-frame counter.
+    pub fn frame(&self) -> u64 {
+        self.machine.ppu.frame()
+    }
+
     /// A core's interrupt controller, for inspection and test setup.
     pub fn interrupts(&self, core: Core) -> &Interrupts {
         &self.machine.interrupts[core.index()]
@@ -356,6 +398,15 @@ impl System {
             self.machine.io_read(core, addr, bytes)
         } else {
             self.machine.data_read(core, addr, bytes)
+        }
+    }
+
+    /// Write memory/VRAM as `core`'s CPU would (I/O routes to [`Self::io_write`]).
+    pub fn write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
+        if (0x0400_0000..0x0500_0000).contains(&addr) {
+            self.io_write(core, addr, value, bytes);
+        } else {
+            self.machine.data_write(core, addr, value, bytes);
         }
     }
 }
@@ -570,6 +621,39 @@ mod tests {
         // Re-routing block A to LCDC exposes the same bytes at its LCDC address.
         system.io_write(Core::Arm9, 0x0400_0240, 0x80, 1); // MST 0
         assert_eq!(system.read(Core::Arm9, 0x0680_0000, 4), pattern[0]);
+    }
+
+    #[test]
+    fn vblank_fires_on_both_cores_and_vram_display_renders() {
+        use crate::IrqSource;
+        let mut system = System::new();
+        // Both cores enable the V-blank interrupt (DISPSTAT bit 3) and arm.
+        for core in [Core::Arm9, Core::Arm7] {
+            system.io_write(core, 0x0400_0004, 1 << 3, 2); // DISPSTAT: VBlank IRQ enable
+            system.io_write(core, 0x0400_0210, IrqSource::VBlank.mask(), 4); // IE
+            system.io_write(core, 0x0400_0208, 1, 4); // IME
+        }
+        // Engine A in VRAM-display mode (DISPCNT bits 16-17 = 2) showing block A;
+        // block A mapped as LCDC and seeded with a gradient.
+        system.io_write(Core::Arm9, 0x0400_0240, 0x80, 1); // VRAMCNT_A: enable, MST 0 (LCDC)
+        for i in 0..(crate::ppu::WIDTH * crate::ppu::HEIGHT) {
+            system.write(Core::Arm9, 0x0680_0000 + i as u32 * 2, (i & 0x7FFF) as u32, 2);
+        }
+        system.io_write(Core::Arm9, 0x0400_0000, 2 << 16, 4); // DISPCNT: VRAM display, block A
+
+        system.run_frame();
+
+        // One frame completed; VCOUNT wrapped back into the visible region.
+        assert_eq!(system.frame(), 1);
+        assert!(system.io_read(Core::Arm9, 0x0400_0006, 2) as u16 <= 263);
+        // The V-blank interrupt reached both cores.
+        assert_eq!(system.interrupts(Core::Arm9).iflags(), IrqSource::VBlank.mask());
+        assert_eq!(system.interrupts(Core::Arm7).iflags(), IrqSource::VBlank.mask());
+        // The framebuffer holds the blitted gradient.
+        let fb = system.framebuffer();
+        assert_eq!(fb[0], 0);
+        assert_eq!(fb[100], 100);
+        assert_eq!(fb[0x1234], 0x1234);
     }
 
     #[test]

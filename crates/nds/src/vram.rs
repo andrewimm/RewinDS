@@ -58,6 +58,14 @@ impl Vram {
         self.vramcnt[bank]
     }
 
+    /// Read a 16-bit value directly from a block's storage (bank 0=A … 8=I),
+    /// bypassing the CPU map — used by the display controller (VRAM display mode).
+    pub fn block_read16(&self, bank: usize, offset: usize) -> u16 {
+        let s = &self.banks[bank];
+        let mask = s.len() - 1;
+        u16::from_le_bytes([s[offset & mask], s[(offset + 1) & mask]])
+    }
+
     pub fn read(&self, addr: u32, bytes: u32) -> u32 {
         match self.resolve(addr) {
             Some((bank, off)) => {

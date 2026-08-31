@@ -151,8 +151,12 @@ pub struct Load<'a> {
 }
 
 /// Either console, behind one surface.
+// The two machines differ in size, but the facade is held once and long-lived,
+// so the variance costs nothing worth an extra indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum Emulator {
     Gba(GbaEmulator),
+    Nds(NdsEmulator),
 }
 
 impl Emulator {
@@ -174,7 +178,10 @@ impl Emulator {
                 system.cpu.set_pc(0);
                 Ok(Emulator::Gba(GbaEmulator::new(system)))
             }
-            Console::Nds => Err(LoadError::Unsupported(Console::Nds)),
+            // A bare DS: the machine and its two-screen presentation exist and run,
+            // but there is no cartridge boot path yet (that lands with M2.4), so it
+            // runs no guest code — the screens present the 2D engine's output.
+            Console::Nds => Ok(Emulator::Nds(NdsEmulator::new(nds::System::new()))),
         }
     }
 
@@ -182,6 +189,7 @@ impl Emulator {
     pub fn console(&self) -> Console {
         match self {
             Emulator::Gba(_) => Console::Gba,
+            Emulator::Nds(_) => Console::Nds,
         }
     }
 
@@ -191,6 +199,7 @@ impl Emulator {
     pub fn run_frame(&mut self) {
         match self {
             Emulator::Gba(g) => g.run_frame(),
+            Emulator::Nds(n) => n.run_frame(),
         }
     }
 
@@ -198,6 +207,8 @@ impl Emulator {
     pub fn set_input(&mut self, input: Input) {
         match self {
             Emulator::Gba(g) => g.set_input(input),
+            // DS input (keypad + touch via the ARM7) is not wired yet.
+            Emulator::Nds(_) => {}
         }
     }
 
@@ -206,16 +217,19 @@ impl Emulator {
     pub fn set_audio_muted(&mut self, muted: bool) {
         match self {
             Emulator::Gba(g) => g.audio_muted = muted,
+            Emulator::Nds(_) => {}
         }
     }
 
     /// Attach a host audio output at `output_rate` Hz with `channels` channels,
     /// returning the consumer the host drains on its audio thread. Replaces any
-    /// previous attachment.
+    /// previous attachment. (The DS audio pipeline is not implemented yet, so an
+    /// NDS returns a consumer that only ever underruns to silence.)
     pub fn enable_audio(&mut self, output_rate: u32, channels: usize) -> AudioSource {
         let (sink, source) = audio::channel(output_rate, channels);
         match self {
             Emulator::Gba(g) => g.audio = Some(sink),
+            Emulator::Nds(_) => drop(sink),
         }
         source
     }
@@ -224,6 +238,7 @@ impl Emulator {
     pub fn screen_count(&self) -> usize {
         match self {
             Emulator::Gba(_) => 1,
+            Emulator::Nds(_) => 2,
         }
     }
 
@@ -236,6 +251,11 @@ impl Emulator {
                 height: gba_screen::HEIGHT as u32,
                 rgba: &g.rgba,
             }),
+            Emulator::Nds(n) => (index < 2).then(|| Screen {
+                width: nds::ppu::WIDTH as u32,
+                height: nds::ppu::HEIGHT as u32,
+                rgba: &n.rgba[index],
+            }),
         }
     }
 
@@ -245,6 +265,7 @@ impl Emulator {
     pub fn save_data(&self) -> &[u8] {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.backup_bytes(),
+            Emulator::Nds(_) => &[],
         }
     }
 
@@ -252,6 +273,7 @@ impl Emulator {
     pub fn load_save_data(&mut self, data: &[u8]) {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.load_backup(data),
+            Emulator::Nds(_) => {}
         }
     }
 
@@ -260,6 +282,7 @@ impl Emulator {
     pub fn save_dirty(&self) -> bool {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.backup_dirty(),
+            Emulator::Nds(_) => false,
         }
     }
 
@@ -267,6 +290,7 @@ impl Emulator {
     pub fn clear_save_dirty(&mut self) {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.clear_backup_dirty(),
+            Emulator::Nds(_) => {}
         }
     }
 
@@ -274,6 +298,7 @@ impl Emulator {
     pub fn save_type_name(&self) -> &'static str {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.save_type().name(),
+            Emulator::Nds(_) => "none",
         }
     }
 
@@ -288,6 +313,7 @@ impl Emulator {
                 }
                 None => false,
             },
+            Emulator::Nds(_) => false,
         }
     }
 
@@ -298,6 +324,7 @@ impl Emulator {
     pub fn as_gba(&self) -> Option<&gba::System> {
         match self {
             Emulator::Gba(g) => Some(&g.system),
+            Emulator::Nds(_) => None,
         }
     }
 
@@ -305,6 +332,7 @@ impl Emulator {
     pub fn as_gba_mut(&mut self) -> Option<&mut gba::System> {
         match self {
             Emulator::Gba(g) => Some(&mut g.system),
+            Emulator::Nds(_) => None,
         }
     }
 
@@ -313,8 +341,45 @@ impl Emulator {
     pub fn into_gba(self) -> Option<gba::System> {
         match self {
             Emulator::Gba(g) => Some(g.system),
+            Emulator::Nds(_) => None,
         }
     }
+}
+
+/// A DS behind the facade: the system plus its two RGBA present buffers (top =
+/// Engine A; bottom is black until Engine B lands).
+pub struct NdsEmulator {
+    system: nds::System,
+    rgba: [Vec<u8>; 2],
+}
+
+impl NdsEmulator {
+    fn new(system: nds::System) -> Self {
+        NdsEmulator {
+            system,
+            rgba: [
+                vec![0; nds::ppu::WIDTH * nds::ppu::HEIGHT * 4],
+                vec![0; nds::ppu::WIDTH * nds::ppu::HEIGHT * 4],
+            ],
+        }
+    }
+
+    fn run_frame(&mut self) {
+        self.system.run_frame();
+        // Top screen from Engine A's BGR555 framebuffer; bottom stays black.
+        for (px, &color) in self.rgba[0].as_chunks_mut::<4>().0.iter_mut().zip(self.system.framebuffer()) {
+            *px = bgr555_to_rgba8(color);
+        }
+    }
+}
+
+/// Convert a BGR555 pixel to RGBA8.
+fn bgr555_to_rgba8(color: u16) -> [u8; 4] {
+    let r = (color & 0x1F) as u8;
+    let g = ((color >> 5) & 0x1F) as u8;
+    let b = ((color >> 10) & 0x1F) as u8;
+    // Scale 5-bit to 8-bit by replicating the high bits into the low.
+    [(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), 255]
 }
 
 /// GBA screen dimensions.
@@ -434,13 +499,23 @@ mod tests {
     }
 
     #[test]
-    fn nds_is_recognised_but_unsupported() {
-        let result = Emulator::load(Load {
+    fn nds_boots_bare_and_presents_two_screens() {
+        let mut emu = Emulator::load(Load {
             console: Some(Console::Nds),
             rom: None,
             bios: None,
-        });
-        assert!(matches!(result, Err(LoadError::Unsupported(Console::Nds))));
+        })
+        .expect("bare NDS");
+        assert_eq!(emu.console(), Console::Nds);
+        assert_eq!(emu.screen_count(), 2);
+        emu.run_frame();
+        for i in 0..2 {
+            let screen = emu.screen(i).expect("screen");
+            assert_eq!(screen.width, 256);
+            assert_eq!(screen.height, 192);
+            assert_eq!(screen.rgba.len(), 256 * 192 * 4);
+        }
+        assert!(emu.screen(2).is_none());
     }
 
     #[test]
