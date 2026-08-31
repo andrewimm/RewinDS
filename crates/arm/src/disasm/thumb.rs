@@ -171,12 +171,14 @@ pub fn format_thumb(inst: &ThumbInstruction) -> String {
 
         ThumbInstruction::LongBranchLink {
             second_half,
+            exchange,
             offset,
         } => {
             // Each halfword is shown on its own; the PC-aware API combines the
-            // two into a single resolved `bl <target>`.
+            // two into a single resolved `bl`/`blx <target>`.
+            let mnem = if *exchange { "blx" } else { "bl" };
             let half = if *second_half { "low" } else { "high" };
-            format!("bl\t({half}) #0x{offset:03x}")
+            format!("{mnem}\t({half}) #0x{offset:03x}")
         }
 
         ThumbInstruction::Undefined { raw } => format!(".hword\t0x{raw:04x}"),

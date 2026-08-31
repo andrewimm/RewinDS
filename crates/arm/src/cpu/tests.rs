@@ -573,6 +573,66 @@ fn dsp_multiply_traps_as_undefined_on_v4t() {
 }
 
 #[test]
+fn blx_register_switches_state_and_links() {
+    use super::ArmVersion::Armv5TE;
+    // blx r2 — target bit0 selects Thumb; LR = instruction+4.
+    let thumb = run_one(Armv5TE, 0xE12F_FF32, &[(2, 0x41)]);
+    assert_eq!(thumb.register(15), 0x40);
+    assert!(thumb.cpsr().thumb());
+    assert_eq!(thumb.register(14), 4);
+    let arm = run_one(Armv5TE, 0xE12F_FF32, &[(2, 0x80)]);
+    assert_eq!(arm.register(15), 0x80);
+    assert!(!arm.cpsr().thumb());
+}
+
+#[test]
+fn blx_register_traps_on_v4t() {
+    let cpu = run_one(super::ArmVersion::Armv4T, 0xE12F_FF32, &[(2, 0x40)]);
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+    assert_ne!(cpu.register(15), 0x40); // did not branch
+}
+
+#[test]
+fn blx_immediate_links_and_enters_thumb() {
+    // blx #+ : offset 8, so PC = (0+8) + 8 = 0x10; always switches to Thumb.
+    let cpu = run_one(super::ArmVersion::Armv5TE, 0xFA00_0002, &[]);
+    assert_eq!(cpu.register(15), 0x10);
+    assert!(cpu.cpsr().thumb());
+    assert_eq!(cpu.register(14), 4);
+}
+
+#[test]
+fn blx_immediate_is_nop_on_v4t() {
+    // cond == 1111 is never-execute on ARMv4T: the instruction does nothing.
+    let cpu = run_one(super::ArmVersion::Armv4T, 0xFA00_0002, &[(14, 0x999)]);
+    assert_eq!(cpu.register(15), 4); // just advanced to the next instruction
+    assert!(!cpu.cpsr().thumb());
+    assert_eq!(cpu.register(14), 0x999); // LR untouched
+}
+
+#[test]
+fn bkpt_enters_abort_on_v5_and_traps_on_v4t() {
+    let v5 = run_one(super::ArmVersion::Armv5TE, 0xE120_0070, &[]);
+    assert_eq!(v5.mode(), Some(Mode::Abort));
+    assert_eq!(v5.register(15), 0x0C); // prefetch-abort vector
+    let v4 = run_one(super::ArmVersion::Armv4T, 0xE120_0070, &[]);
+    assert_eq!(v4.mode(), Some(Mode::Undefined));
+}
+
+#[test]
+fn thumb_blx_switches_back_to_arm() {
+    // bx into Thumb at 0x100, run the BL/BLX pair, land back in ARM.
+    let mut bus = TestBus::new(0x200);
+    bus.load(0, &[0xE12F_FF10]); // bx r0
+    bus.load_thumb(0x100, &[0xF000, 0xE800]); // first half + BLX second half
+    let mut cpu = Cpu::with_version(super::ArmVersion::Armv5TE);
+    cpu.set_register(0, 0x101); // Thumb, address 0x100
+    run_to(&mut cpu, &mut bus, 0x104, 10);
+    assert!(!cpu.cpsr().thumb()); // switched to ARM
+    assert_eq!(cpu.register(15), 0x104);
+}
+
+#[test]
 fn cpu_version_defaults_to_v4t_and_selects_v5() {
     use super::ArmVersion;
     assert_eq!(Cpu::new().version(), ArmVersion::Armv4T);

@@ -172,6 +172,8 @@ pub enum ThumbInstruction {
     /// raw 11-bit field is kept; the interpreter combines the two halves.
     LongBranchLink {
         second_half: bool,
+        /// The second half is `BLX` (switch to ARM) rather than `BL`. ARMv5-only.
+        exchange: bool,
         offset: u16,
     },
 

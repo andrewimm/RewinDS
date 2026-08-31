@@ -17,21 +17,37 @@
 use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
-    ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros,
-    DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind, HalfwordMultiply, HalfwordOffset,
-    HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, SaturatingArithmetic,
-    SaturatingOp, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, BranchLinkExchange,
+    Breakpoint, CountLeadingZeros, DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind,
+    HalfwordMultiply, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
+    SaturatingArithmetic, SaturatingOp, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
 /// Decode a 32-bit ARM instruction word.
 pub fn decode_arm(raw: u32) -> ArmInstruction {
-    let condition = Condition::decode(raw >> 28);
-    let operation = decode_operation(raw);
-    ArmInstruction {
-        condition,
-        operation,
+    // `cond == 1111` is the ARMv5 unconditional-instruction space (BLX <label>,
+    // PLD, …). On ARMv4T it means "never execute", so anything here that we do not
+    // model stays a NOP via the `Nv` condition.
+    if raw >> 28 == 0xF {
+        return if (raw >> 25) & 0b111 == 0b101 {
+            ArmInstruction { condition: Condition::Al, operation: decode_blx_immediate(raw) }
+        } else {
+            // PLD and reserved hints: never-execute keeps them NOP on both cores.
+            ArmInstruction { condition: Condition::Nv, operation: ArmOperation::Undefined { raw } }
+        };
     }
+    ArmInstruction {
+        condition: Condition::decode(raw >> 28),
+        operation: decode_operation(raw),
+    }
+}
+
+/// `BLX <label>`: `1111 101H imm24` — a link-and-exchange PC-relative branch. The
+/// 24-bit offset is sign-extended and scaled by 4; the `H` bit adds a halfword.
+fn decode_blx_immediate(raw: u32) -> ArmOperation {
+    let offset = ((raw << 8) as i32 >> 6) | (((raw >> 24) & 1) as i32) << 1;
+    ArmOperation::BranchLinkExchange(BranchLinkExchange { offset })
 }
 
 /// Classify and decode the operation portion of an ARM word (everything below
@@ -39,6 +55,8 @@ pub fn decode_arm(raw: u32) -> ArmInstruction {
 fn decode_operation(raw: u32) -> ArmOperation {
     if matches_branch_exchange(raw) {
         decode_branch_exchange(raw)
+    } else if matches_breakpoint(raw) {
+        decode_breakpoint(raw)
     } else if matches_clz(raw) {
         decode_clz(raw)
     } else if matches_saturating(raw) {
@@ -75,9 +93,15 @@ fn decode_operation(raw: u32) -> ArmOperation {
 // reference give these bit patterns; the masks below encode them directly.
 // ---------------------------------------------------------------------------
 
-/// `BX Rn`: `cond 0001 0010 1111 1111 1111 0001 Rn`.
+/// `BX`/`BLX Rn`: `cond 0001 0010 1111 1111 1111 00L1 Rn` (`L` = bit 5, masked out
+/// here so both match; the decoder reads it for the link).
 fn matches_branch_exchange(raw: u32) -> bool {
-    (raw & 0x0FFF_FFF0) == 0x012F_FF10
+    (raw & 0x0FFF_FFD0) == 0x012F_FF10
+}
+
+/// `BKPT`: `cond 0001 0010 imm12 0111 imm4` (ARMv5).
+fn matches_breakpoint(raw: u32) -> bool {
+    (raw & 0x0FF0_00F0) == 0x0120_0070
 }
 
 /// `CLZ Rd,Rm`: `cond 0001 0110 1111 Rd 1111 0001 Rm` (ARMv5).
@@ -390,7 +414,13 @@ fn decode_branch(raw: u32) -> ArmOperation {
 fn decode_branch_exchange(raw: u32) -> ArmOperation {
     ArmOperation::BranchExchange(BranchExchange {
         rn: Register::new(raw as u8),
+        link: raw & (1 << 5) != 0,
     })
+}
+
+fn decode_breakpoint(raw: u32) -> ArmOperation {
+    let comment = (((raw >> 8) & 0xFFF) << 4) | (raw & 0xF);
+    ArmOperation::Breakpoint(Breakpoint { comment: comment as u16 })
 }
 
 fn decode_swi_or_coprocessor(raw: u32) -> ArmOperation {
@@ -749,6 +779,7 @@ mod tests {
             decode_arm(0xE12F_FF1E).operation,
             ArmOperation::BranchExchange(BranchExchange {
                 rn: Register::new(14),
+                link: false,
             })
         );
     }

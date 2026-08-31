@@ -57,6 +57,8 @@ pub fn format_arm(inst: &ArmInstruction) -> String {
         ArmOperation::Swap(op) => format_swap(op, cond),
         ArmOperation::Branch(op) => format_branch(op, cond),
         ArmOperation::BranchExchange(op) => format_branch_exchange(op, cond),
+        ArmOperation::BranchLinkExchange(op) => format!("blx\t#{}", op.offset),
+        ArmOperation::Breakpoint(op) => format!("bkpt\t#0x{:04x}", op.comment),
         ArmOperation::SoftwareInterrupt(op) => format_software_interrupt(op, cond),
         ArmOperation::Mrs(op) => format_mrs(op, cond),
         ArmOperation::Msr(op) => format_msr(op, cond),
@@ -294,7 +296,8 @@ fn format_branch(op: &Branch, cond: &str) -> String {
 }
 
 fn format_branch_exchange(op: &BranchExchange, cond: &str) -> String {
-    format!("bx{cond}\t{}", reg(op.rn))
+    let mnem = if op.link { "blx" } else { "bx" };
+    format!("{mnem}{cond}\t{}", reg(op.rn))
 }
 
 fn format_software_interrupt(op: &SoftwareInterrupt, cond: &str) -> String {

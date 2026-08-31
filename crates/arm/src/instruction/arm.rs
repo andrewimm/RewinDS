@@ -37,6 +37,8 @@ pub enum ArmOperation {
 
     Branch(Branch),
     BranchExchange(BranchExchange),
+    BranchLinkExchange(BranchLinkExchange),
+    Breakpoint(Breakpoint),
 
     SoftwareInterrupt(SoftwareInterrupt),
 
@@ -66,6 +68,8 @@ impl ArmOperation {
             self,
             ArmOperation::Branch(_)
                 | ArmOperation::BranchExchange(_)
+                | ArmOperation::BranchLinkExchange(_)
+                | ArmOperation::Breakpoint(_)
                 | ArmOperation::SoftwareInterrupt(_)
         )
     }
@@ -81,6 +85,8 @@ impl ArmOperation {
         match self {
             ArmOperation::Branch(_)
             | ArmOperation::BranchExchange(_)
+            | ArmOperation::BranchLinkExchange(_)
+            | ArmOperation::Breakpoint(_)
             | ArmOperation::SoftwareInterrupt(_) => true,
 
             // Result-writing operations redirect execution only when their
@@ -408,10 +414,27 @@ pub struct Branch {
     pub offset: i32,
 }
 
-/// `BX` — branch and exchange instruction set (ARM <-> Thumb).
+/// `BX` / `BLX Rn` — branch and exchange instruction set (ARM <-> Thumb). `BLX`
+/// also saves the return address in LR and is ARMv5-only (traps on ARMv4T).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BranchExchange {
     pub rn: Register,
+    /// The `L` bit: `BLX` saves a return address (`BX` does not).
+    pub link: bool,
+}
+
+/// `BLX <label>` — PC-relative branch-with-link that switches to Thumb. ARMv5-only;
+/// a no-op on ARMv4T (it lives in the `cond == 1111` never-execute space). The
+/// offset already folds in the encoding's `<< 2` and the halfword (`H`) bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchLinkExchange {
+    pub offset: i32,
+}
+
+/// `BKPT` — software breakpoint; enters the Prefetch Abort vector. ARMv5-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Breakpoint {
+    pub comment: u16,
 }
 
 /// `SWI` — software interrupt.
@@ -467,7 +490,7 @@ mod tests {
                 link: true,
                 offset: 0,
             }),
-            ArmOperation::BranchExchange(BranchExchange { rn: Register::LR }),
+            ArmOperation::BranchExchange(BranchExchange { rn: Register::LR, link: false }),
             ArmOperation::SoftwareInterrupt(SoftwareInterrupt { comment: 0 }),
         ] {
             assert!(op.is_control_flow());

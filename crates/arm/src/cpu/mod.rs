@@ -17,10 +17,11 @@ pub use bus::{Bus, Timed};
 use crate::condition::Condition;
 use crate::decode::{decode_arm, decode_thumb};
 use crate::instruction::arm::{
-    ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros, DataProcessing,
-    DataProcessingOpcode, DspMulOp, HalfwordKind, HalfwordMultiply, HalfwordOffset,
-    HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, Operand2, SaturatingArithmetic,
-    SaturatingOp, ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    ArmOperation, BlockTransfer, Branch, BranchExchange, BranchLinkExchange, Breakpoint,
+    CountLeadingZeros, DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind,
+    HalfwordMultiply, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong,
+    Operand2, SaturatingArithmetic, SaturatingOp, ShiftKind, ShiftSource, SingleOffset,
+    SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -419,6 +420,8 @@ impl Cpu {
             ArmOperation::DataProcessing(op) => self.execute_data_processing(op),
             ArmOperation::Branch(op) => self.execute_branch(op),
             ArmOperation::BranchExchange(op) => self.execute_branch_exchange(op),
+            ArmOperation::BranchLinkExchange(op) => self.execute_blx_immediate(op),
+            ArmOperation::Breakpoint(op) => self.execute_breakpoint(op),
             ArmOperation::SingleTransfer(op) => self.execute_single_transfer(op, bus),
             ArmOperation::HalfwordTransfer(op) => self.execute_halfword_transfer(op, bus),
             ArmOperation::BlockTransfer(op) => self.execute_block_transfer(op, bus),
@@ -834,9 +837,38 @@ impl Cpu {
     }
 
     fn execute_branch_exchange(&mut self, bx: BranchExchange) {
+        // `BLX Rn` is ARMv5-only; on ARMv4T the encoding is undefined.
+        if bx.link && !self.version.is_v5() {
+            return self.execute_undefined();
+        }
         let target = self.reg(bx.rn);
+        if bx.link {
+            self.set_reg(Register::LR, self.r[15].wrapping_add(4));
+        }
         self.cpsr.set_thumb(target & 1 != 0);
         self.set_reg(Register::PC, target & !1);
+    }
+
+    /// `BLX <label>` (ARMv5): branch-with-link into Thumb. On ARMv4T it sits in the
+    /// never-execute (`cond == 1111`) space and is simply a NOP.
+    fn execute_blx_immediate(&mut self, op: BranchLinkExchange) {
+        if !self.version.is_v5() {
+            return;
+        }
+        self.set_reg(Register::LR, self.r[15].wrapping_add(4));
+        // Read PC (with the ARM +8 pipeline offset) before switching to Thumb.
+        let target = self.reg(Register::PC).wrapping_add(op.offset as u32);
+        self.cpsr.set_thumb(true);
+        self.set_reg(Register::PC, target);
+    }
+
+    /// `BKPT` (ARMv5): take the Prefetch Abort exception. Undefined on ARMv4T.
+    fn execute_breakpoint(&mut self, _op: Breakpoint) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        let return_address = self.r[15].wrapping_add(4);
+        self.enter_exception(0x0C, Mode::Abort, return_address, false);
     }
 
     fn execute_data_processing(&mut self, op: DataProcessing) {

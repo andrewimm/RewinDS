@@ -177,18 +177,28 @@ impl Cpu {
                 let target = self.reg(Register::PC).wrapping_add(offset as u32);
                 self.set_reg(Register::PC, target);
             }
-            LongBranchLink { second_half, offset } => {
-                if !second_half {
+            LongBranchLink { second_half, exchange, offset } => {
+                if exchange && !self.version.is_v5() {
+                    // Thumb `BLX` is ARMv5-only; undefined on the ARM7TDMI.
+                    let return_address = self.r[15].wrapping_add(2);
+                    self.enter_exception(0x04, Mode::Undefined, return_address, false);
+                } else if !second_half {
                     // First half: LR = (PC+4) + sign_extend(offset) << 12.
                     let high = (((offset as u32) << 21) as i32 >> 21) << 12;
                     let lr = self.reg(Register::PC).wrapping_add(high as u32);
                     self.set_reg(Register::LR, lr);
                 } else {
                     // Second half: branch to LR + (offset << 1); LR = return | 1.
+                    // `BLX` switches to ARM and forces word alignment.
                     let target = self.reg(Register::LR).wrapping_add((offset as u32) << 1);
                     let return_address = self.r[15].wrapping_add(2) | 1;
                     self.set_reg(Register::LR, return_address);
-                    self.set_reg(Register::PC, target);
+                    if exchange {
+                        self.cpsr.set_thumb(false);
+                        self.set_reg(Register::PC, target & !3);
+                    } else {
+                        self.set_reg(Register::PC, target);
+                    }
                 }
             }
             Undefined { .. } => {

@@ -80,9 +80,8 @@ pub fn decode_thumb(raw: u16) -> ThumbInstruction {
         }
         0b111 => match (raw >> 11) & 0b11 {
             0b00 => decode_unconditional_branch(raw), // 11100
-            0b10 | 0b11 => decode_long_branch_link(raw), // 11110 / 11111
-            0b01 => ThumbInstruction::Undefined { raw }, // 11101 — BLX, ARMv5 only
-            _ => unreachable!(),
+            // 11110 = first half; 11111 = BL, 11101 = BLX (ARMv5) second halves.
+            _ => decode_long_branch_link(raw),
         },
         _ => unreachable!(),
     }
@@ -363,8 +362,11 @@ fn decode_unconditional_branch(raw: u16) -> ThumbInstruction {
 /// Format 19 — long branch with link. Bit 11 selects the half; the raw 11-bit
 /// field is kept for the interpreter to combine across the two halves.
 fn decode_long_branch_link(raw: u16) -> ThumbInstruction {
+    // Opcode bits [12:11]: 10 = first half; 11 = BL second half; 01 = BLX second.
+    let opcode = (raw >> 11) & 0b11;
     ThumbInstruction::LongBranchLink {
-        second_half: raw & (1 << 11) != 0,
+        second_half: opcode != 0b10,
+        exchange: opcode == 0b01,
         offset: raw & 0x7FF,
     }
 }
@@ -383,11 +385,11 @@ mod tests {
 
     #[test]
     fn undefined_spaces_decode_to_undefined() {
-        // BLX space, bits 15..11 = 11101, is ARMv5-only.
-        let blx = 0b1110_1000_0000_0000;
+        // BLX space (bits 15..11 = 11101) decodes as a BLX second half; it is the
+        // interpreter that traps it as undefined on an ARMv4T core.
         assert_eq!(
-            decode_thumb(blx),
-            ThumbInstruction::Undefined { raw: blx }
+            decode_thumb(0b1110_1000_0000_0000),
+            ThumbInstruction::LongBranchLink { second_half: true, exchange: true, offset: 0 }
         );
         // Conditional-branch slot with the reserved cond == 1110.
         let reserved_cond = 0b1101_1110_0000_0000;
@@ -810,6 +812,7 @@ mod tests {
             decode_thumb(0xF123),
             ThumbInstruction::LongBranchLink {
                 second_half: false,
+                exchange: false,
                 offset: 0x123,
             }
         );
@@ -818,6 +821,7 @@ mod tests {
             decode_thumb(0xFC56),
             ThumbInstruction::LongBranchLink {
                 second_half: true,
+                exchange: false,
                 offset: 0x456,
             }
         );
