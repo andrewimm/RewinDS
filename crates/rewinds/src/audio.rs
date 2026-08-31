@@ -69,11 +69,11 @@ impl Audio {
         let dst_rate = config.sample_rate().0 as f64;
         let channels = config.channels() as usize;
         if channels != 2 {
-            eprintln!("audio: default output is not stereo ({channels} channels); running silent");
+            log::warn!("audio: default output is not stereo ({channels} channels); running silent");
             return None;
         }
         if config.sample_format() != cpal::SampleFormat::F32 {
-            eprintln!("audio: unsupported sample format {:?}; running silent", config.sample_format());
+            log::warn!("audio: unsupported sample format {:?}; running silent", config.sample_format());
             return None;
         }
 
@@ -88,13 +88,13 @@ impl Audio {
                     let got = consumer.pop_slice(data);
                     data[got..].fill(0.0); // underrun -> silence
                 },
-                |e| eprintln!("audio stream error: {e}"),
+                |e| log::error!("audio stream error: {e}"),
                 None,
             )
             .ok()?;
         stream.play().ok()?;
 
-        eprintln!("audio: {dst_rate} Hz stereo output");
+        log::info!("audio: {dst_rate} Hz stereo output");
         Some(Audio {
             _stream: stream,
             producer,

@@ -251,6 +251,12 @@ impl System {
         self.gba.bus.io.apu.take_samples()
     }
 
+    /// Audio clip metering since the last call: (samples clamped, peak pre-clamp
+    /// magnitude). A peak above 32767 means the mix is clipping.
+    pub fn audio_clip_stats(&mut self) -> (u64, f64) {
+        self.gba.bus.io.apu.clip_stats()
+    }
+
     /// Run the machine until the PPU completes the current frame (its 160 visible
     /// scanlines have all been drawn, at the start of the vertical blank). Starts
     /// the LCD if it is not already running. After this returns, [`Self::framebuffer`]

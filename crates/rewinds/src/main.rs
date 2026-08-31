@@ -8,6 +8,7 @@
 //! [`System::run_frame`], [`System::framebuffer`], and the key map below.
 
 mod audio;
+mod logging;
 
 use gba::{Cartridge, Key as Button, SaveType, System};
 use minifb::{Key, Scale, Window, WindowOptions};
@@ -33,6 +34,8 @@ const KEY_MAP: &[(Key, Button)] = &[
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
+    logging::init();
+
     // Parse args: positional bios [rom], plus optional --debug-port <port>.
     let mut positional = Vec::new();
     let mut debug_port = None;
@@ -71,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             system.gba.bus.cartridge.load_backup(&bytes);
         }
         let save_type = system.gba.bus.cartridge.save_type();
-        eprintln!("cartridge save: {} ({} bytes)", save_type.name(), save_type.backup_size());
+        log::info!("cartridge save: {} ({} bytes)", save_type.name(), save_type.backup_size());
         save_paths = Some((sav, meta));
     }
 
@@ -109,6 +112,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             system.set_key(button, window.is_key_down(host));
         }
 
+        // Debug mix mutes: F1 = DirectSound, F2 = PSG.
+        if window.is_key_pressed(Key::F1, minifb::KeyRepeat::No) {
+            let muted = system.gba.bus.io.apu.toggle_mute_directsound();
+            log::info!("DirectSound {}", if muted { "muted" } else { "unmuted" });
+        }
+        if window.is_key_pressed(Key::F2, minifb::KeyRepeat::No) {
+            let muted = system.gba.bus.io.apu.toggle_mute_psg();
+            log::info!("PSG {}", if muted { "muted" } else { "unmuted" });
+        }
+        // F3 = A/B the output low-pass filter.
+        if window.is_key_pressed(Key::F3, minifb::KeyRepeat::No) {
+            let on = system.gba.bus.io.apu.toggle_low_pass();
+            log::info!("low-pass filter {}", if on { "on" } else { "off" });
+        }
+
         system.run_frame();
 
         if let Some(a) = audio.as_mut() {
@@ -136,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some((sav, meta)) = &save_paths {
         if system.gba.bus.cartridge.backup_dirty() {
             if let Err(e) = write_save(sav, meta, &system.gba.bus.cartridge) {
-                eprintln!("warning: could not write save {}: {e}", sav.display());
+                log::warn!("could not write save {}: {e}", sav.display());
             }
         }
     }

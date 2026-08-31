@@ -837,6 +837,7 @@ dependencies = [
  "cpal",
  "debug",
  "gba",
+ "log",
  "minifb",
  "ringbuf",
 ]

@@ -394,10 +394,12 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             json!({"ie": irq.ie(), "if": irq.iflags(), "ime": irq.ime(), "pending": irq.pending()})
         }
         "audio.take" => {
+            let (clipped, raw_peak) = system.audio_clip_stats();
             let samples = system.take_audio();
             let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
             let nonzero = samples.iter().filter(|&&s| s != 0).count();
-            json!({"count": samples.len(), "peak": peak, "nonzero": nonzero})
+            json!({"count": samples.len(), "peak": peak, "nonzero": nonzero,
+                   "clipped": clipped, "rawPeak": raw_peak})
         }
         "input.set" => {
             let name = params.get("key").and_then(Value::as_str).unwrap_or("");

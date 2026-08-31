@@ -16,6 +16,7 @@ pub mod keypad;
 pub mod machine;
 pub mod ppu;
 pub mod prefetch;
+pub mod psg;
 pub mod serial;
 pub mod system;
 pub mod timer;

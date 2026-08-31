@@ -13,11 +13,28 @@
 //! mixer samples the latched values at the output rate (a scheduler event),
 //! appending interleaved stereo `i16` frames to an output buffer the host drains.
 
+use crate::psg::Psg;
 use emu_core::Timestamp;
 
 /// Emitted output sample rate. The CPU runs at 2^24 Hz, so one sample every 512
 /// cycles is 32768 Hz — the GBA's typical `SOUNDBIAS` output rate.
 pub const SAMPLE_RATE: u32 = 32_768;
+/// PSG base cycles spanned by one output sample (2^22 Hz / 32768).
+const PSG_CYCLES_PER_SAMPLE: i32 = 128;
+
+/// Mix gains, chosen to bring DirectSound and the PSG to comparable per-channel
+/// loudness (matching hardware, where a full DirectSound channel and a full PSG
+/// channel are similar) at the natural register levels. `DS_GAIN` keeps
+/// DirectSound at the level that already sounded right.
+const DS_GAIN: i32 = 48;
+const PSG_GAIN: i32 = 96;
+/// DC-blocking high-pass coefficient: cutoff ≈ 4 Hz at 32768 Hz, removing the
+/// offset the PSG's unipolar output (and any DirectSound bias) would add.
+const DC_BLOCK_R: f64 = 0.9992;
+/// One-pole output low-pass coefficient: cutoff ≈ 8.4 kHz at 32768 Hz. Stands in
+/// for the GBA's analog output filter, shaving the harsh high-frequency imaging
+/// our zero-order-hold resampling produces.
+const LOW_PASS_ALPHA: f64 = 0.80;
 /// CPU cycles between emitted samples.
 pub const CYCLES_PER_SAMPLE: Timestamp = 16_777_216 / SAMPLE_RATE as u64;
 
@@ -87,15 +104,28 @@ impl Fifo {
 /// The audio processing unit.
 #[derive(Clone, Debug)]
 pub struct Apu {
-    /// Sound control/PSG registers `0x060..0x090` (readback + DirectSound synth
-    /// source). PSG synthesis is not yet modeled; these are retained for reads.
+    /// DirectSound/bias control registers `0x082..0x090` (readback + synth source).
     regs: [u8; 0x30],
-    /// Channel 3 wave RAM `0x090..0x0A0`.
-    wave_ram: [u8; 0x10],
+    /// The four Game Boy PSG channels (registers `0x060..0x082` + wave RAM).
+    psg: Psg,
     fifo: [Fifo; 2],
     /// The latched current output of each DirectSound channel (updated on the
     /// channel's timer overflow, held between overflows).
     latch: [i8; 2],
+    /// DC-blocking filter state (previous input/output) per output channel.
+    dc_x: [f64; 2],
+    dc_y: [f64; 2],
+    /// Output low-pass filter state per channel, and whether it is engaged.
+    lp_y: [f64; 2],
+    low_pass_on: bool,
+    /// Debug mutes for isolating the mix; the channels still advance so
+    /// unmuting doesn't glitch.
+    mute_directsound: bool,
+    mute_psg: bool,
+    /// Clip metering since the last drain: how many samples exceeded the i16
+    /// range (and were clamped), and the peak pre-clamp magnitude.
+    clip_count: u64,
+    raw_peak: f64,
     /// Interleaved stereo output frames awaiting the host.
     buffer: Vec<i16>,
 }
@@ -104,9 +134,17 @@ impl Default for Apu {
     fn default() -> Self {
         Apu {
             regs: [0; 0x30],
-            wave_ram: [0; 0x10],
+            psg: Psg::new(),
             fifo: Default::default(),
             latch: [0; 2],
+            dc_x: [0.0; 2],
+            dc_y: [0.0; 2],
+            lp_y: [0.0; 2],
+            low_pass_on: true,
+            mute_directsound: false,
+            mute_psg: false,
+            clip_count: 0,
+            raw_peak: 0.0,
             buffer: Vec::new(),
         }
     }
@@ -132,13 +170,12 @@ impl Apu {
     /// Read a 16-bit sound register (`offset` relative to `0x4000000`).
     pub fn read16(&self, offset: u32) -> u16 {
         match offset {
-            0x060..=0x08F => {
+            0x060..=0x081 | 0x090..=0x09F => self.psg.read16(offset),
+            // NR52: our master-enable bit plus the PSG channel-on status bits.
+            0x084 => (self.soundcnt_x() & X_MASTER_ENABLE) | self.psg.status_bits(),
+            0x082..=0x08F => {
                 let i = (offset - 0x060) as usize;
                 u16::from_le_bytes([self.regs[i], self.regs[i + 1]])
-            }
-            0x090..=0x09F => {
-                let i = (offset - 0x090) as usize;
-                u16::from_le_bytes([self.wave_ram[i], self.wave_ram[i + 1]])
             }
             _ => 0, // FIFOs are write-only
         }
@@ -148,7 +185,8 @@ impl Apu {
     /// [`Apu::write_fifo`]; this handles the control/PSG block and wave RAM.
     pub fn write16(&mut self, offset: u32, value: u16, mask: u16) {
         match offset {
-            0x060..=0x08F => {
+            0x060..=0x081 | 0x090..=0x09F => self.psg.write16(offset, value, mask),
+            0x082..=0x08F => {
                 let i = (offset - 0x060) as usize;
                 let cur = u16::from_le_bytes([self.regs[i], self.regs[i + 1]]);
                 let merged = (cur & !mask) | (value & mask);
@@ -166,12 +204,6 @@ impl Apu {
                         self.regs[0x23] &= !((H_DSB_RESET >> 8) as u8);
                     }
                 }
-            }
-            0x090..=0x09F => {
-                let i = (offset - 0x090) as usize;
-                let cur = u16::from_le_bytes([self.wave_ram[i], self.wave_ram[i + 1]]);
-                let merged = (cur & !mask) | (value & mask);
-                self.wave_ram[i..i + 2].copy_from_slice(&merged.to_le_bytes());
             }
             _ => {}
         }
@@ -204,30 +236,81 @@ impl Apu {
         refill
     }
 
-    /// Emit one interleaved stereo frame from the current channel state.
+    /// Emit one interleaved stereo frame: advance the PSG one output sample and
+    /// mix it with the DirectSound channels, then DC-block and clamp.
     pub fn generate_sample(&mut self) {
-        let (left, right) = self.mix();
-        self.buffer.push(left);
-        self.buffer.push(right);
+        let (mut pl, mut pr) = self.psg.step_sample(PSG_CYCLES_PER_SAMPLE);
+        if self.mute_psg {
+            (pl, pr) = (0, 0);
+        }
+        let (mut raw_l, mut raw_r) = (0i32, 0i32);
+        if self.master_enabled() {
+            let (dl, dr) = if self.mute_directsound { (0, 0) } else { self.directsound() };
+            // SOUNDCNT_H bits 0-1 attenuate the PSG (25% / 50% / 100%).
+            let shift = 2 - (self.soundcnt_h() & 3).min(2);
+            raw_l = dl * DS_GAIN + (pl >> shift) * PSG_GAIN;
+            raw_r = dr * DS_GAIN + (pr >> shift) * PSG_GAIN;
+        }
+        let l = self.dc_block(0, raw_l as f64);
+        let r = self.dc_block(1, raw_r as f64);
+        let l = self.low_pass(0, l);
+        let r = self.low_pass(1, r);
+        let magnitude = l.abs().max(r.abs());
+        self.raw_peak = self.raw_peak.max(magnitude);
+        if magnitude > i16::MAX as f64 {
+            self.clip_count += 1;
+        }
+        self.buffer.push(l.clamp(i16::MIN as f64, i16::MAX as f64) as i16);
+        self.buffer.push(r.clamp(i16::MIN as f64, i16::MAX as f64) as i16);
     }
 
-    /// Mix the current DirectSound latches into a stereo pair. PSG channels are
-    /// not yet modeled.
-    fn mix(&self) -> (i16, i16) {
-        if !self.master_enabled() {
-            return (0, 0);
+    /// Clip metering since the last call: (samples clamped, peak pre-clamp
+    /// magnitude). Resets the counters.
+    pub fn clip_stats(&mut self) -> (u64, f64) {
+        let stats = (self.clip_count, self.raw_peak);
+        self.clip_count = 0;
+        self.raw_peak = 0.0;
+        stats
+    }
+
+    /// One-pole DC-blocking high-pass on output channel `ch`.
+    fn dc_block(&mut self, ch: usize, x: f64) -> f64 {
+        let y = x - self.dc_x[ch] + DC_BLOCK_R * self.dc_y[ch];
+        self.dc_x[ch] = x;
+        self.dc_y[ch] = y;
+        y
+    }
+
+    /// One-pole output low-pass on channel `ch` (a no-op when disengaged, but the
+    /// state keeps tracking so toggling it doesn't jump).
+    fn low_pass(&mut self, ch: usize, x: f64) -> f64 {
+        self.lp_y[ch] += LOW_PASS_ALPHA * (x - self.lp_y[ch]);
+        if self.low_pass_on {
+            self.lp_y[ch]
+        } else {
+            x
         }
+    }
+
+    /// Toggle the output low-pass filter; returns whether it is now engaged.
+    pub fn toggle_low_pass(&mut self) -> bool {
+        self.low_pass_on = !self.low_pass_on;
+        self.low_pass_on
+    }
+
+    /// The DirectSound channels' contribution in natural units: each 8-bit sample
+    /// scaled ×2 at full volume or ×1 at half, then panned. (`DS_GAIN` is applied
+    /// by the caller.)
+    fn directsound(&self) -> (i32, i32) {
         let h = self.soundcnt_h();
-        let mut left = 0i32;
-        let mut right = 0i32;
-        // Each channel: 8-bit sample scaled by its volume, panned. Scale up so a
-        // full-scale channel is comfortably within i16.
         let channel = |sample: i8, full: bool| -> i32 {
             let s = sample as i32;
-            if full { s * 4 } else { s * 2 }
+            if full { s * 2 } else { s }
         };
         let a = channel(self.latch[0], h & H_DSA_VOLUME_FULL != 0);
         let b = channel(self.latch[1], h & H_DSB_VOLUME_FULL != 0);
+        let mut left = 0i32;
+        let mut right = 0i32;
         if h & H_DSA_ENABLE_LEFT != 0 {
             left += a;
         }
@@ -240,12 +323,33 @@ impl Apu {
         if h & H_DSB_ENABLE_RIGHT != 0 {
             right += b;
         }
-        // Headroom scale so mixed full-scale channels approach i16 range.
-        let scale = 24;
+        (left, right)
+    }
+
+    /// The DirectSound stereo pair at output scale, clamped — kept for tests.
+    #[cfg(test)]
+    fn mix(&self) -> (i16, i16) {
+        if !self.master_enabled() {
+            return (0, 0);
+        }
+        let (l, r) = self.directsound();
         (
-            (left * scale).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-            (right * scale).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (l * DS_GAIN).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (r * DS_GAIN).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
         )
+    }
+
+    /// Toggle the DirectSound mute (a debug aid for judging the mix); returns the
+    /// new muted state.
+    pub fn toggle_mute_directsound(&mut self) -> bool {
+        self.mute_directsound = !self.mute_directsound;
+        self.mute_directsound
+    }
+
+    /// Toggle the PSG mute; returns the new muted state.
+    pub fn toggle_mute_psg(&mut self) -> bool {
+        self.mute_psg = !self.mute_psg;
+        self.mute_psg
     }
 
     /// Move the generated samples out for the host to play, leaving the buffer
