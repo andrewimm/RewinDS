@@ -8,6 +8,7 @@
 //! Only the registers backed by a modeled device are wired up; other I/O reads
 //! as zero and ignores writes for now.
 
+use crate::apu::Apu;
 use crate::dma::Dma;
 use crate::event::EventKind;
 use crate::interrupt::{InterruptController, IrqSource};
@@ -108,6 +109,7 @@ pub struct Io {
     pub video: Ppu,
     pub keypad: Keypad,
     pub serial: Serial,
+    pub apu: Apu,
     /// Storage for mapped-but-unmodeled registers (see [`RawRegisters`]).
     raw: RawRegisters,
 }
@@ -177,6 +179,12 @@ impl Io {
         value: u32,
         scheduler: &mut Scheduler<EventKind>,
     ) -> bool {
+        // The DirectSound FIFOs are word-written; take the whole word before it
+        // would be split into halfwords.
+        if width == AccessWidth::Word && (offset == 0x0A0 || offset == 0x0A4) {
+            self.apu.write_fifo(if offset == 0x0A0 { 0 } else { 1 }, value);
+            return false;
+        }
         match width {
             AccessWidth::Byte => {
                 let shift = 8 * (offset & 1);
@@ -216,7 +224,8 @@ impl Io {
             0x208 => self.irq.ime() as u16,
             // POSTFLG (low byte); HALTCNT (high byte) is write-only.
             0x300 => self.control.postflg as u16,
-            // Mapped-but-unmodeled registers (sound, serial, …) read back storage.
+            0x060..=0x0AF => self.apu.read16(offset),
+            // Mapped-but-unmodeled registers read back storage.
             _ => self.raw.read16(offset),
         }
     }
@@ -299,7 +308,11 @@ impl Io {
                 }
                 false
             }
-            // Mapped-but-unmodeled registers (sound, serial, …) retain writes.
+            0x060..=0x0AF => {
+                self.apu.write16(offset, value, mask);
+                false
+            }
+            // Mapped-but-unmodeled registers retain writes.
             _ => {
                 self.raw.write16(offset, value, mask);
                 false

@@ -5,6 +5,7 @@
 //! concrete [`EventKind`] plugged into `emu_core::Scheduler` and the [`Gba`]
 //! machine whose [`Bus`] the CPU (and later DMA) drives.
 
+pub mod apu;
 pub mod bus;
 pub mod cartridge;
 pub mod dma;
@@ -20,6 +21,7 @@ pub mod system;
 pub mod timer;
 pub mod trace;
 
+pub use apu::Apu;
 pub use bus::{Bus, Memory};
 pub use cartridge::{Backup, Cartridge, FlashSize, SaveType};
 pub use dma::{Dma, DmaChannel, DmaTiming};
