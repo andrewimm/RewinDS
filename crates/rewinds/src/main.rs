@@ -14,15 +14,17 @@ use gba::{Cartridge, Key as Button, SaveType, System};
 use minifb::{Key, Scale, Window, WindowOptions};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
 
-/// Host key → GBA button. Arrow keys drive the D-pad; Z/X are A/B; A/S are the
-/// L/R shoulders; Enter/Backspace are Start/Select.
+/// Host key → GBA button. Arrow keys drive the D-pad; X/Z are A/B (VBA layout);
+/// A/S are the L/R shoulders; Enter/Backspace are Start/Select. Hold Space to
+/// fast-forward.
 const KEY_MAP: &[(Key, Button)] = &[
-    (Key::Z, Button::A),
-    (Key::X, Button::B),
+    (Key::X, Button::A),
+    (Key::Z, Button::B),
     (Key::Enter, Button::Start),
     (Key::Backspace, Button::Select),
     (Key::Up, Button::Up),
@@ -127,10 +129,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             log::info!("low-pass filter {}", if on { "on" } else { "off" });
         }
 
-        system.run_frame();
-
-        if let Some(a) = audio.as_mut() {
-            a.push(&system.take_audio());
+        // Hold Space to fast-forward: run unthrottled for a display frame's worth
+        // of real time, presenting only the final frame and dropping audio (like
+        // VBA's speed-up). Otherwise run one frame at 60 fps with audio.
+        let warp = window.is_key_down(Key::Space);
+        window.set_target_fps(if warp { 10_000 } else { 60 });
+        if warp {
+            let deadline = Instant::now() + Duration::from_millis(14);
+            loop {
+                system.run_frame();
+                let _ = system.take_audio(); // fast-forward is silent
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        } else {
+            system.run_frame();
+            if let Some(a) = audio.as_mut() {
+                a.push(&system.take_audio());
+            }
         }
 
         for (out, color) in buffer.iter_mut().zip(system.framebuffer()) {
