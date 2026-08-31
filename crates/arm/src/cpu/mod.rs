@@ -18,9 +18,9 @@ use crate::condition::Condition;
 use crate::decode::{decode_arm, decode_thumb};
 use crate::instruction::arm::{
     ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros, DataProcessing,
-    DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
-    Multiply, MultiplyLong, Operand2, SaturatingArithmetic, SaturatingOp, ShiftKind, ShiftSource,
-    SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    DataProcessingOpcode, DspMulOp, HalfwordKind, HalfwordMultiply, HalfwordOffset,
+    HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, Operand2, SaturatingArithmetic,
+    SaturatingOp, ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -427,6 +427,7 @@ impl Cpu {
             ArmOperation::MultiplyLong(op) => self.execute_multiply_long(op, bus),
             ArmOperation::CountLeadingZeros(op) => self.execute_clz(op),
             ArmOperation::SaturatingArithmetic(op) => self.execute_saturating(op),
+            ArmOperation::HalfwordMultiply(op) => self.execute_halfword_multiply(op),
             ArmOperation::Mrs(op) => self.execute_mrs(op),
             ArmOperation::Msr(op) => self.execute_msr(op),
             ArmOperation::SoftwareInterrupt(op) => self.execute_software_interrupt(op),
@@ -752,6 +753,58 @@ impl Cpu {
             self.cpsr.set_q(true); // sticky — only MSR clears it
         }
         self.set_reg(op.rd, result as u32);
+    }
+
+    /// The ARMv5TE DSP multiplies (`SMUL/SMLA` halfword and `W`/`L` forms).
+    /// Undefined on ARMv4T. Only the accumulating 32-bit forms touch `Q`.
+    fn execute_halfword_multiply(&mut self, op: HalfwordMultiply) {
+        if !self.version.is_v5() {
+            return self.execute_undefined();
+        }
+        // The selected 16-bit halfword of a register, sign-extended to i32.
+        let half = |value: u32, top: bool| -> i32 {
+            if top {
+                (value >> 16) as i16 as i32
+            } else {
+                value as i16 as i32
+            }
+        };
+        let rm = self.reg(op.rm);
+        let rs_half = half(self.reg(op.rs), op.y);
+
+        match op.op {
+            DspMulOp::SmulXY => {
+                let product = half(rm, op.x).wrapping_mul(rs_half);
+                self.set_reg(op.rd, product as u32);
+            }
+            DspMulOp::SmlaXY => {
+                let product = half(rm, op.x).wrapping_mul(rs_half);
+                let (result, overflow) = product.overflowing_add(self.reg(op.rn) as i32);
+                if overflow {
+                    self.cpsr.set_q(true); // Q set, but the result is NOT saturated
+                }
+                self.set_reg(op.rd, result as u32);
+            }
+            DspMulOp::SmulWY => {
+                let product = (rm as i32 as i64) * (rs_half as i64);
+                self.set_reg(op.rd, (product >> 16) as i32 as u32);
+            }
+            DspMulOp::SmlaWY => {
+                let product = (rm as i32 as i64) * (rs_half as i64);
+                let (result, overflow) = ((product >> 16) as i32).overflowing_add(self.reg(op.rn) as i32);
+                if overflow {
+                    self.cpsr.set_q(true);
+                }
+                self.set_reg(op.rd, result as u32);
+            }
+            DspMulOp::SmlalXY => {
+                let product = (half(rm, op.x) as i64) * (rs_half as i64);
+                let acc = (((self.reg(op.rd) as u64) << 32) | self.reg(op.rn) as u64) as i64;
+                let result = acc.wrapping_add(product);
+                self.set_reg(op.rn, result as u32); // RdLo
+                self.set_reg(op.rd, (result >> 32) as u32); // RdHi
+            }
+        }
     }
 
     /// The offset for a single data transfer: an immediate, or a register with an

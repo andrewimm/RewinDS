@@ -18,9 +18,9 @@ use crate::condition::Condition;
 use crate::decode::operand::{decode_operand2, decode_shift};
 use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, CountLeadingZeros,
-    DataProcessing, DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr,
-    MsrSource, Multiply, MultiplyLong, SaturatingArithmetic, SaturatingOp, SingleOffset,
-    SingleTransfer, SoftwareInterrupt, Swap,
+    DataProcessing, DataProcessingOpcode, DspMulOp, HalfwordKind, HalfwordMultiply, HalfwordOffset,
+    HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, SaturatingArithmetic,
+    SaturatingOp, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 use crate::register::Register;
 
@@ -43,6 +43,8 @@ fn decode_operation(raw: u32) -> ArmOperation {
         decode_clz(raw)
     } else if matches_saturating(raw) {
         decode_saturating(raw)
+    } else if matches_halfword_multiply(raw) {
+        decode_halfword_multiply(raw)
     } else if matches_swap(raw) {
         decode_swap(raw)
     } else if matches_multiply(raw) {
@@ -112,6 +114,32 @@ fn decode_saturating(raw: u32) -> ArmOperation {
         rd: Register::new((raw >> 12) as u8),
         rm: Register::new(raw as u8),
         rn: Register::new((raw >> 16) as u8),
+    })
+}
+
+/// DSP halfword multiplies: `cond 0001 0oo0 Rd Rn Rs 1yx0 Rm` (ARMv5TE).
+fn matches_halfword_multiply(raw: u32) -> bool {
+    (raw & 0x0F90_0090) == 0x0100_0080
+}
+
+fn decode_halfword_multiply(raw: u32) -> ArmOperation {
+    let x = raw & (1 << 5) != 0;
+    let y = raw & (1 << 6) != 0;
+    let op = match (raw >> 21) & 0b11 {
+        0b00 => DspMulOp::SmlaXY,
+        0b01 if x => DspMulOp::SmulWY,
+        0b01 => DspMulOp::SmlaWY,
+        0b10 => DspMulOp::SmlalXY,
+        _ => DspMulOp::SmulXY,
+    };
+    ArmOperation::HalfwordMultiply(HalfwordMultiply {
+        op,
+        x,
+        y,
+        rd: Register::new((raw >> 16) as u8),
+        rn: Register::new((raw >> 12) as u8),
+        rs: Register::new((raw >> 8) as u8),
+        rm: Register::new(raw as u8),
     })
 }
 

@@ -28,6 +28,7 @@ pub enum ArmOperation {
     /// ARMv5TE-only arithmetic; traps as Undefined on an ARMv4T core.
     CountLeadingZeros(CountLeadingZeros),
     SaturatingArithmetic(SaturatingArithmetic),
+    HalfwordMultiply(HalfwordMultiply),
 
     SingleTransfer(SingleTransfer),
     HalfwordTransfer(HalfwordTransfer),
@@ -98,6 +99,7 @@ impl ArmOperation {
             | ArmOperation::MultiplyLong(_)
             | ArmOperation::CountLeadingZeros(_)
             | ArmOperation::SaturatingArithmetic(_)
+            | ArmOperation::HalfwordMultiply(_)
             | ArmOperation::Msr(_)
             | ArmOperation::Undefined { .. } => false,
         }
@@ -266,6 +268,38 @@ pub struct SaturatingArithmetic {
     pub rm: Register,
     /// Second operand (bits 19..16) — doubled first in the `QD` variants.
     pub rn: Register,
+}
+
+/// The DSP 16×16 (and 32×16) signed multiply forms. `x`/`y` select which halfword
+/// of `Rm`/`Rs` is used; the `W` forms multiply the full 32-bit `Rm` by a halfword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DspMulOp {
+    /// `SMLAxy` — `Rd = HalfRm*HalfRs + Rn` (32-bit accumulate, sets Q on overflow).
+    SmlaXY,
+    /// `SMLAWy` — `Rd = (Rm*HalfRs) >> 16 + Rn` (sets Q on overflow).
+    SmlaWY,
+    /// `SMULWy` — `Rd = (Rm*HalfRs) >> 16`.
+    SmulWY,
+    /// `SMLALxy` — `RdHi:RdLo += HalfRm*HalfRs` (64-bit, no Q).
+    SmlalXY,
+    /// `SMULxy` — `Rd = HalfRm*HalfRs`.
+    SmulXY,
+}
+
+/// `SMULxy` / `SMLAxy` / `SMULWy` / `SMLAWy` / `SMLALxy` — ARMv5TE DSP multiplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalfwordMultiply {
+    pub op: DspMulOp,
+    /// `Rm` top-half select (unused by the `W` forms, where the bit chose the op).
+    pub x: bool,
+    /// `Rs` top-half select.
+    pub y: bool,
+    /// `Rd`, or `RdHi` for `SMLALxy`.
+    pub rd: Register,
+    /// `Rn` accumulator, or `RdLo` for `SMLALxy`.
+    pub rn: Register,
+    pub rs: Register,
+    pub rm: Register,
 }
 
 // ---------------------------------------------------------------------------

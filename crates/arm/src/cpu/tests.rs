@@ -527,6 +527,52 @@ fn saturating_traps_as_undefined_on_v4t() {
 }
 
 #[test]
+fn smul_halfword_selects_and_signs_operands() {
+    use super::ArmVersion::Armv5TE;
+    // smulbb r0, r1, r2 — bottom(r1) * bottom(r2), signed.
+    let cpu = run_one(Armv5TE, 0xE160_0281, &[(1, 0xFFFF), (2, 2)]); // (-1) * 2
+    assert_eq!(cpu.register(0) as i32, -2);
+    // smulbt r0, r1, r2 — bottom(r1) * top(r2).
+    let cpu = run_one(Armv5TE, 0xE160_02C1, &[(1, 3), (2, 0x0004_0000)]);
+    assert_eq!(cpu.register(0), 12);
+}
+
+#[test]
+fn smla_halfword_accumulates_and_sets_q_on_overflow() {
+    use super::ArmVersion::Armv5TE;
+    // smlabb r0, r1, r2, r3 — bottom*bottom + r3.
+    let cpu = run_one(Armv5TE, 0xE100_3281, &[(1, 2), (2, 3), (3, 10)]);
+    assert_eq!(cpu.register(0), 16);
+    assert!(!cpu.cpsr().q());
+    // Overflow of the 32-bit accumulate sets Q but does NOT saturate (wraps).
+    let cpu = run_one(Armv5TE, 0xE100_3281, &[(1, 0x7FFF), (2, 0x7FFF), (3, 0x7FFF_FFFF)]);
+    assert!(cpu.cpsr().q());
+    assert_eq!(cpu.register(0), 0x3FFF_0001u32.wrapping_add(0x7FFF_FFFF));
+}
+
+#[test]
+fn smulw_takes_the_top_32_of_the_48bit_product() {
+    // smulwb r0, r1, r2 — (r1 * bottom(r2)) >> 16.
+    let cpu = run_one(super::ArmVersion::Armv5TE, 0xE120_02A1, &[(1, 0x0001_0000), (2, 2)]);
+    assert_eq!(cpu.register(0), 2); // 65536 * 2 >> 16
+}
+
+#[test]
+fn smlal_halfword_accumulates_into_64_bits() {
+    // smlalbb r0(lo), r1(hi), r2, r3 — r1:r0 += bottom(r2)*bottom(r3).
+    let cpu = run_one(super::ArmVersion::Armv5TE, 0xE141_0382, &[(2, 0xFFFF), (3, 2)]); // (-1)*2 = -2
+    assert_eq!(cpu.register(0), 0xFFFF_FFFE);
+    assert_eq!(cpu.register(1), 0xFFFF_FFFF); // sign-extended high word
+}
+
+#[test]
+fn dsp_multiply_traps_as_undefined_on_v4t() {
+    let cpu = run_one(super::ArmVersion::Armv4T, 0xE160_0281, &[(0, 0xCAFE), (1, 3), (2, 5)]);
+    assert_eq!(cpu.register(0), 0xCAFE); // untouched
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+}
+
+#[test]
 fn cpu_version_defaults_to_v4t_and_selects_v5() {
     use super::ArmVersion;
     assert_eq!(Cpu::new().version(), ArmVersion::Armv4T);

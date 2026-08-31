@@ -4,8 +4,8 @@ use crate::disasm::{condition_suffix, immediate, reg, register_list, signed_imme
 use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
     DataProcessingOpcode, HalfwordKind, HalfwordOffset, HalfwordTransfer, Mrs, Msr, MsrSource,
-    Multiply, MultiplyLong, Operand2, SaturatingOp, Shift, ShiftKind, ShiftSource, SingleOffset,
-    SingleTransfer, SoftwareInterrupt, Swap,
+    DspMulOp, Multiply, MultiplyLong, Operand2, SaturatingOp, Shift, ShiftKind, ShiftSource,
+    SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 
 /// Render a decoded ARM instruction as assembly text.
@@ -26,6 +26,30 @@ pub fn format_arm(inst: &ArmInstruction) -> String {
                 SaturatingOp::QDSub => "qdsub",
             };
             format!("{mnem}{cond}\t{}, {}, {}", reg(op.rd), reg(op.rm), reg(op.rn))
+        }
+        ArmOperation::HalfwordMultiply(op) => {
+            let h = |t: bool| if t { "t" } else { "b" };
+            match op.op {
+                DspMulOp::SmulXY => format!(
+                    "smul{}{}{cond}\t{}, {}, {}",
+                    h(op.x), h(op.y), reg(op.rd), reg(op.rm), reg(op.rs)
+                ),
+                DspMulOp::SmlaXY => format!(
+                    "smla{}{}{cond}\t{}, {}, {}, {}",
+                    h(op.x), h(op.y), reg(op.rd), reg(op.rm), reg(op.rs), reg(op.rn)
+                ),
+                DspMulOp::SmulWY => format!(
+                    "smulw{}{cond}\t{}, {}, {}", h(op.y), reg(op.rd), reg(op.rm), reg(op.rs)
+                ),
+                DspMulOp::SmlaWY => format!(
+                    "smlaw{}{cond}\t{}, {}, {}, {}",
+                    h(op.y), reg(op.rd), reg(op.rm), reg(op.rs), reg(op.rn)
+                ),
+                DspMulOp::SmlalXY => format!(
+                    "smlal{}{}{cond}\t{}, {}, {}, {}",
+                    h(op.x), h(op.y), reg(op.rn), reg(op.rd), reg(op.rm), reg(op.rs)
+                ),
+            }
         }
         ArmOperation::SingleTransfer(op) => format_single_transfer(op, cond),
         ArmOperation::HalfwordTransfer(op) => format_halfword_transfer(op, cond),
