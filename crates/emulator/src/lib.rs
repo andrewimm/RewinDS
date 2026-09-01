@@ -221,8 +221,14 @@ impl Emulator {
     pub fn set_input(&mut self, input: Input) {
         match self {
             Emulator::Gba(g) => g.set_input(input),
-            // The DS keypad shares the low-ten bit order; touch is not wired yet.
-            Emulator::Nds(n) => n.system.set_keypad(input.buttons),
+            // The DS keypad shares the low-ten bit order; touch maps the lower screen.
+            Emulator::Nds(n) => {
+                n.system.set_keypad(input.buttons);
+                n.system.set_touch(input.touch_pressed.then_some((
+                    input.touch_x as i32,
+                    input.touch_y as i32,
+                )));
+            }
         }
     }
 

@@ -9,6 +9,35 @@
 //! stall in early startup or reject the (missing) settings. This module rebuilds
 //! that state (GBATEK "DS Firmware User Settings" and the `27FFxxx` footer tables).
 
+/// Touch-screen calibration: two `(ADC, screen-pixel)` reference points spanning the
+/// panel. The TSC reports raw 12-bit ADC values; games convert them to pixels with
+/// these points (linear interpolation, GBATEK). The same constants drive both the
+/// settings block games read and [`touch_adc`], which inverts them — so a host touch
+/// at pixel `(x, y)` produces the ADC that the game converts back to `(x, y)`.
+pub const TOUCH_ADC_X1: u16 = 0x0200;
+pub const TOUCH_ADC_Y1: u16 = 0x0200;
+pub const TOUCH_SCR_X1: u8 = 0x20;
+pub const TOUCH_SCR_Y1: u8 = 0x20;
+pub const TOUCH_ADC_X2: u16 = 0x0E00;
+pub const TOUCH_ADC_Y2: u16 = 0x0E00;
+pub const TOUCH_SCR_X2: u8 = 0xE0;
+pub const TOUCH_SCR_Y2: u8 = 0x90;
+
+/// The raw 12-bit ADC pair `(x, y)` a touchscreen controller reports for a touch at
+/// screen pixel `(x, y)` — the inverse of the calibration games apply. Clamped to the
+/// 12-bit ADC range; coordinates outside the reference span extrapolate linearly.
+pub fn touch_adc(x: i32, y: i32) -> (u16, u16) {
+    let map = |v: i32, adc1: u16, adc2: u16, scr1: u8, scr2: u8| -> u16 {
+        let adc = (v - scr1 as i32) * (adc2 as i32 - adc1 as i32) / (scr2 as i32 - scr1 as i32)
+            + adc1 as i32;
+        adc.clamp(0, 0xFFF) as u16
+    };
+    (
+        map(x, TOUCH_ADC_X1, TOUCH_ADC_X2, TOUCH_SCR_X1, TOUCH_SCR_X2),
+        map(y, TOUCH_ADC_Y1, TOUCH_ADC_Y2, TOUCH_SCR_Y1, TOUCH_SCR_Y2),
+    )
+}
+
 /// The 0x70-byte "Current Settings" block the firmware copies to RAM `0x27FFC80`
 /// (GBATEK "DS Firmware User Settings"). The RAM copy holds only the 0x70 data
 /// bytes — the update counter and CRC16 live in flash, not here — so games trust
@@ -31,16 +60,17 @@ pub fn user_settings() -> [u8; 0x70] {
     }
     put16(&mut s, 0x1A, 6); // Nickname length
 
-    // Touch-screen calibration: two ADC/screen reference points spanning the
-    // panel so ADC values map linearly to pixels (GBATEK conversion formula).
-    put16(&mut s, 0x58, 0x0200); // adc.x1
-    put16(&mut s, 0x5A, 0x0200); // adc.y1
-    s[0x5C] = 0x20; // scr.x1
-    s[0x5D] = 0x20; // scr.y1
-    put16(&mut s, 0x5E, 0x0E00); // adc.x2
-    put16(&mut s, 0x60, 0x0E00); // adc.y2
-    s[0x62] = 0xE0; // scr.x2 (near 224)
-    s[0x63] = 0x90; // scr.y2 (near 144)
+    // Touch-screen calibration: two ADC/screen reference points spanning the panel
+    // so ADC values map linearly to pixels (GBATEK conversion formula). The same
+    // constants feed `touch_adc`, which inverts this map for injected touches.
+    put16(&mut s, 0x58, TOUCH_ADC_X1);
+    put16(&mut s, 0x5A, TOUCH_ADC_Y1);
+    s[0x5C] = TOUCH_SCR_X1;
+    s[0x5D] = TOUCH_SCR_Y1;
+    put16(&mut s, 0x5E, TOUCH_ADC_X2);
+    put16(&mut s, 0x60, TOUCH_ADC_Y2);
+    s[0x62] = TOUCH_SCR_X2;
+    s[0x63] = TOUCH_SCR_Y2;
 
     // Language and flags: English (1), plus the "settings okay" bits (10,11,13,
     // 14,15) with "settings lost" (bit 9) clear, so no user-info / calibration /

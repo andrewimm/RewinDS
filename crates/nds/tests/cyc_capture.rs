@@ -282,12 +282,22 @@ fn backup_dump() {
 fn play_probe() {
     use std::collections::BTreeSet;
     let mut sys = booted();
-    let press_from = env_hex("CYC_PRESS_FROM", 520) as u64;
+    // Decimal frame index (not hex — it's a frame count).
+    let press_from: u64 = std::env::var("CYC_PRESS_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(520);
     let key = env_hex("CYC_KEYS", 0x001); // A
+    // CYC_TOUCH="x,y" taps the lower-screen touch panel instead of a button.
+    let touch: Option<(i32, i32)> = std::env::var("CYC_TOUCH").ok().map(|s| {
+        let mut it = s.split(',').map(|v| v.trim().parse::<i32>().unwrap());
+        (it.next().unwrap(), it.next().unwrap())
+    });
     for f in 0..frames() {
-        // Tap the key for 6 of every 40 frames once past the menu-reach point.
+        // Tap for 6 of every 40 frames once past the menu-reach point.
         let down = f >= press_from && (f - press_from) % 40 < 6;
-        sys.set_keypad(if down { key } else { 0 });
+        if let Some(pt) = touch {
+            sys.set_touch(if down { Some(pt) } else { None });
+        } else {
+            sys.set_keypad(if down { key } else { 0 });
+        }
         sys.run_frame();
     }
     let dispcnt_a = sys.read(Core::Arm9, 0x0400_0000, 4);

@@ -1,10 +1,10 @@
 //! The ARM7 SPI bus (`SPICNT`/`SPIDATA` at `0x40001C0`/`0x40001C2`).
 //!
 //! Three devices share the bus, selected by `SPICNT` bits 8-9: the power-management
-//! chip, the firmware serial flash, and the touchscreen controller. Only the
-//! **firmware** device is modelled — games read their touchscreen calibration and
-//! other user settings from it during boot (see [`crate::firmware`]); the others
-//! return zero for now (touchscreen input is a later milestone).
+//! chip, the firmware serial flash, and the touchscreen controller (a TSC2046-style
+//! ADC). The firmware device serves the user settings games read at boot (see
+//! [`crate::firmware`]); the touchscreen device reports the current pen position as
+//! 12-bit ADC values (see [`Spi::set_touch`]); the power chip stores its registers.
 //!
 //! Transfers are byte-at-a-time: the CPU writes a byte to `SPIDATA` to clock it out
 //! and reads the byte clocked back in. A multi-byte command holds chip-select
@@ -38,6 +38,12 @@ pub struct Spi {
     pmic_reading: bool,
     /// Whether the next PMIC byte is the command byte (reset on chip-select release).
     pmic_command: bool,
+    /// Current pen position as a raw 12-bit ADC `(x, y)` pair, or `None` when no pen
+    /// is down. Set by the host through [`Self::set_touch`].
+    touch: Option<(u16, u16)>,
+    /// The touchscreen readout shift register: a conversion result staged MSB-first
+    /// for the two data bytes the reader clocks out after a control byte.
+    touch_output: u16,
 }
 
 impl Default for Spi {
@@ -59,7 +65,16 @@ impl Spi {
             pmic_index: 0,
             pmic_reading: false,
             pmic_command: true,
+            touch: None,
+            touch_output: 0,
         }
+    }
+
+    /// Set (or clear) the touchscreen pen position as a raw 12-bit ADC `(x, y)` pair.
+    /// `None` lifts the pen: position channels then read 0. The caller converts a
+    /// screen pixel to ADC via [`crate::firmware::touch_adc`].
+    pub fn set_touch(&mut self, adc: Option<(u16, u16)>) {
+        self.touch = adc;
     }
 
     /// Read `SPICNT`; the busy flag (bit 7) is always clear (instant transfers).
@@ -92,8 +107,7 @@ impl Spi {
         self.data = match device {
             DEVICE_FIRMWARE => self.firmware_transfer(value as u8),
             DEVICE_POWER => self.power_transfer(value as u8),
-            // Touchscreen: no pen is down (see `EXTKEYIN`), so every channel reads 0.
-            DEVICE_TOUCH => 0,
+            DEVICE_TOUCH => self.touch_transfer(value as u8),
             _ => 0,
         };
         if self.cnt & (1 << 11) == 0 {
@@ -127,6 +141,28 @@ impl Spi {
             self.pmic[index] = value;
             0
         }
+    }
+
+    /// Clock one byte through the touchscreen ADC. A control byte (bit 7 set) starts
+    /// a conversion for its channel (bits 6-4: 1 = Y, 5 = X); the 12-bit result then
+    /// clocks out MSB-first over the next two bytes, positioned as a TSC2046 does
+    /// (`result << 3`, so the reader recovers it as `(b0 << 5) | (b1 >> 3)`). With no
+    /// pen down every position channel converts to 0.
+    fn touch_transfer(&mut self, value: u8) -> u8 {
+        if value & 0x80 != 0 {
+            let channel = (value >> 4) & 7;
+            let (x, y) = self.touch.unwrap_or((0, 0));
+            let result = match channel {
+                1 => y, // Y position
+                5 => x, // X position
+                _ => 0, // pressure/aux channels unused
+            };
+            self.touch_output = (result & 0x0FFF) << 3;
+            return 0; // the control byte's own readback is discarded by the reader
+        }
+        let byte = (self.touch_output >> 8) as u8;
+        self.touch_output <<= 8;
+        byte
     }
 
     /// Clock one byte through the firmware flash, returning the byte read back. The
@@ -192,6 +228,41 @@ mod tests {
         // adc.x1 at settings + 0x58 must be non-zero (matches user_settings()).
         let cal = read_at(&mut spi, offset + 0x58, 2);
         assert_eq!(u16::from_le_bytes([cal[0], cal[1]]), 0x0200);
+    }
+
+    /// Drive the touchscreen X and Y channels and reconstruct the 12-bit ADC value
+    /// the reader recovers as `(b0 << 5) | (b1 >> 3)`.
+    #[test]
+    fn touchscreen_reports_position_adc() {
+        let mut spi = Spi::new();
+        spi.set_touch(Some((0x123, 0x456)));
+        let hold = (DEVICE_TOUCH << 8) | (1 << 11) | (1 << 15);
+        let read_channel = |spi: &mut Spi, ctrl: u16| -> u16 {
+            spi.write_cnt(hold);
+            spi.write_data(ctrl); // control byte (bit7 start + channel)
+            spi.write_data(0);
+            let b0 = spi.read_data();
+            spi.write_data(0);
+            let b1 = spi.read_data();
+            spi.write_cnt(0);
+            (b0 << 5) | (b1 >> 3)
+        };
+        assert_eq!(read_channel(&mut spi, 0x80 | (5 << 4)), 0x123, "X channel");
+        assert_eq!(read_channel(&mut spi, 0x80 | (1 << 4)), 0x456, "Y channel");
+    }
+
+    /// With no pen down, a position conversion reads zero.
+    #[test]
+    fn touchscreen_pen_up_reads_zero() {
+        let mut spi = Spi::new();
+        let hold = (DEVICE_TOUCH << 8) | (1 << 11) | (1 << 15);
+        spi.write_cnt(hold);
+        spi.write_data(0x80 | (5 << 4));
+        spi.write_data(0);
+        let b0 = spi.read_data();
+        spi.write_data(0);
+        let b1 = spi.read_data();
+        assert_eq!((b0 << 5) | (b1 >> 3), 0);
     }
 
     #[test]

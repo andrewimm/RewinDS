@@ -1020,7 +1020,8 @@ impl System {
     pub fn set_keypad(&mut self, pressed: u32) {
         self.machine.keyinput = 0x03FF & !(pressed as u16);
         // EXTKEYIN carries the X (bit 10) and Y (bit 11) buttons, active-low; the
-        // pen-down and hinge bits stay at "up"/"open".
+        // hinge stays "open", and the pen-down bit (6) is owned by `set_touch`, so
+        // preserve it rather than clobbering an in-progress touch.
         let mut ext = 0x007F;
         if pressed & (1 << 10) != 0 {
             ext &= !0x01; // X pressed
@@ -1028,7 +1029,25 @@ impl System {
         if pressed & (1 << 11) != 0 {
             ext &= !0x02; // Y pressed
         }
+        ext = (ext & !(1 << 6)) | (self.machine.extkeyin & (1 << 6));
         self.machine.extkeyin = ext;
+    }
+
+    /// Set (or lift) the touchscreen pen. `Some((x, y))` presses at screen pixel
+    /// `(x, y)` on the lower screen — routed to the touchscreen ADC (converted from
+    /// pixels via the firmware calibration) and reflected in `EXTKEYIN`'s pen-down
+    /// bit (active-low); `None` lifts the pen.
+    pub fn set_touch(&mut self, pos: Option<(i32, i32)>) {
+        match pos {
+            Some((x, y)) => {
+                self.machine.spi.set_touch(Some(crate::firmware::touch_adc(x, y)));
+                self.machine.extkeyin &= !(1 << 6); // pen down
+            }
+            None => {
+                self.machine.spi.set_touch(None);
+                self.machine.extkeyin |= 1 << 6; // pen up
+            }
+        }
     }
 
     /// Begin the PPU's continuous scanline schedule (idempotent).

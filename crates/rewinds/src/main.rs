@@ -11,7 +11,7 @@ mod audio;
 mod logging;
 
 use emulator::{button, Console, Emulator, Input, Load};
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -138,6 +138,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut input = Input::default();
         for &(host, bit) in KEY_MAP {
             input.set(bit, window.is_key_down(host));
+        }
+        // Mouse over the lower screen drives the DS touchscreen. The screens stack
+        // top-over-bottom, so the lower screen occupies buffer rows [screen_h, 2·h);
+        // subtract that to get a pixel within the touch panel.
+        if screen_count > 1 && window.get_mouse_down(MouseButton::Left) {
+            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Discard) {
+                let (px, py) = (mx as i32, my as i32 - screen_h as i32);
+                if px >= 0 && px < screen_w as i32 && py >= 0 && py < screen_h as i32 {
+                    input.touch_x = px as i16;
+                    input.touch_y = py as i16;
+                    input.touch_pressed = true;
+                }
+            }
         }
         emulator.set_input(input);
 
