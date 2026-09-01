@@ -57,6 +57,9 @@ pub struct Machine {
     pub(crate) ipc: Ipc,
     /// The gamecard slot: runtime ROM/filesystem streaming.
     pub(crate) cart: Cart,
+    /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only).
+    pub(crate) icache: crate::icache::ICache,
+    pub(crate) dcache: crate::icache::ICache,
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
@@ -81,6 +84,8 @@ impl Machine {
             ppu: Ppu::new(),
             ipc: Ipc::new(),
             cart: Cart::new(),
+            icache: crate::icache::ICache::new(),
+            dcache: crate::icache::ICache::new(),
             keyinput: 0x03FF, // all released
             postflg: [0, 0],
             clock: [0; 2],

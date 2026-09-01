@@ -17,6 +17,7 @@ pub mod dma;
 pub mod firmware;
 pub mod interrupt;
 pub mod ipc;
+pub mod icache;
 pub mod key1;
 pub mod memory;
 pub mod ppu;
