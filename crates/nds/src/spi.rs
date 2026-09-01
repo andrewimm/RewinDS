@@ -14,7 +14,9 @@
 use crate::firmware;
 
 /// `SPICNT` device select (bits 8-9).
+const DEVICE_POWER: u16 = 0;
 const DEVICE_FIRMWARE: u16 = 1;
+const DEVICE_TOUCH: u16 = 2;
 
 /// The SPI bus controller and the firmware-flash device on it.
 pub struct Spi {
@@ -30,6 +32,12 @@ pub struct Spi {
     address: u32,
     /// How many bytes of the current command have been clocked (command + address).
     phase: u32,
+    /// Power-management (PMIC) registers, and its per-command index state.
+    pmic: [u8; 8],
+    pmic_index: u8,
+    pmic_reading: bool,
+    /// Whether the next PMIC byte is the command byte (reset on chip-select release).
+    pmic_command: bool,
 }
 
 impl Default for Spi {
@@ -47,6 +55,10 @@ impl Spi {
             command: 0,
             address: 0,
             phase: 0,
+            pmic: [0; 8],
+            pmic_index: 0,
+            pmic_reading: false,
+            pmic_command: true,
         }
     }
 
@@ -77,10 +89,12 @@ impl Spi {
             return; // bus disabled
         }
         let device = (self.cnt >> 8) & 3;
-        self.data = if device == DEVICE_FIRMWARE {
-            self.firmware_transfer(value as u8)
-        } else {
-            0 // power management / touchscreen not modelled
+        self.data = match device {
+            DEVICE_FIRMWARE => self.firmware_transfer(value as u8),
+            DEVICE_POWER => self.power_transfer(value as u8),
+            // Touchscreen: no pen is down (see `EXTKEYIN`), so every channel reads 0.
+            DEVICE_TOUCH => 0,
+            _ => 0,
         };
         if self.cnt & (1 << 11) == 0 {
             self.deselect();
@@ -92,6 +106,27 @@ impl Spi {
         self.command = 0;
         self.address = 0;
         self.phase = 0;
+        self.pmic_command = true;
+    }
+
+    /// Clock one byte through the power-management chip: the first byte selects a
+    /// register (bit 7 = read) and the following bytes read or write it. Registers
+    /// (backlight, power, sound-amp control) are stored and read back.
+    fn power_transfer(&mut self, value: u8) -> u8 {
+        if self.pmic_command {
+            self.pmic_reading = value & 0x80 != 0;
+            self.pmic_index = value & 0x7F;
+            self.pmic_command = false;
+            return 0;
+        }
+        let index = (self.pmic_index & 0x7) as usize;
+        self.pmic_index = self.pmic_index.wrapping_add(1);
+        if self.pmic_reading {
+            self.pmic[index]
+        } else {
+            self.pmic[index] = value;
+            0
+        }
     }
 
     /// Clock one byte through the firmware flash, returning the byte read back. The
@@ -157,5 +192,23 @@ mod tests {
         // adc.x1 at settings + 0x58 must be non-zero (matches user_settings()).
         let cal = read_at(&mut spi, offset + 0x58, 2);
         assert_eq!(u16::from_le_bytes([cal[0], cal[1]]), 0x0200);
+    }
+
+    #[test]
+    fn power_management_register_round_trips() {
+        let mut spi = Spi::new();
+        let hold = (DEVICE_POWER << 8) | (1 << 11) | (1 << 15);
+        // Write 0x2A to power register 3 (command byte: register in bits 0-6, held).
+        spi.write_cnt(hold);
+        spi.write_data(3); // register 3, write
+        spi.write_data(0x2A);
+        spi.write_cnt(1 << 15); // release the bus mid-way is fine; re-select to read
+        spi.write_cnt(0); // fully deselect
+
+        // Read it back (command byte with bit 7 = read).
+        spi.write_cnt(hold);
+        spi.write_data(3 | 0x80); // register 3, read
+        spi.write_data(0); // clock the data out
+        assert_eq!(spi.read_data(), 0x2A);
     }
 }

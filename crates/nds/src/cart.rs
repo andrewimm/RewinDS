@@ -53,6 +53,11 @@ pub struct Cart {
     /// Set when the final word of a block is consumed; the caller then raises the
     /// transfer-complete IRQ and clears it via [`Cart::take_completion`].
     completed: bool,
+    /// Backup-SPI (`AUXSPIDATA`, `40001A2h`) state: the in-flight command byte and
+    /// the byte last clocked back. Enough for save-type detection to get consistent
+    /// (empty-chip) responses; save contents are not persisted.
+    backup_command: u8,
+    backup_data: u8,
 }
 
 impl Default for Cart {
@@ -67,6 +72,8 @@ impl Default for Cart {
             reply: Reply::Fixed(0xFFFF_FFFF),
             words_left: 0,
             completed: false,
+            backup_command: 0,
+            backup_data: 0,
         }
     }
 }
@@ -100,6 +107,29 @@ impl Cart {
     }
     pub fn write_auxspicnt(&mut self, value: u16) {
         self.auxspicnt = value;
+    }
+
+    /// The byte last clocked back from the backup chip (`AUXSPIDATA` read).
+    pub fn read_auxspidata(&self) -> u8 {
+        self.backup_data
+    }
+
+    /// Clock a byte to the backup chip. The first byte of a transfer is the command;
+    /// a read-status (`0x05`) reports "ready", other reads return the empty-chip
+    /// value (`0xFF`). Chip-select hold is `AUXSPICNT` bit 6.
+    pub fn write_auxspidata(&mut self, value: u8) {
+        self.backup_data = if self.backup_command == 0 {
+            self.backup_command = value;
+            0
+        } else {
+            match self.backup_command {
+                0x05 => 0x00, // RDSR: ready, not write-protected
+                _ => 0xFF,    // read data / unhandled: empty chip
+            }
+        };
+        if self.auxspicnt & (1 << 6) == 0 {
+            self.backup_command = 0; // chip-select released
+        }
     }
 
     /// `ROMCTRL` with the live `DRQ`/`Start` status bits reflecting the transfer.

@@ -62,6 +62,13 @@ impl Vram {
         self.vramcnt[bank]
     }
 
+    /// `VRAMSTAT` (`0x4000240`, ARM7): bit 0/1 report whether bank C/D is currently
+    /// allocated to the ARM7 as work RAM (enabled with `MST == 2`).
+    pub fn vramstat(&self) -> u8 {
+        let to_arm7 = |cnt: u8| (cnt & 0x80 != 0 && cnt & 0x7 == 2) as u8;
+        to_arm7(self.vramcnt[2]) | (to_arm7(self.vramcnt[3]) << 1)
+    }
+
     /// Read a 16-bit value directly from a block's storage (bank 0=A … 8=I),
     /// bypassing the CPU map — used by the display controller (VRAM display mode).
     pub fn block_read16(&self, bank: usize, offset: usize) -> u16 {

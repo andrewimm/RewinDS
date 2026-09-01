@@ -185,12 +185,16 @@ impl DmaChannel {
 #[derive(Clone, Copy, Debug)]
 pub struct Dma {
     pub(crate) channels: [DmaChannel; 4],
+    /// `DMA_FILL0..3` (`0x40000E0`): per-channel fill words a DMA can use as its
+    /// source. Stored and read back; used for fast zero/value fills.
+    fill: [u32; 4],
 }
 
 impl Default for Dma {
     fn default() -> Self {
         Dma {
             channels: [DmaChannel::new(); 4],
+            fill: [0; 4],
         }
     }
 }
@@ -198,6 +202,18 @@ impl Default for Dma {
 impl Dma {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read a `DMA_FILL` word (`offset` from `0x40000E0`).
+    pub fn read_fill(&self, offset: u32) -> u32 {
+        self.fill.get((offset / 4) as usize).copied().unwrap_or(0)
+    }
+
+    /// Write a `DMA_FILL` word (`offset` from `0x40000E0`).
+    pub fn write_fill(&mut self, offset: u32, value: u32) {
+        if let Some(slot) = self.fill.get_mut((offset / 4) as usize) {
+            *slot = value;
+        }
     }
 
     /// Read a DMA register halfword. Only `DMAxCNT_H` is readable.

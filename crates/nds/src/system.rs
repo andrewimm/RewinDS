@@ -218,6 +218,10 @@ pub struct Machine {
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
+    /// `EXTKEYIN` (`0x4000136`, ARM7): the X/Y buttons, pen-down, and hinge, all
+    /// active-low with the unused bits set. Default = nothing pressed, pen up, hinge
+    /// open; a booting game checks the pen bit before sampling the touchscreen.
+    pub(crate) extkeyin: u16,
     /// `POSTFLG` (`0x4000300`) per core: bit 0 = boot completed. Retail games
     /// refuse to run while it reads 0; direct boot sets it (GBATEK).
     pub(crate) postflg: [u8; 2],
@@ -253,7 +257,8 @@ impl Machine {
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
             timing: [CoreTiming::default(), CoreTiming::default()],
-            keyinput: 0x03FF, // all released
+            keyinput: 0x03FF,   // all released
+            extkeyin: 0x007F,   // X/Y released, pen up, hinge open
             postflg: [0, 0],
             exmemcnt: 0,
             powcnt1: 0,
@@ -337,7 +342,8 @@ impl Machine {
     /// accepted and ignored (the cartridge serves plaintext — see [`crate::cart`]).
     fn write_gamecard(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
         match addr {
-            0x0400_01A0 => self.cart.write_auxspicnt(value as u16), // AUXSPIDATA (A2) unmodelled
+            0x0400_01A0 => self.cart.write_auxspicnt(value as u16),
+            0x0400_01A2 => self.cart.write_auxspidata(value as u8), // backup SPI data
             0x0400_01A4..=0x0400_01A7 => {
                 // Merge into the stored config, then honour a start bit.
                 let shift = (addr - 0x0400_01A4) * 8;
@@ -382,6 +388,10 @@ impl Machine {
             let control = self.dma[c].read_register(addr & 0xFF) as u32;
             return if bytes == 4 { control << 16 } else { control };
         }
+        // DMA fill registers: 0x40000E0..0x40000EF (one word per channel).
+        if (0x0400_00E0..0x0400_00F0).contains(&addr) {
+            return self.dma[c].read_fill(addr - 0x0400_00E0);
+        }
         if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
             let base = addr - 0x0400_0000;
             let low = self.ppu.read_register(base) as u32;
@@ -398,10 +408,12 @@ impl Machine {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
+            0x0400_0136 if core == Core::Arm7 => self.extkeyin as u32,
             0x0400_0138 if core == Core::Arm7 => self.rtc.read(),
             0x0400_0204 => self.exmemcnt as u32, // EXMEMCNT/EXMEMSTAT (both cores)
             0x0400_0304 if core == Core::Arm9 => self.powcnt1 as u32,
             0x0400_01A0 => self.cart.read_auxspicnt() as u32,
+            0x0400_01A2 => self.cart.read_auxspidata() as u32,
             0x0400_01A4 => self.cart.read_romctrl(),
             0x0400_01C0 if core == Core::Arm7 => self.spi.read_cnt() as u32,
             0x0400_01C2 if core == Core::Arm7 => self.spi.read_data() as u32,
@@ -422,6 +434,7 @@ impl Machine {
                 }
                 word
             }
+            0x0400_0240 if core == Core::Arm7 => self.vram.vramstat() as u32,
             0x0400_0241 if core == Core::Arm7 => self.memory.wramcnt as u32,
             _ => 0,
         }
@@ -465,6 +478,11 @@ impl Machine {
             if let Some(channel) = armed {
                 self.run_dma_channel(core, channel);
             }
+            return;
+        }
+        // DMA fill registers: 0x40000E0..0x40000EF (one word per channel).
+        if (0x0400_00E0..0x0400_00F0).contains(&addr) {
+            self.dma[c].write_fill(addr - 0x0400_00E0, value);
             return;
         }
         // The VRAMCNT_A..I block (with WRAMCNT sharing address 0x4000247), all
@@ -851,6 +869,16 @@ impl System {
     /// the `KEYINPUT` bit order (A, B, Select, Start, Right, Left, Up, Down, R, L).
     pub fn set_keypad(&mut self, pressed: u32) {
         self.machine.keyinput = 0x03FF & !(pressed as u16);
+        // EXTKEYIN carries the X (bit 10) and Y (bit 11) buttons, active-low; the
+        // pen-down and hinge bits stay at "up"/"open".
+        let mut ext = 0x007F;
+        if pressed & (1 << 10) != 0 {
+            ext &= !0x01; // X pressed
+        }
+        if pressed & (1 << 11) != 0 {
+            ext &= !0x02; // Y pressed
+        }
+        self.machine.extkeyin = ext;
     }
 
     /// Begin the PPU's continuous scanline schedule (idempotent).
