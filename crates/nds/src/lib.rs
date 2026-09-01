@@ -23,6 +23,7 @@ pub mod math;
 pub mod memory;
 pub mod ppu;
 pub mod rtc;
+pub mod sound;
 pub mod spi;
 pub mod system;
 pub mod timer;

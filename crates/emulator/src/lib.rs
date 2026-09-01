@@ -231,19 +231,18 @@ impl Emulator {
     pub fn set_audio_muted(&mut self, muted: bool) {
         match self {
             Emulator::Gba(g) => g.audio_muted = muted,
-            Emulator::Nds(_) => {}
+            Emulator::Nds(n) => n.audio_muted = muted,
         }
     }
 
     /// Attach a host audio output at `output_rate` Hz with `channels` channels,
     /// returning the consumer the host drains on its audio thread. Replaces any
-    /// previous attachment. (The DS audio pipeline is not implemented yet, so an
-    /// NDS returns a consumer that only ever underruns to silence.)
+    /// previous attachment.
     pub fn enable_audio(&mut self, output_rate: u32, channels: usize) -> AudioSource {
         let (sink, source) = audio::channel(output_rate, channels);
         match self {
             Emulator::Gba(g) => g.audio = Some(sink),
-            Emulator::Nds(_) => drop(sink),
+            Emulator::Nds(n) => n.audio = Some(sink),
         }
         source
     }
@@ -365,6 +364,8 @@ impl Emulator {
 pub struct NdsEmulator {
     system: nds::System,
     rgba: [Vec<u8>; 2],
+    audio: Option<audio::AudioSink>,
+    audio_muted: bool,
 }
 
 impl NdsEmulator {
@@ -375,6 +376,8 @@ impl NdsEmulator {
                 vec![0; nds::ppu::WIDTH * nds::ppu::HEIGHT * 4],
                 vec![0; nds::ppu::WIDTH * nds::ppu::HEIGHT * 4],
             ],
+            audio: None,
+            audio_muted: false,
         }
     }
 
@@ -389,6 +392,13 @@ impl NdsEmulator {
                 .zip(self.system.screen(screen))
             {
                 *px = bgr555_to_rgba8(color);
+            }
+        }
+        // Always drain (so the buffer can't grow unbounded); feed only when attached.
+        let samples = self.system.take_audio();
+        if let Some(sink) = self.audio.as_mut() {
+            if !self.audio_muted {
+                sink.push(&samples);
             }
         }
     }

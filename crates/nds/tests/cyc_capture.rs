@@ -227,6 +227,32 @@ fn dump_frame() {
     eprintln!("frame {} DISPCNT_A={dispcnt_a:#010x} DISPCNT_B={dispcnt_b:#010x} -> {out}", frames());
 }
 
+/// Run `CYC_FRAMES` frames and report the sound mixer's output: sample count, peak
+/// amplitude, and how many samples are non-zero — to confirm audio is produced.
+#[test]
+#[ignore]
+fn audio_probe() {
+    let mut sys = booted();
+    let keys = env_hex("CYC_KEYS", 0);
+    let (mut total, mut peak, mut nonzero) = (0usize, 0i32, 0usize);
+    for f in 0..frames() {
+        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        sys.run_frame();
+        let s = sys.take_audio();
+        total += s.len();
+        for &x in &s {
+            peak = peak.max((x as i32).abs());
+            if x != 0 {
+                nonzero += 1;
+            }
+        }
+        let (on, active, mask) = sys.sound_status();
+        if f % 30 == 0 || (f == frames() - 1) {
+            eprintln!("frame {f:3}: samples={total} peak={peak} nonzero={nonzero}  master_on={on} active={active} mask={mask:#06x}");
+        }
+    }
+}
+
 /// Report DISPCNT + non-black pixel count each frame (has the game reached display?).
 #[test]
 #[ignore]

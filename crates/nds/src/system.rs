@@ -126,6 +126,8 @@ pub enum NdsEvent {
     },
     /// A 2D-engine scanline boundary (line start or H-blank).
     Ppu(PpuEvent),
+    /// The sound mixer should emit one output sample.
+    SoundSample,
 }
 
 /// Per-core per-instruction timing state for the ARM pipeline model, where an
@@ -245,6 +247,8 @@ pub struct Machine {
     pub(crate) spi: crate::spi::Spi,
     /// The ARM7 serial real-time clock (`0x4000138`).
     pub(crate) rtc: crate::rtc::Rtc,
+    /// The 16-channel sound engine (`0x4000400`-`0x400051F`, ARM7).
+    pub(crate) sound: crate::sound::Sound,
     /// The ARM9 hardware division and square-root units.
     pub(crate) math: crate::math::Math,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
@@ -297,6 +301,7 @@ impl Machine {
             cart: Cart::new(),
             spi: crate::spi::Spi::new(),
             rtc: crate::rtc::Rtc::new(),
+            sound: crate::sound::Sound::new(),
             math: crate::math::Math::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
@@ -437,6 +442,10 @@ impl Machine {
         if (0x0400_00E0..0x0400_00F0).contains(&addr) {
             return self.dma[c].read_fill(addr - 0x0400_00E0);
         }
+        // Sound registers (ARM7): 16 channels + SOUNDCNT/SOUNDBIAS.
+        if core == Core::Arm7 && (0x0400_0400..0x0400_0520).contains(&addr) {
+            return self.sound.read(addr - 0x0400_0000, bytes);
+        }
         // 2D engine register blocks (ARM9): Engine A at 0x4000008, Engine B at
         // 0x4001008. `addr & 0xFFF` is the offset within the engine's block.
         if core == Core::Arm9
@@ -535,6 +544,11 @@ impl Machine {
         // DMA fill registers: 0x40000E0..0x40000EF (one word per channel).
         if (0x0400_00E0..0x0400_00F0).contains(&addr) {
             self.dma[c].write_fill(addr - 0x0400_00E0, value);
+            return;
+        }
+        // Sound registers (ARM7): 16 channels + SOUNDCNT/SOUNDBIAS.
+        if core == Core::Arm7 && (0x0400_0400..0x0400_0520).contains(&addr) {
+            self.sound.write(addr - 0x0400_0000, value, bytes);
             return;
         }
         // The VRAMCNT_A..I block (with WRAMCNT sharing address 0x4000247), all
@@ -663,6 +677,14 @@ impl EventHandler<NdsEvent> for Machine {
                     ctx,
                 );
             }
+            NdsEvent::SoundSample => {
+                // `sound`, `memory`, and `cp15` are disjoint fields; the channels
+                // stream their source samples through the ARM7 memory map.
+                let (sound, memory, cp15) = (&mut self.sound, &self.memory, &self.cp15);
+                sound.generate_sample(|addr| memory.read8(Core::Arm7, addr, false, cp15));
+                ctx.scheduler
+                    .schedule_after(crate::sound::CYCLES_PER_SAMPLE, NdsEvent::SoundSample);
+            }
         }
     }
 }
@@ -673,6 +695,8 @@ pub struct System {
     pub arm7: Cpu,
     scheduler: Scheduler<NdsEvent>,
     machine: Machine,
+    /// Whether the recurring sound-sample event has been scheduled.
+    audio_started: bool,
 }
 
 impl Default for System {
@@ -689,6 +713,7 @@ impl System {
             arm7: Cpu::new(),
             scheduler: Scheduler::new(),
             machine: Machine::new(),
+            audio_started: false,
         }
     }
 
@@ -980,9 +1005,36 @@ impl System {
         self.machine.ppu.start(&mut self.scheduler);
     }
 
+    /// Begin the sound mixer's recurring sample event (idempotent).
+    pub fn start_audio(&mut self) {
+        if self.audio_started {
+            return;
+        }
+        self.audio_started = true;
+        let now = self.scheduler.now();
+        self.scheduler
+            .schedule_at(now + crate::sound::CYCLES_PER_SAMPLE, NdsEvent::SoundSample);
+    }
+
+    /// Drain the mixer's interleaved stereo `i16` samples produced since the last call.
+    pub fn take_audio(&mut self) -> Vec<i16> {
+        self.machine.sound.take_samples()
+    }
+
+    /// Debug: (sound master enabled, active-channel count, active-channel bitmask).
+    pub fn sound_status(&self) -> (bool, usize, u16) {
+        self.machine.sound.status()
+    }
+
+    /// Debug: a sound channel's `(sad, tmr, len, pos)`.
+    pub fn sound_channel(&self, ch: usize) -> (u32, u16, u32, u32) {
+        self.machine.sound.channel_debug(ch)
+    }
+
     /// Run until the 2D engine completes one frame (into the next V-blank).
     pub fn run_frame(&mut self) {
         self.start_video();
+        self.start_audio();
         let start = self.machine.ppu.frame();
         for _ in 0..(crate::ppu::HEIGHT as u64 + 100) {
             if self.machine.ppu.frame() != start {
@@ -1069,6 +1121,31 @@ mod tests {
             0xE581_0000,                  // str r0, [r1]
             0xEAFF_FFFE,                  // b .
         ]
+    }
+
+    /// End-to-end: set up a sound channel (from the ARM7's view) over sample data in
+    /// Main RAM, run the mixer's schedule, and confirm non-silent audio is produced.
+    #[test]
+    fn sound_channel_produces_non_silent_audio() {
+        let mut system = System::new();
+        // A loud constant PCM8 waveform (+100) at 0x0203_0000, one word (4 samples).
+        for b in 0..4 {
+            system.memory().main[0x3_0000 + b] = 100;
+        }
+        let w = |s: &mut System, addr: u32, value: u32, bytes: u32| {
+            s.io_write(Core::Arm7, addr, value, bytes);
+        };
+        w(&mut system, 0x0400_0500, (1 << 15) | 127, 2); // SOUNDCNT: master enable + full
+        w(&mut system, 0x0400_0404, 0x0203_0000, 4); // ch0 SAD
+        w(&mut system, 0x0400_0408, 0xFF00, 2); // ch0 TMR
+        w(&mut system, 0x0400_040C, 1, 4); // ch0 LEN = 1 word
+        // Start: loop mode, PCM8, full channel volume, centered pan.
+        w(&mut system, 0x0400_0400, (1 << 31) | (1 << 27) | (64 << 16) | 127, 4);
+        system.start_audio();
+        system.run_until(system.now() + crate::sound::CYCLES_PER_SAMPLE * 64);
+        let audio = system.take_audio();
+        assert!(!audio.is_empty(), "the mixer should emit samples");
+        assert!(audio.iter().any(|&s| s != 0), "a playing channel should be audible");
     }
 
     #[test]
