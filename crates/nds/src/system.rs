@@ -824,7 +824,8 @@ impl System {
         self.machine.vram.assemble_texture_image(&mut image);
         self.machine.vram.assemble_texture_palette(&mut palette);
         let tex = gpu3d::texture::TextureSet { image: &image, palette: &palette };
-        gpu3d::raster::render(self.machine.gpu3d.render_list(), &tex, &mut fb);
+        let cfg = self.machine.gpu3d.render_config();
+        gpu3d::raster::render(self.machine.gpu3d.render_list(), &tex, &cfg, &mut fb);
         let mut rgb = Vec::with_capacity(gpu3d::raster::WIDTH * gpu3d::raster::HEIGHT * 3);
         for p in &fb.pixels {
             if p.covered {

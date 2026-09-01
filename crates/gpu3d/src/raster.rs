@@ -64,6 +64,34 @@ impl Framebuffer3d {
     }
 }
 
+/// Per-frame rendering controls from `DISP3DCNT` + `ALPHA_TEST_REF`.
+#[derive(Clone, Copy)]
+pub struct RenderConfig {
+    /// `DISP3DCNT` bit 3: when clear, translucent polygons are drawn opaque (their
+    /// pixels overwrite the framebuffer rather than blending).
+    pub alpha_blend: bool,
+    /// `DISP3DCNT` bit 2: gate pixels on `alpha > alpha_ref` instead of `alpha > 0`.
+    pub alpha_test: bool,
+    /// `ALPHA_TEST_REF` (0-31): the alpha-test comparison value.
+    pub alpha_ref: u8,
+}
+
+impl Default for RenderConfig {
+    /// The common case: alpha-blending on, no alpha test — the configuration the
+    /// rasterizer unit tests assume. Real frames build this from the registers.
+    fn default() -> Self {
+        RenderConfig { alpha_blend: true, alpha_test: false, alpha_ref: 0 }
+    }
+}
+
+impl RenderConfig {
+    /// Whether a final pixel alpha passes the alpha test (GBATEK: drawn when `alpha >
+    /// ALPHA_TEST_REF` if enabled, else when `alpha > 0`).
+    fn alpha_passes(&self, alpha: u8) -> bool {
+        alpha > if self.alpha_test { self.alpha_ref } else { 0 }
+    }
+}
+
 /// The screen rectangle geometry projects into, decoded from the `VIEWPORT` command.
 #[derive(Clone, Copy)]
 pub struct Viewport {
@@ -254,8 +282,19 @@ fn shade(rp: &RPoly, tex: &TextureSet, vtx: [i32; 3], st: [i32; 2]) -> ([u8; 3],
 
 /// Fill scanline `y` between the two crossings, shading and depth-testing each pixel.
 /// `pass` selects opaque pixels (write + depth) or translucent pixels (blend over the
-/// resolved opaque layer).
-fn fill_span(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, y: i32, l: &Crossing, r: &Crossing, pass: Pass) {
+/// resolved opaque layer). A pixel is treated as opaque when it is fully opaque OR when
+/// alpha-blending is globally disabled (`DISP3DCNT` bit 3 = 0).
+#[allow(clippy::too_many_arguments)]
+fn fill_span(
+    fb: &mut Framebuffer3d,
+    rp: &RPoly,
+    tex: &TextureSet,
+    cfg: &RenderConfig,
+    y: i32,
+    l: &Crossing,
+    r: &Crossing,
+    pass: Pass,
+) {
     let xl = l.x.max(0);
     let xr = r.x.min(WIDTH as i32 - 1);
     if xl > xr {
@@ -274,15 +313,18 @@ fn fill_span(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, y: i32, l: &C
         let color = [lerp(l.color[0], r.color[0]), lerp(l.color[1], r.color[1]), lerp(l.color[2], r.color[2])];
         let st = [lerp(l.st[0], r.st[0]), lerp(l.st[1], r.st[1])];
         let (rgb, alpha) = shade(rp, tex, color, st);
-        if alpha == 0 {
-            continue; // fully transparent texel — draws nothing
+        if !cfg.alpha_passes(alpha) {
+            continue; // failed the alpha test (or fully transparent)
         }
+        let opaque_pixel = alpha == 31 || !cfg.alpha_blend;
         match pass {
-            Pass::Opaque if alpha == 31 => {
-                fb.pixels[idx] = Pixel3d { color: rgb, alpha: 31, covered: true };
+            Pass::Opaque if opaque_pixel => {
+                // Overwrite with the polygon's color and alpha (per GBATEK, a
+                // blend-disabled translucent pixel keeps its own alpha in the buffer).
+                fb.pixels[idx] = Pixel3d { color: rgb, alpha, covered: true };
                 fb.depth[idx] = depth;
             }
-            Pass::Translucent if alpha < 31 => {
+            Pass::Translucent if !opaque_pixel => {
                 let dst = fb.pixels[idx];
                 let a = alpha as i32;
                 // GBATEK: FrameBuf = (Poly·(A+1) + FrameBuf·(31−A)) / 32, FrameBuf[A] =
@@ -313,7 +355,7 @@ fn fill_span(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, y: i32, l: &C
 }
 
 /// Scan-fill one projected polygon's spans on scanline `y` for the given pass.
-fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, y: i32, pass: Pass) {
+fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, cfg: &RenderConfig, y: i32, pass: Pass) {
     if y < rp.ymin || y > rp.ymax {
         return;
     }
@@ -338,12 +380,13 @@ fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, y: i32, pass:
     } else {
         (crossings[1], crossings[0])
     };
-    fill_span(fb, rp, tex, y, &l, &r, pass);
+    fill_span(fb, rp, tex, cfg, y, &l, &r, pass);
 }
 
-/// Rasterize the sealed render list into `fb`, sampling from `tex`. Opaque pixels are
-/// laid down first (with depth), then translucent pixels blend over them.
-pub fn render(list: &RenderList, tex: &TextureSet, fb: &mut Framebuffer3d) {
+/// Rasterize the sealed render list into `fb`, sampling from `tex` under `cfg`. Opaque
+/// pixels are laid down first (with depth), then — if alpha-blending is enabled —
+/// translucent pixels blend over them.
+pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut Framebuffer3d) {
     fb.clear();
     let vp = Viewport::decode(list.viewport);
     let w_buffer = list.w_buffer();
@@ -356,18 +399,22 @@ pub fn render(list: &RenderList, tex: &TextureSet, fb: &mut Framebuffer3d) {
         .map(|p| RPoly::build(p, verts, &vp, w_buffer))
         .collect();
 
-    // Pass 1: opaque pixels of every polygon (depth-tested, write depth).
+    // Pass 1: opaque pixels of every polygon (depth-tested, write depth). When
+    // alpha-blending is disabled, every passing pixel is drawn here as opaque.
     for y in 0..HEIGHT as i32 {
         for rp in &polys {
-            scan_poly(fb, rp, tex, y, Pass::Opaque);
+            scan_poly(fb, rp, tex, cfg, y, Pass::Opaque);
         }
     }
     // Pass 2: translucent pixels blend over the resolved opaque layer, in submission
-    // order (a first cut ahead of true translucent depth sorting).
-    for y in 0..HEIGHT as i32 {
-        for rp in &polys {
-            if rp.has_translucency {
-                scan_poly(fb, rp, tex, y, Pass::Translucent);
+    // order (a first cut ahead of true translucent depth sorting). Skipped entirely
+    // when alpha-blending is disabled.
+    if cfg.alpha_blend {
+        for y in 0..HEIGHT as i32 {
+            for rp in &polys {
+                if rp.has_translucency {
+                    scan_poly(fb, rp, tex, cfg, y, Pass::Translucent);
+                }
             }
         }
     }
@@ -384,11 +431,32 @@ mod tests {
         n * ONE / 8
     }
 
-    /// Rasterize a render list with no textures bound.
+    /// Rasterize a render list with no textures bound (default config: blend on).
     fn rasterize(e: &GeometryEngine) -> Framebuffer3d {
+        rasterize_cfg(e, &RenderConfig::default())
+    }
+
+    /// Rasterize with an explicit render config.
+    fn rasterize_cfg(e: &GeometryEngine, cfg: &RenderConfig) -> Framebuffer3d {
         let mut fb = Framebuffer3d::new();
-        render(e.render_list(), &TextureSet::default(), &mut fb);
+        render(e.render_list(), &TextureSet::default(), cfg, &mut fb);
         fb
+    }
+
+    /// Submit one flat-colored triangle rendering both faces, at the given eighths
+    /// coords, with `attr` OR-ed into POLYGON_ATTR (for alpha bits).
+    fn one_triangle(color: u32, attr: u32) -> GeometryEngine {
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]);
+        e.execute(op::COLOR, &[color]);
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | attr]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        for (x, y) in [(-4, 4), (4, 4), (0, -4)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, 0]);
+        }
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        e
     }
 
     /// Build a render list from a single flat-colored triangle at the given eighths
@@ -519,5 +587,48 @@ mod tests {
         assert!(p.covered);
         assert_eq!(p.alpha, 16, "the polygon alpha carries into the 2D composite");
         assert_eq!(p.color, [63, 0, 0], "source color, not pre-blended with black");
+    }
+
+    #[test]
+    fn alpha_test_hides_pixels_at_or_below_the_reference() {
+        // A polygon with alpha 16. With ref 16, `alpha > ref` is false → hidden;
+        // with ref 15 it draws; ref 31 hides everything.
+        let e = one_triangle(0x1F, 16 << 16);
+        let ref16 = RenderConfig { alpha_test: true, alpha_ref: 16, ..Default::default() };
+        assert!(!rasterize_cfg(&e, &ref16).at(128, 96).covered, "alpha 16 not > ref 16");
+        let ref15 = RenderConfig { alpha_test: true, alpha_ref: 15, ..Default::default() };
+        assert!(rasterize_cfg(&e, &ref15).at(128, 96).covered, "alpha 16 > ref 15");
+        // Opaque polygon, ref 31 → hidden (GBATEK: 1Fh hides all polygons).
+        let opaque = one_triangle(0x1F, 31 << 16);
+        let ref31 = RenderConfig { alpha_test: true, alpha_ref: 31, ..Default::default() };
+        assert!(!rasterize_cfg(&opaque, &ref31).at(128, 96).covered, "even opaque hidden at ref 31");
+    }
+
+    #[test]
+    fn alpha_blend_disabled_draws_translucent_polygons_opaque() {
+        // Near translucent red (alpha 8) over far opaque blue. With blending disabled,
+        // the near polygon overwrites (no blend) — the centroid is pure red.
+        let tri_near = [(-4, 4), (4, 4), (0, -4)];
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]);
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | (31 << 16)]);
+        e.execute(op::COLOR, &[0x7C00]); // far blue, opaque
+        e.execute(op::BEGIN_VTXS, &[0]);
+        for (x, y) in tri_near {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, e8(4) as u32 & 0xFFFF]);
+        }
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | (8 << 16)]);
+        e.execute(op::COLOR, &[0x1F]); // near red, alpha 8
+        e.execute(op::BEGIN_VTXS, &[0]);
+        for (x, y) in tri_near {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, e8(-4) as u32 & 0xFFFF]);
+        }
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        let no_blend = RenderConfig { alpha_blend: false, ..Default::default() };
+        let p = rasterize_cfg(&e, &no_blend).at(128, 96);
+        assert_eq!(p.color, [63, 0, 0], "translucent poly drawn opaque, overwriting blue");
+        assert_eq!(p.alpha, 8, "its own alpha is still written to the buffer");
     }
 }

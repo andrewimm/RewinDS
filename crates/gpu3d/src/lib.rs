@@ -28,6 +28,7 @@ use geometry::GeometryEngine;
 /// IO register offsets relative to `0x0400_0000` (the ARM9 GX block).
 mod reg {
     pub const DISP3DCNT: u32 = 0x060;
+    pub const ALPHA_TEST_REF: u32 = 0x340;
     pub const GXFIFO_LO: u32 = 0x400;
     pub const GXFIFO_HI: u32 = 0x440; // exclusive end of the GXFIFO region
     pub const PORT_HI: u32 = 0x600; // exclusive end of the command-port region
@@ -47,6 +48,8 @@ pub struct Gpu3d {
     geometry: GeometryEngine,
     /// `DISP3DCNT` (`0x4000060`): 3D display/blend/fog/edge enables.
     disp3dcnt: u16,
+    /// `ALPHA_TEST_REF` (`0x4000340`): the alpha-test comparison value (bits 0-4).
+    alpha_test_ref: u8,
     /// The rasterized 256×192 output of the sealed render list, and the frame index it
     /// was rendered from (so it is rasterized at most once per swap).
     framebuffer: raster::Framebuffer3d,
@@ -71,6 +74,7 @@ impl Gpu3d {
             decoder: Decoder::default(),
             geometry: GeometryEngine::default(),
             disp3dcnt: 0,
+            alpha_test_ref: 0,
             framebuffer: raster::Framebuffer3d::new(),
             rendered_frame: 0,
             tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
@@ -133,6 +137,15 @@ impl Gpu3d {
         self.geometry.render_list()
     }
 
+    /// The rasterizer controls decoded from `DISP3DCNT` + `ALPHA_TEST_REF`.
+    pub fn render_config(&self) -> raster::RenderConfig {
+        raster::RenderConfig {
+            alpha_blend: self.disp3dcnt & (1 << 3) != 0,
+            alpha_test: self.disp3dcnt & (1 << 2) != 0,
+            alpha_ref: self.alpha_test_ref & 0x1F,
+        }
+    }
+
     /// Rasterize the sealed render list into the internal framebuffer (once per swap;
     /// a no-op if already rendered for the current frame), sampling from the texture
     /// VRAM the glue refreshed via [`Gpu3d::texture_image_mut`]. Called at V-blank.
@@ -140,7 +153,8 @@ impl Gpu3d {
         let frame = self.geometry.render_list().frame;
         if frame != self.rendered_frame {
             let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
-            raster::render(self.geometry.render_list(), &tex, &mut self.framebuffer);
+            let cfg = self.render_config();
+            raster::render(self.geometry.render_list(), &tex, &cfg, &mut self.framebuffer);
             self.rendered_frame = frame;
         }
     }
@@ -218,7 +232,10 @@ impl Gpu3d {
             reg::DISP3DCNT => {
                 self.disp3dcnt = merge16(self.disp3dcnt, value, bytes);
             }
-            // Clear/fog/toon/edge control registers are consumed by the rasterizer
+            reg::ALPHA_TEST_REF => {
+                self.alpha_test_ref = value as u8 & 0x1F;
+            }
+            // Other clear/fog/toon/edge control registers are consumed by the rasterizer
             // (later phases); accept and ignore their writes for now.
             _ => {}
         }
