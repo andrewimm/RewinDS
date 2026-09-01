@@ -13,11 +13,13 @@
 //! rasterizer, and provenance follow in later phases.
 
 pub mod command;
+pub mod debug;
 pub mod fifo;
 pub mod geometry;
 pub mod matrix;
 
 use command::Decoder;
+use debug::{Polygon3dProvenance, Vertex3dProvenance};
 use fifo::{Entry, Fifo};
 use geometry::GeometryEngine;
 
@@ -77,6 +79,17 @@ impl Gpu3d {
     /// single frame — confirms a game is submitting 3D geometry through the pipeline.
     pub fn peak_geometry(&self) -> (usize, usize) {
         self.geometry.peak()
+    }
+
+    /// Provenance of a built vertex: its source command, object-space position, and
+    /// clip coordinates. `None` if the index is out of range.
+    pub fn explain_vertex(&self, index: usize) -> Option<Vertex3dProvenance> {
+        self.geometry.explain_vertex(index)
+    }
+
+    /// Provenance of a built polygon: its primitive type, attributes, and vertices.
+    pub fn explain_polygon(&self, index: usize) -> Option<Polygon3dProvenance> {
+        self.geometry.explain_polygon(index)
     }
 
     /// Execute every complete command buffered in the FIFO (a command is complete

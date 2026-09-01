@@ -165,6 +165,19 @@ pub enum SourceProvenance {
     AffineBg(AffineBgProvenance),
     BitmapBg(BitmapBgProvenance),
     Obj(ObjProvenance),
+    /// A pixel sourced from the DS 3D engine (2D Engine A's BG0 when it is the 3D
+    /// layer). `video2d` holds no 3D detail; this carries the index into the 3D
+    /// engine's polygon RAM (and the polygon id) so a debug bridge resolves the full
+    /// geometry provenance from the 3D engine.
+    Polygon3d(Polygon3dProvenance),
+}
+
+/// A reference from a composited pixel back into the 3D engine's output. See
+/// [`SourceProvenance::Polygon3d`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Polygon3dProvenance {
+    pub polygon_index: u32,
+    pub poly_id: u8,
 }
 
 impl SourceProvenance {
@@ -187,6 +200,9 @@ impl SourceProvenance {
             SourceProvenance::Obj(p) => {
                 vec![p.oam_address, p.tile_byte_address, p.palette_address]
             }
+            // The 3D source is not a single guest address; the debug bridge resolves
+            // the polygon index against the 3D engine instead.
+            SourceProvenance::Polygon3d(_) => vec![],
         }
     }
 }

@@ -9,6 +9,7 @@
 //! matrix.
 
 use crate::command::op;
+use crate::debug::{Polygon3dProvenance, Vertex3dProvenance};
 use crate::matrix::{MatrixEngine, ONE};
 
 /// Vertex RAM depth (GBATEK: 6144 vertices per frame).
@@ -41,6 +42,18 @@ pub struct Polygon {
     pub attr: u32,
     pub tex_param: u32,
     pub pltt_base: u32,
+    /// Provenance: the `BEGIN_VTXS` primitive type and command sequence number.
+    pub primitive: u8,
+    pub begin_seq: u32,
+}
+
+/// Durable per-vertex provenance kept parallel to vertex RAM (the hot [`Vertex`] stays
+/// lean). The full [`Vertex3dProvenance`] is built from this plus the vertex on query.
+#[derive(Clone, Copy, Default)]
+struct VertexOrigin {
+    source_op: u8,
+    command_seq: u32,
+    object_position: [i32; 3],
 }
 
 /// Sign-extend the low 10 bits of `v` (used by `VTX_10`, `VTX_DIFF`, `NORMAL`).
@@ -66,6 +79,8 @@ struct State {
     cur_attr: u32,
     tex_param: u32,
     pltt_base: u32,
+    /// Command sequence number of the current list's `BEGIN_VTXS` (polygon provenance).
+    begin_seq: u32,
 }
 
 /// Groups the stream of submitted vertices into polygons per the `BEGIN_VTXS`
@@ -123,7 +138,12 @@ pub struct GeometryEngine {
     state: State,
     vertices: Vec<Vertex>,
     polygons: Vec<Polygon>,
+    /// Provenance parallel to `vertices` (same index; cleared together on swap).
+    vertex_origins: Vec<VertexOrigin>,
     assembler: Assembler,
+    /// Commands executed since the last `SWAP_BUFFERS` — the per-frame command
+    /// sequence number stamped on vertex/polygon provenance.
+    command_seq: u32,
     /// High-water marks of `(polygons, vertices)` built in a single frame, captured at
     /// each `SWAP_BUFFERS` — a debug window on how much geometry a game submits.
     peak: (usize, usize),
@@ -164,6 +184,7 @@ impl GeometryEngine {
     /// Execute one fully-assembled geometry command.
     pub fn execute(&mut self, cmd: u8, params: &[u32]) {
         use op::*;
+        self.command_seq += 1;
         match cmd {
             MTX_MODE => self.matrix.set_mode(params[0] as u8),
             MTX_PUSH => self.matrix.push(),
@@ -186,34 +207,34 @@ impl GeometryEngine {
 
             VTX_16 => {
                 self.state.position = [se16(params[0]), se16(params[0] >> 16), se16(params[1])];
-                self.submit_vertex();
+                self.submit_vertex(VTX_16);
             }
             VTX_10 => {
                 let p = params[0];
                 self.state.position = [se10(p) << 6, se10(p >> 10) << 6, se10(p >> 20) << 6];
-                self.submit_vertex();
+                self.submit_vertex(VTX_10);
             }
             VTX_XY => {
                 self.state.position[0] = se16(params[0]);
                 self.state.position[1] = se16(params[0] >> 16);
-                self.submit_vertex();
+                self.submit_vertex(VTX_XY);
             }
             VTX_XZ => {
                 self.state.position[0] = se16(params[0]);
                 self.state.position[2] = se16(params[0] >> 16);
-                self.submit_vertex();
+                self.submit_vertex(VTX_XZ);
             }
             VTX_YZ => {
                 self.state.position[1] = se16(params[0]);
                 self.state.position[2] = se16(params[0] >> 16);
-                self.submit_vertex();
+                self.submit_vertex(VTX_YZ);
             }
             VTX_DIFF => {
                 let p = params[0];
                 self.state.position[0] += se10(p);
                 self.state.position[1] += se10(p >> 10);
                 self.state.position[2] += se10(p >> 20);
-                self.submit_vertex();
+                self.submit_vertex(VTX_DIFF);
             }
 
             POLYGON_ATTR => self.state.pending_attr = params[0],
@@ -222,6 +243,7 @@ impl GeometryEngine {
             BEGIN_VTXS => {
                 // POLYGON_ATTR takes effect here, at the start of the vertex list.
                 self.state.cur_attr = self.state.pending_attr;
+                self.state.begin_seq = self.command_seq;
                 self.assembler.begin(params[0] as u8);
             }
             END_VTXS => {}
@@ -232,9 +254,10 @@ impl GeometryEngine {
         }
     }
 
-    /// Transform the current position by the clip matrix and append it to vertex RAM,
-    /// then feed the primitive assembler, emitting a polygon when one completes.
-    fn submit_vertex(&mut self) {
+    /// Transform the current position by the clip matrix and append it to vertex RAM
+    /// (with its provenance), then feed the primitive assembler, emitting a polygon
+    /// when one completes. `source_op` is the vertex command that produced it.
+    fn submit_vertex(&mut self, source_op: u8) {
         if self.vertices.len() >= VERTEX_RAM {
             return;
         }
@@ -246,6 +269,11 @@ impl GeometryEngine {
             color: self.state.color,
             texcoord: self.state.texcoord,
         });
+        self.vertex_origins.push(VertexOrigin {
+            source_op,
+            command_seq: self.command_seq,
+            object_position: self.state.position,
+        });
         if let Some((verts, count)) = self.assembler.add(vi) {
             if self.polygons.len() < POLYGON_RAM {
                 let mut v = [0u16; MAX_POLY_VERTS];
@@ -256,9 +284,39 @@ impl GeometryEngine {
                     attr: self.state.cur_attr,
                     tex_param: self.state.tex_param,
                     pltt_base: self.state.pltt_base,
+                    primitive: self.assembler.prim,
+                    begin_seq: self.state.begin_seq,
                 });
             }
         }
+    }
+
+    /// Build the full provenance of vertex-RAM entry `i` from its durable origin.
+    pub fn explain_vertex(&self, i: usize) -> Option<Vertex3dProvenance> {
+        let v = self.vertices.get(i)?;
+        let o = &self.vertex_origins[i];
+        Some(Vertex3dProvenance {
+            index: i as u16,
+            source_op: o.source_op,
+            command_seq: o.command_seq,
+            object_position: o.object_position,
+            clip: v.clip,
+        })
+    }
+
+    /// Build the full provenance of polygon-RAM entry `i`.
+    pub fn explain_polygon(&self, i: usize) -> Option<Polygon3dProvenance> {
+        let p = self.polygons.get(i)?;
+        Some(Polygon3dProvenance {
+            index: i as u16,
+            primitive: p.primitive,
+            command_seq: p.begin_seq,
+            attr: p.attr,
+            poly_id: ((p.attr >> 24) & 0x3F) as u8,
+            tex_param: p.tex_param,
+            pltt_base: p.pltt_base,
+            vertices: p.verts[..p.count as usize].to_vec(),
+        })
     }
 
     /// `SWAP_BUFFERS`: reset the build buffers. Phase 7 first seals them into an
@@ -268,8 +326,10 @@ impl GeometryEngine {
         self.peak.0 = self.peak.0.max(self.polygons.len());
         self.peak.1 = self.peak.1.max(self.vertices.len());
         self.vertices.clear();
+        self.vertex_origins.clear();
         self.polygons.clear();
         self.assembler.run.clear();
+        self.command_seq = 0;
     }
 }
 
@@ -411,6 +471,49 @@ mod tests {
         }
         assert_eq!(e.polygons()[0].attr, 0xDEAD_BEEF);
         assert_eq!(e.vertices()[0].color, [31, 0, 31]);
+    }
+
+    #[test]
+    fn explain_vertex_reports_source_command_and_object_position() {
+        let mut e = engine();
+        e.execute(op::MTX_TRANS, &[f(10) as u32, 0, 0]); // clip = translate(+10x)
+        e.execute(op::BEGIN_VTXS, &[0]);
+        vtx16(&mut e, 1, 2, 3);
+        let p = e.explain_vertex(0).unwrap();
+        assert_eq!(p.index, 0);
+        assert_eq!(p.source_op, op::VTX_16);
+        assert_eq!(p.object_position, [f(1), f(2), f(3)]); // pre-transform
+        assert_eq!(p.clip, [f(11), f(2), f(3), f(1)]); // post-transform (translated x)
+        assert!(e.explain_vertex(5).is_none());
+    }
+
+    #[test]
+    fn explain_polygon_reports_primitive_attr_and_vertices() {
+        let mut e = engine();
+        e.execute(op::POLYGON_ATTR, &[(7 << 24) | 0x1234]); // poly id 7
+        e.execute(op::BEGIN_VTXS, &[2]); // triangle strip
+        for i in 0..4 {
+            vtx16(&mut e, i, 0, 0);
+        }
+        let p = e.explain_polygon(1).unwrap();
+        assert_eq!(p.primitive, 2);
+        assert_eq!(p.poly_id, 7);
+        assert_eq!(p.attr, (7 << 24) | 0x1234);
+        assert_eq!(p.vertices, vec![2, 1, 3]); // second strip triangle (odd winding)
+    }
+
+    #[test]
+    fn command_sequence_stamps_provenance_and_resets_on_swap() {
+        let mut e = engine(); // engine() already ran one command (MTX_MODE) → seq 1
+        e.execute(op::BEGIN_VTXS, &[0]); // seq 2
+        vtx16(&mut e, 0, 0, 0); // seq 3
+        assert_eq!(e.explain_vertex(0).unwrap().command_seq, 3);
+        assert_eq!(e.explain_polygon(0), None); // only one vertex so far
+        vtx16(&mut e, 1, 0, 0); // seq 4
+        vtx16(&mut e, 2, 0, 0); // seq 5 → triangle complete
+        assert_eq!(e.explain_polygon(0).unwrap().command_seq, 2); // the BEGIN_VTXS seq
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        assert_eq!(e.explain_vertex(0), None); // provenance cleared with the buffers
     }
 
     #[test]
