@@ -323,6 +323,12 @@ impl Bus for NdsCpuBus<'_> {
             // MCR executes in 2 cycles on the ARM946E-S, independent of any fetch.
             let t = &mut self.machine.timing[0];
             t.internal = t.internal.max(2);
+            // CP15 c7,c0,4 is Wait For Interrupt: halt the ARM9 until an enabled
+            // interrupt is pending. This is how the ARM9 (which has no HALTCNT) idles.
+            if crn == 7 && crm == 0 && opcode2 == 4 {
+                self.machine.halted[0] = true;
+                return true;
+            }
             self.machine.cp15.write(opcode1, crn, crm, opcode2, value)
         } else {
             false

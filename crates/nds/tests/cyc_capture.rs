@@ -141,6 +141,53 @@ fn disasm() {
     }
 }
 
+/// After `CYC_FRAMES` frames, report each core's interrupt state and the PC set it is
+/// spinning in — to distinguish a handshake deadlock (spinning with IRQs off / IF idle)
+/// from an interrupt wait (IRQs enabled, waiting on a VBlank/IPC IF bit that never sets).
+#[test]
+#[ignore]
+fn boot_state() {
+    use std::collections::BTreeSet;
+    let mut sys = booted();
+    for _ in 0..frames() {
+        sys.run_frame();
+    }
+    for core in [Core::Arm9, Core::Arm7] {
+        let (pc, irq_on) = if core == Core::Arm9 {
+            (sys.arm9.register(15), sys.arm9.irq_enabled())
+        } else {
+            (sys.arm7.register(15), sys.arm7.irq_enabled())
+        };
+        let irqs = sys.interrupts(core);
+        let who = if core == Core::Arm9 { "ARM9" } else { "ARM7" };
+        eprintln!(
+            "{who}: PC={pc:#010x} irq_enabled={irq_on} IME={} IE={:#010x} IF={:#010x} pending={} line={}",
+            irqs.ime(),
+            irqs.ie(),
+            irqs.iflags(),
+            irqs.pending(),
+            irqs.line_asserted(),
+        );
+    }
+    // Sample the spin range: record PCs over ~half a frame and list the distinct set.
+    cyctrace::enable();
+    let base = [cyctrace::len(0), cyctrace::len(1)];
+    let now = sys.now();
+    sys.run_until(now + _half_frame());
+    for core in 0..2 {
+        let pcs = cyctrace::slice(core, base[core]);
+        let set: BTreeSet<u32> = pcs.iter().copied().collect();
+        let who = if core == 0 { "ARM9" } else { "ARM7" };
+        eprintln!("{who} spin: {} instrs, {} distinct PCs: {:08X?}",
+            pcs.len(), set.len(), set.iter().take(24).collect::<Vec<_>>());
+    }
+}
+
+fn _half_frame() -> u64 {
+    // ~half a scanline-driven frame in master ticks; enough to capture a spin loop.
+    nds::ppu::CYCLES_PER_LINE * 130
+}
+
 /// Report DISPCNT + non-black pixel count each frame (has the game reached display?).
 #[test]
 #[ignore]

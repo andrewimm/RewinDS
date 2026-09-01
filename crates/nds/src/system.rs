@@ -56,6 +56,10 @@ pub mod cyctrace {
     pub fn len(core: usize) -> usize {
         TRACE[core].lock().unwrap().len()
     }
+    /// A copy of a core's recorded PCs from index `from` to the end.
+    pub fn slice(core: usize, from: usize) -> Vec<u32> {
+        TRACE[core].lock().unwrap()[from..].to_vec()
+    }
     pub fn dump(core: usize, path: &str) {
         use std::fmt::Write as _;
         let t = TRACE[core].lock().unwrap();
@@ -273,6 +277,10 @@ pub struct Machine {
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
     pub(crate) clock: [Timestamp; 2],
+    /// Per-core halt state: the ARM7 via `HALTCNT` (`0x4000301`), the ARM9 via the
+    /// CP15 wait-for-interrupt. A halted core executes nothing until an enabled
+    /// interrupt is pending (`IE & IF`, regardless of `IME`/CPSR.I).
+    pub(crate) halted: [bool; 2],
 }
 
 impl Machine {
@@ -296,6 +304,7 @@ impl Machine {
             keyinput: 0x03FF,   // all released
             extkeyin: 0x007F,   // X/Y released, pen up, hinge open
             postflg: [0, 0],
+            halted: [false, false],
             exmemcnt: 0,
             powcnt1: 0,
             clock: [0; 2],
@@ -596,6 +605,12 @@ impl Machine {
                 let mask = if core == Core::Arm9 { 0b11 } else { 0b01 };
                 self.postflg[c] |= value as u8 & mask;
             }
+            // HALTCNT: bits 6-7 select the power-down mode (2 = Halt, 3 = Sleep); both
+            // stop the ARM7 until an enabled interrupt is pending. Bit 7 marks either,
+            // which is all we model.
+            0x0400_0301 if core == Core::Arm7 && value & 0x80 != 0 => {
+                self.halted[c] = true;
+            }
             _ => {}
         }
     }
@@ -700,14 +715,29 @@ impl System {
                 .next_deadline()
                 .map_or(target, |d| d.min(target));
 
-            // Step the more-behind core (ties to the ARM9) until both reach the
-            // deadline. Every step advances the stepped core's clock, so this
-            // terminates.
-            while self.machine.clock[0].min(self.machine.clock[1]) < deadline {
-                let core = if self.machine.clock[0] <= self.machine.clock[1] {
+            // Step the more-behind *runnable* core (ties to the ARM9) until both reach
+            // the deadline. A halted core runs nothing: it wakes once an enabled
+            // interrupt is pending (Halt terminates on `IE & IF` regardless of `IME`/
+            // CPSR.I — the IRQ itself is taken only if allowed), otherwise it idles to
+            // the deadline so the barrier can advance and events there may wake it.
+            loop {
+                for c in 0..2 {
+                    if self.machine.halted[c] && self.machine.interrupts[c].pending() {
+                        self.machine.halted[c] = false;
+                    }
+                    if self.machine.halted[c] && self.machine.clock[c] < deadline {
+                        self.machine.clock[c] = deadline;
+                    }
+                }
+                let (c0, c1) = (self.machine.clock[0], self.machine.clock[1]);
+                let run0 = !self.machine.halted[0] && c0 < deadline;
+                let run1 = !self.machine.halted[1] && c1 < deadline;
+                let core = if run0 && (!run1 || c0 <= c1) {
                     Core::Arm9
-                } else {
+                } else if run1 {
                     Core::Arm7
+                } else {
+                    break;
                 };
                 self.step_core(core);
             }
