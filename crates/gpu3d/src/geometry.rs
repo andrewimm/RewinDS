@@ -27,12 +27,12 @@ pub const MAX_POLY_VERTS: usize = 10;
 pub const CLIP_GENERATED: u8 = 0xFF;
 
 /// A geometry vertex after transform and clipping: clip-space position plus the
-/// attributes to interpolate. Colors are 5-bit RGB (expanded later); texcoords 1.11.4.
+/// attributes to interpolate. Colors are 6-bit RGB; texcoords 1.11.4.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Vertex {
     /// Clip-space `(x, y, z, w)` in 4.12 (before the perspective divide).
     pub clip: [i32; 4],
-    /// Vertex color, 5-bit per channel (`COLOR`, or lighting output in Phase 6).
+    /// Vertex color, 6-bit per channel — `COLOR` (5-bit expanded) or lighting output.
     pub color: [u8; 3],
     /// Texture coordinate `(s, t)` in 1.11.4.
     pub texcoord: [i32; 2],
@@ -77,13 +77,70 @@ impl ClipVertex {
         Vertex {
             clip: self.clip,
             color: [
-                self.color[0].clamp(0, 31) as u8,
-                self.color[1].clamp(0, 31) as u8,
-                self.color[2].clamp(0, 31) as u8,
+                self.color[0].clamp(0, 63) as u8,
+                self.color[1].clamp(0, 63) as u8,
+                self.color[2].clamp(0, 63) as u8,
             ],
             texcoord: self.texcoord,
         }
     }
+}
+
+/// One of the four directional lights: its transformed direction and half vector
+/// (1.9 fixed, `1.0 == 512`) and its color (6-bit per channel).
+#[derive(Clone, Copy, Default)]
+struct Light {
+    dir: [i32; 3],
+    half: [i32; 3],
+    color: [i32; 3],
+}
+
+/// Material colors, the shininess table, and the four lights — the lighting state
+/// sampled by `NORMAL`. Colors are 6-bit (0-63); levels use a 1/512 fixed scale.
+struct Lighting {
+    emission: [i32; 3],
+    diffuse: [i32; 3],
+    ambient: [i32; 3],
+    specular: [i32; 3],
+    shininess: [u8; 128],
+    use_table: bool,
+    lights: [Light; 4],
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        Lighting {
+            emission: [0; 3],
+            diffuse: [0; 3],
+            ambient: [0; 3],
+            specular: [0; 3],
+            shininess: [0; 128],
+            use_table: false,
+            lights: [Light::default(); 4],
+        }
+    }
+}
+
+/// Dot product of two 3-vectors in `i64` (vector components are ~1.9, so the product
+/// is 1/512² scale).
+fn dot3(a: &[i32; 3], b: &[i32; 3]) -> i64 {
+    a[0] as i64 * b[0] as i64 + a[1] as i64 * b[1] as i64 + a[2] as i64 * b[2] as i64
+}
+
+/// Expand a 5-bit color channel to 6 bits (`31 -> 63`, `0 -> 0`).
+fn expand6(c5: u32) -> i32 {
+    let c = (c5 & 0x1F) as i32;
+    (c << 1) | (c >> 4)
+}
+
+/// Unpack an `RGB555` (bits 0-14 of `word`) to 6-bit `[r, g, b]`.
+fn unpack_rgb6(word: u32) -> [i32; 3] {
+    [expand6(word), expand6(word >> 5), expand6(word >> 10)]
+}
+
+/// Narrow a 6-bit color triple to the stored `[u8; 3]` (already in range).
+fn color6(c: [i32; 3]) -> [u8; 3] {
+    [c[0] as u8, c[1] as u8, c[2] as u8]
 }
 
 /// Sign-extend the low 10 bits of `v` (used by `VTX_10`, `VTX_DIFF`, `NORMAL`).
@@ -265,6 +322,7 @@ impl Assembler {
 pub struct GeometryEngine {
     pub matrix: MatrixEngine,
     state: State,
+    lighting: Lighting,
     vertices: Vec<Vertex>,
     polygons: Vec<Polygon>,
     /// Provenance parallel to `vertices` (same index; cleared together on swap).
@@ -332,9 +390,48 @@ impl GeometryEngine {
             MTX_SCALE => self.matrix.scale(params),
             MTX_TRANS => self.matrix.translate(params),
 
-            COLOR => self.state.color = unpack_rgb5(params[0]),
+            COLOR => self.state.color = color6(unpack_rgb6(params[0])),
             TEXCOORD => {
                 self.state.texcoord = [se16(params[0]), se16(params[0] >> 16)];
+            }
+
+            DIF_AMB => {
+                let p = params[0];
+                self.lighting.diffuse = unpack_rgb6(p);
+                self.lighting.ambient = unpack_rgb6(p >> 16);
+                if p & (1 << 15) != 0 {
+                    // Bit 15: also set the diffuse color as the current vertex color.
+                    self.state.color = color6(self.lighting.diffuse);
+                }
+            }
+            SPE_EMI => {
+                let p = params[0];
+                self.lighting.specular = unpack_rgb6(p);
+                self.lighting.emission = unpack_rgb6(p >> 16);
+                self.lighting.use_table = p & (1 << 15) != 0;
+            }
+            SHININESS => {
+                for (i, &w) in params.iter().enumerate().take(32) {
+                    for b in 0..4 {
+                        self.lighting.shininess[i * 4 + b] = (w >> (b * 8)) as u8;
+                    }
+                }
+            }
+            LIGHT_VECTOR => {
+                let p = params[0];
+                let dir = self.transform_direction([se10(p), se10(p >> 10), se10(p >> 20)]);
+                let num = ((p >> 30) & 3) as usize;
+                self.lighting.lights[num].dir = dir;
+                // Half vector = (direction + line-of-sight (0,0,-1)) / 2, in 1.9.
+                self.lighting.lights[num].half = [dir[0] / 2, dir[1] / 2, (dir[2] - 512) / 2];
+            }
+            LIGHT_COLOR => {
+                let p = params[0];
+                self.lighting.lights[((p >> 30) & 3) as usize].color = unpack_rgb6(p);
+            }
+            NORMAL => {
+                let p = params[0];
+                self.compute_lighting([se10(p), se10(p >> 10), se10(p >> 20)]);
             }
 
             VTX_16 => {
@@ -381,9 +478,58 @@ impl GeometryEngine {
             END_VTXS => {}
             SWAP_BUFFERS => self.swap_buffers(),
 
-            // NORMAL / lighting / materials — Phase 6; other commands — later phases.
+            // BOX/POS/VEC_TEST and unknown opcodes — later phases.
             _ => {}
         }
+    }
+
+    /// Transform a direction (normal or light vector) by the 3×3 of the directional
+    /// (vector) matrix, keeping it in 1.9 fixed-point (`>> 12`).
+    fn transform_direction(&self, v: [i32; 3]) -> [i32; 3] {
+        let m = &self.matrix.vector().m;
+        let mut out = [0i32; 3];
+        for (i, o) in out.iter_mut().enumerate() {
+            let mut acc = 0i64;
+            for (j, &vj) in v.iter().enumerate() {
+                acc += m[j * 4 + i] as i64 * vj as i64;
+            }
+            *o = (acc >> 12) as i32;
+        }
+        out
+    }
+
+    /// `NORMAL`: transform the normal by the directional matrix and compute the vertex
+    /// color from emission + each enabled light's ambient/diffuse/specular terms
+    /// (GBATEK formula). Colors are 6-bit; levels are 1/512 fixed and combine as
+    /// `(material·light >> 6) · level >> 9`.
+    fn compute_lighting(&mut self, normal_raw: [i32; 3]) {
+        let n = self.transform_direction(normal_raw);
+        let attr = self.state.cur_attr;
+        let mut color = self.lighting.emission;
+        for i in 0..4 {
+            if attr & (1 << i) == 0 {
+                continue; // light i disabled by POLYGON_ATTR
+            }
+            let light = &self.lighting.lights[i];
+            let diffuse_level = ((-dot3(&light.dir, &n)) >> 9).clamp(0, 512) as i32;
+            let shine_dot = ((-dot3(&light.half, &n)) >> 9).clamp(0, 512) as i32;
+            let mut shine_level = (shine_dot * shine_dot) >> 9; // (-H·N)^2, in 1/512
+            if self.lighting.use_table {
+                let idx = ((shine_level >> 2) as usize).min(127);
+                shine_level = (self.lighting.shininess[idx] as i32) << 1; // 8-bit → 1/512
+            }
+            for (c, chan) in color.iter_mut().enumerate() {
+                let lc = light.color[c];
+                *chan += ((self.lighting.ambient[c] * lc) >> 6)
+                    + ((((self.lighting.diffuse[c] * lc) >> 6) * diffuse_level) >> 9)
+                    + ((((self.lighting.specular[c] * lc) >> 6) * shine_level) >> 9);
+            }
+        }
+        self.state.color = [
+            color[0].clamp(0, 63) as u8,
+            color[1].clamp(0, 63) as u8,
+            color[2].clamp(0, 63) as u8,
+        ];
     }
 
     /// Transform the current position by the clip matrix into a clip-space vertex and
@@ -498,15 +644,6 @@ impl GeometryEngine {
         self.assembler.run.clear();
         self.command_seq = 0;
     }
-}
-
-/// Unpack an `RGB555` color word into 5-bit `[r, g, b]`.
-fn unpack_rgb5(word: u32) -> [u8; 3] {
-    [
-        (word & 0x1F) as u8,
-        ((word >> 5) & 0x1F) as u8,
-        ((word >> 10) & 0x1F) as u8,
-    ]
 }
 
 #[cfg(test)]
@@ -640,7 +777,7 @@ mod tests {
             vtx(&mut e, i, i, 0);
         }
         assert_eq!(e.polygons()[0].attr, (1 << 6) | (1 << 7) | (0xBEEF << 8));
-        assert_eq!(e.vertices()[0].color, [31, 0, 31]);
+        assert_eq!(e.vertices()[0].color, [63, 0, 63]); // 5-bit 31 → 6-bit 63
     }
 
     #[test]
@@ -699,7 +836,7 @@ mod tests {
         vtx(&mut e, 12, -4, 0);
         let p = &e.polygons()[0];
         let reds: Vec<u8> = (0..p.count as usize).map(|j| e.vertices()[p.verts[j] as usize].color[0]).collect();
-        assert!(reds.iter().any(|&r| r > 0 && r < 31), "an interpolated red between 0 and 31: {reds:?}");
+        assert!(reds.iter().any(|&r| r > 0 && r < 63), "an interpolated red between 0 and 63: {reds:?}");
     }
 
     #[test]
@@ -767,6 +904,79 @@ mod tests {
         assert_eq!(e.explain_vertex(0), None); // provenance cleared with the buffers
     }
 
+    /// Complete an in-frustum triangle and return its first vertex's (lit) color.
+    fn triangle_color(e: &mut GeometryEngine) -> [u8; 3] {
+        vtx(e, 0, 0, 0);
+        vtx(e, 2, 0, 0);
+        vtx(e, 0, 2, 0);
+        e.vertices()[0].color
+    }
+
+    #[test]
+    fn lighting_emission_is_the_baseline_without_lights() {
+        let mut e = engine();
+        e.execute(op::SPE_EMI, &[0x1F << 16]); // emission red = 31 → 63
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7)]); // render both, no lights
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::NORMAL, &[0]);
+        assert_eq!(triangle_color(&mut e), [63, 0, 0]);
+    }
+
+    #[test]
+    fn lighting_diffuse_responds_to_normal_orientation() {
+        // Light 0 along -Z, red diffuse material and red light.
+        let setup = |e: &mut GeometryEngine, normal: u32| {
+            let z = ((-256i32) as u32) & 0x3FF;
+            e.execute(op::LIGHT_VECTOR, &[z << 20]); // light 0 dir (0,0,-256)
+            e.execute(op::LIGHT_COLOR, &[0x1F]); // red
+            e.execute(op::DIF_AMB, &[0x1F]); // diffuse red, ambient 0
+            e.execute(op::SPE_EMI, &[0]); // no specular/emission
+            e.execute(op::POLYGON_ATTR, &[1 | (1 << 6) | (1 << 7)]); // light 0 + render both
+            e.execute(op::BEGIN_VTXS, &[0]);
+            e.execute(op::NORMAL, &[normal]);
+        };
+        let mut facing = engine();
+        setup(&mut facing, (256u32 & 0x3FF) << 20); // normal +Z, toward the light
+        let mut perp = engine();
+        setup(&mut perp, 256u32 & 0x3FF); // normal +X, perpendicular
+        assert!(triangle_color(&mut facing)[0] > 0, "diffuse when facing the light");
+        assert_eq!(triangle_color(&mut perp)[0], 0, "no diffuse when perpendicular");
+    }
+
+    #[test]
+    fn lighting_ambient_adds_regardless_of_normal() {
+        let mut e = engine();
+        e.execute(op::LIGHT_COLOR, &[0x1F]); // light 0 red
+        e.execute(op::DIF_AMB, &[0x1F << 16]); // ambient red, diffuse 0
+        e.execute(op::SPE_EMI, &[0]);
+        e.execute(op::POLYGON_ATTR, &[1 | (1 << 6) | (1 << 7)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::NORMAL, &[0]);
+        assert!(triangle_color(&mut e)[0] > 0, "ambient always contributes");
+    }
+
+    #[test]
+    fn dif_amb_bit15_sets_the_vertex_color() {
+        let mut e = engine();
+        e.execute(op::DIF_AMB, &[0x1F | (1 << 15)]); // diffuse red + set-vertex-color
+        begin(&mut e, 0);
+        assert_eq!(triangle_color(&mut e), [63, 0, 0]); // no NORMAL: color from bit 15
+    }
+
+    #[test]
+    fn lighting_specular_uses_the_shininess_table() {
+        let mut e = engine();
+        let z = ((-256i32) as u32) & 0x3FF;
+        e.execute(op::LIGHT_VECTOR, &[z << 20]); // light 0 along -Z
+        e.execute(op::LIGHT_COLOR, &[0x7FFF]); // white
+        e.execute(op::SPE_EMI, &[0x7FFF | (1 << 15)]); // specular white + table enable
+        e.execute(op::SHININESS, &[0xFFFF_FFFF; 32]); // table saturated
+        e.execute(op::POLYGON_ATTR, &[1 | (1 << 6) | (1 << 7)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::NORMAL, &[(256u32 & 0x3FF) << 20]); // normal +Z
+        assert!(triangle_color(&mut e)[0] > 0, "specular via the table contributes");
+    }
+
     #[test]
     fn swap_buffers_resets_the_build_buffers() {
         let mut e = engine();
@@ -780,3 +990,4 @@ mod tests {
         assert_eq!(e.ram_count(), 0);
     }
 }
+
