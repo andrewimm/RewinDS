@@ -1211,6 +1211,24 @@ impl System {
         self.machine.ppu.frame()
     }
 
+    /// A snapshot of a 2D engine's register file, for debugging (0 = A, 1 = B).
+    pub fn engine_registers(&self, engine: usize) -> video2d::Registers {
+        self.machine.ppu.engine_registers(engine)
+    }
+
+    /// Debug: per-layer pixel coverage `[bg0, bg1, bg2, bg3, obj]` for a 2D engine —
+    /// how many pixels each layer contributes in isolation.
+    pub fn debug_layer_coverage(&mut self, engine: usize) -> [usize; 5] {
+        let m = &mut self.machine;
+        m.ppu.debug_layer_coverage(engine, &m.vram, &m.memory.palette, &m.memory.oam)
+    }
+
+    /// Debug: the isolated BGR555 framebuffer for one layer (BG 0-3, OBJ = 4).
+    pub fn debug_render_layer(&mut self, engine: usize, layer: usize) -> Vec<u16> {
+        let m = &mut self.machine;
+        m.ppu.debug_render_layer(engine, layer, &m.vram, &m.memory.palette, &m.memory.oam)
+    }
+
     /// A core's interrupt controller, for inspection and test setup.
     pub fn interrupts(&self, core: Core) -> &Interrupts {
         &self.machine.interrupts[core.index()]

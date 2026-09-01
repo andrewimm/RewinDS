@@ -138,14 +138,6 @@ impl Engine {
         oam: &[u8],
         three_d: Option<&gpu3d::raster::Framebuffer3d>,
     ) {
-        video2d::latch::reload_affine_references(&self.registers, &mut self.affine);
-        video2d::latch::latch_for_scanline(
-            &self.registers,
-            &self.affine,
-            &mut self.latched,
-            &mut self.segments,
-        );
-
         let (bg_view, obj_view) = self.vram_view.split_at_mut(OBJ_VIEW_BASE as usize);
         if self.is_b {
             vram.assemble_engine_b_bg(bg_view);
@@ -187,6 +179,19 @@ impl Engine {
         // BG0 sources the 3D engine when DISPCNT bit 3 is set (Engine A only).
         let bg0_3d = three_d.filter(|_| self.dispcnt & (1 << 3) != 0);
         for y in 0..HEIGHT as u16 {
+            // Reconstruct each affine/extended BG's reference for this scanline (the
+            // reference advances by PB/PD down the frame) and re-latch, so affine and
+            // extended backgrounds sample the correct map row per line rather than a
+            // frozen line-0 reference. The whole frame renders at V-blank with the
+            // final register values, so mid-frame register changes are not modelled.
+            self.affine.bg2 = video2d::latch::affine_reference_for_line(&self.registers, 0, y);
+            self.affine.bg3 = video2d::latch::affine_reference_for_line(&self.registers, 1, y);
+            video2d::latch::latch_for_scanline(
+                &self.registers,
+                &self.affine,
+                &mut self.latched,
+                &mut self.segments,
+            );
             let line = bg0_3d.map(|fb| {
                 let mut l = [None; WIDTH];
                 for (x, cell) in l.iter_mut().enumerate() {
@@ -262,6 +267,64 @@ impl Ppu {
 
     pub fn dispcnt(&self, engine: usize) -> u32 {
         self.engines[engine].dispcnt
+    }
+
+    /// A snapshot of an engine's `video2d` register file, for debugging.
+    pub fn engine_registers(&self, engine: usize) -> video2d::Registers {
+        self.engines[engine].registers
+    }
+
+    /// Debug: render each 2D BG (0-3) and OBJ (index 4) of `engine` in isolation
+    /// (windows and 3D off) and count how many pixels differ from the backdrop —
+    /// revealing which layers actually contribute. Re-renders the engine normally
+    /// afterwards. Returns `[bg0, bg1, bg2, bg3, obj]`.
+    pub fn debug_layer_coverage(
+        &mut self,
+        engine: usize,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+    ) -> [usize; 5] {
+        let pal = &palette[engine * 0x400..engine * 0x400 + 0x400];
+        let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
+        let backdrop = u16::from_le_bytes([pal[0], pal[1]]) & 0x7FFF;
+        let e = &mut self.engines[engine];
+        let saved = e.registers.dispcnt;
+        let mut cov = [0usize; 5];
+        for (layer, c) in cov.iter_mut().enumerate() {
+            let enable = if layer < 4 { 1u16 << (8 + layer) } else { 1 << 12 };
+            // Enable only this layer; clear the other BG/OBJ enables, the window
+            // enables (bits 13-15), and the 3D-BG0 bit (bit 3) so BG0 renders as text.
+            e.registers.dispcnt = (saved & !0xFF08) | enable;
+            e.render(vram, pal, oam, None);
+            *c = e.framebuffer.iter().filter(|&&p| (p & 0x7FFF) != backdrop).count();
+        }
+        e.registers.dispcnt = saved;
+        e.render(vram, pal, oam, None);
+        cov
+    }
+
+    /// Debug: render just BG `layer` (or OBJ = 4) of `engine` in isolation and return
+    /// a copy of the resulting BGR555 framebuffer. Re-renders normally afterwards.
+    pub fn debug_render_layer(
+        &mut self,
+        engine: usize,
+        layer: usize,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+    ) -> Vec<u16> {
+        let pal = &palette[engine * 0x400..engine * 0x400 + 0x400];
+        let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
+        let e = &mut self.engines[engine];
+        let saved = e.registers.dispcnt;
+        let enable = if layer < 4 { 1u16 << (8 + layer) } else { 1 << 12 };
+        e.registers.dispcnt = (saved & !0xFF08) | enable;
+        e.render(vram, pal, oam, None);
+        let out = e.framebuffer.clone();
+        e.registers.dispcnt = saved;
+        e.render(vram, pal, oam, None);
+        out
     }
 
     pub fn write_dispcnt(&mut self, engine: usize, value: u32, bytes: u32) {
@@ -366,5 +429,48 @@ impl Ppu {
                     .schedule_at(now + CYCLES_PER_LINE, NdsEvent::Ppu(PpuEvent::LineStart));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vram::Vram;
+
+    /// An extended (affine-addressed) background must advance its reference point down
+    /// the frame, so different scanlines sample different map rows. Regression test for
+    /// the bug where the whole frame used a frozen line-0 reference, leaving affine and
+    /// extended BGs stuck on one map row (which made scrolled foreground layers vanish).
+    #[test]
+    fn extended_bg_advances_affine_reference_per_scanline() {
+        let mut ppu = Ppu::new();
+        let mut vram = Vram::new();
+        vram.set_control(3, 0x81); // bank D -> Engine A BG at 0x06000000
+
+        // 16-tile-wide map (size 0 = 128×128): row 0 -> tile 1, row 1 -> tile 2.
+        vram.write(0x0600_0000, 1, 2); // tile row 0, col 0
+        vram.write(0x0600_0000 + 16 * 2, 2, 2); // tile row 1, col 0
+        // 8bpp tiles at char base block 1 (0x4000): tile 1 = texel 1, tile 2 = texel 2.
+        for i in 0..32 {
+            vram.write(0x0600_4040 + i * 2, 0x0101, 2); // tile 1
+            vram.write(0x0600_4080 + i * 2, 0x0202, 2); // tile 2
+        }
+
+        let mut palette = vec![0u8; 0x800];
+        palette[2..4].copy_from_slice(&0x001Fu16.to_le_bytes()); // entry 1 = red
+        palette[4..6].copy_from_slice(&0x03E0u16.to_le_bytes()); // entry 2 = green
+        let oam = vec![0u8; 0x800];
+
+        // Engine A: mode 5 (BG2 extended), BG2 enabled, graphics display mode.
+        ppu.write_dispcnt(0, 5 | (1 << 10) | (1 << 16), 4);
+        ppu.write_register(0, 0x0C, 1 << 2, 0xFFFF); // BG2CNT: tiled, char base block 1
+        ppu.write_register(0, 0x20, 0x100, 0xFFFF); // BG2 PA = 1.0
+        ppu.write_register(0, 0x26, 0x100, 0xFFFF); // BG2 PD = 1.0 (ref advances by 1 px/line)
+
+        let fb = ppu.debug_render_layer(0, 2, &vram, &palette, &oam);
+        // Scanline 0 samples map row 0 (tile 1 = red); scanline 8 samples row 1 (tile 2
+        // = green). With the frozen-reference bug both would be red.
+        assert_eq!(fb[0], 0x001F, "scanline 0 samples map row 0 (red)");
+        assert_eq!(fb[8 * WIDTH], 0x03E0, "scanline 8 samples map row 1 (green)");
     }
 }

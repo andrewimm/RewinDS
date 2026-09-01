@@ -208,6 +208,25 @@ fn dump_frame() {
     let bgcnt_b: Vec<u16> = (0..4).map(|i| sys.read(Core::Arm9, 0x0400_1008 + i * 2, 2) as u16).collect();
     let vramcnt: Vec<u8> = (0..9).map(|b| sys.vram_control(b)).collect();
     eprintln!("EngineB DISPCNT={dispcnt_b:#010x} BGCNT={bgcnt_b:04X?}  VRAMCNT={vramcnt:02X?}");
+    for eng in 0..2 {
+        let r = sys.engine_registers(eng);
+        let dc = if eng == 0 { dispcnt_a } else { dispcnt_b };
+        eprintln!("  Engine{} mode={} dispcnt_low={:#06x} 3d_bg0={} ext_pal={}",
+            if eng == 0 { "A" } else { "B" }, dc & 7, r.dispcnt, (dc >> 3) & 1, (dc >> 30) & 3);
+        for bg in 0..4 {
+            let en = r.dispcnt & (1 << (8 + bg)) != 0;
+            eprintln!("    BG{bg}: enabled={en} BGCNT={:#06x} (prio={} charbase={} scrbase={} bit7={} bit2={} size={}) hofs={} vofs={}",
+                r.bgcnt[bg], r.bgcnt[bg] & 3, (r.bgcnt[bg] >> 2) & 0xF, (r.bgcnt[bg] >> 8) & 0x1F,
+                (r.bgcnt[bg] >> 7) & 1, (r.bgcnt[bg] >> 2) & 1, (r.bgcnt[bg] >> 14) & 3,
+                r.bg_hofs[bg], r.bg_vofs[bg]);
+        }
+        for k in 0..2 {
+            eprintln!("    BG{} affine: PA={} PB={} PC={} PD={} X={} Y={}", k + 2,
+                r.bg_pa[k], r.bg_pb[k], r.bg_pc[k], r.bg_pd[k], r.bg_ref_x[k], r.bg_ref_y[k]);
+        }
+        let cov = sys.debug_layer_coverage(eng);
+        eprintln!("    layer coverage [BG0,BG1,BG2,BG3,OBJ] = {cov:?}");
+    }
     // Both physical screens stacked vertically (top over bottom): 256 x 384.
     let mut rgb = Vec::with_capacity(256 * 384 * 3);
     for screen in 0..2 {
