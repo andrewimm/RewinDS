@@ -4,12 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Nintendo DS hardware semantics"
 
-[features]
-# Temporary: per-ARM9-instruction cycle-trace capture for cycle-accuracy
-# validation against a reference cycle trace. Compiled out by default; enable
-# with `--features cyctrace`. Remove once cycle accuracy is validated.
-cyctrace = []
-
 [dependencies]
 arm = { path = "../arm" }
 emu-core = { path = "../emu-core" }

@@ -51,3 +51,49 @@ pub fn user_settings() -> [u8; 0x70] {
                   // 0x68 RTC offset = 0.
     s
 }
+
+/// DS CRC16 (GBATEK SWI 0Eh `GetCRC16`, polynomial `0xA001`). Used to checksum the
+/// firmware user-settings blocks so the ARM7's firmware read accepts them.
+pub fn crc16(initial: u16, data: &[u8]) -> u16 {
+    let mut crc = initial;
+    for &byte in data {
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            let carry = crc & 1 != 0;
+            crc >>= 1;
+            if carry {
+                crc ^= 0xA001;
+            }
+        }
+    }
+    crc
+}
+
+/// A minimal 256 KB firmware flash image, as read over SPI by the ARM7. Direct boot
+/// skips the firmware, but games still read the touchscreen calibration and other
+/// user settings from flash via SPI; a game that finds no valid settings there (an
+/// all-zero calibration) skips its touchscreen init, which deadlocks the inter-core
+/// boot handshake. The header's User-Settings pointer (`[0x20]` = offset ÷ 8, GBATEK
+/// "DS Firmware Header") points at two settings areas at `0x3FE00`/`0x3FF00`, each a
+/// `[Self::user_settings]` copy plus an update counter and a CRC16 the game verifies.
+pub fn firmware_flash() -> Vec<u8> {
+    const SIZE: usize = 0x40000; // 256 KB
+    const AREA1: usize = 0x3FE00;
+    const AREA2: usize = 0x3FF00;
+    let mut flash = vec![0xFF; SIZE];
+
+    // Header: User-Settings offset (÷ 8) → area 1.
+    let ptr = (AREA1 / 8) as u16;
+    flash[0x20..0x22].copy_from_slice(&ptr.to_le_bytes());
+
+    let data = user_settings();
+    // Two copies for wear-levelling; the game picks the valid one with the higher
+    // update counter, so area 1 (counter 1) wins over area 2 (counter 0).
+    for (base, counter) in [(AREA1, 1u16), (AREA2, 0u16)] {
+        flash[base..base + 0x70].copy_from_slice(&data);
+        flash[base + 0x70..base + 0x72].copy_from_slice(&counter.to_le_bytes());
+        let crc = crc16(0xFFFF, &data);
+        flash[base + 0x72..base + 0x74].copy_from_slice(&crc.to_le_bytes());
+    }
+    flash
+}

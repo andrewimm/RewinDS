@@ -21,6 +21,7 @@ pub mod ipc;
 pub mod key1;
 pub mod memory;
 pub mod ppu;
+pub mod spi;
 pub mod system;
 pub mod timer;
 pub mod vram;

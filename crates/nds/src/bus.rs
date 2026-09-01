@@ -144,10 +144,6 @@ impl NdsCpuBus<'_> {
     /// Account an opcode fetch as the active core's `cFetch`. The ARM9 always fetches
     /// 32 bits (even in Thumb); the ARM7 fetches at the instruction width.
     fn advance_code(&mut self, address: u32, width: u32) {
-        #[cfg(feature = "cyctrace")]
-        if self.core == Core::Arm9 {
-            crate::system::cyctrace::record(address, self.machine.clock[0]);
-        }
         let c = self.core.index();
         // ARM9 fetches are always 32-bit and step by 4; ARM7 by its instruction width.
         let step = if self.core == Core::Arm9 {

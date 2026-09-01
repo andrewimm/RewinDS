@@ -129,7 +129,7 @@ impl Memory {
                 let (s, mask) = self.slot(slot);
                 s[off & mask]
             }
-            None => 0, // open bus
+            None => 0xFF, // open bus (e.g. the empty GBA/Slot-2 cartridge bus)
         }
     }
 
@@ -139,7 +139,7 @@ impl Memory {
                 let (s, mask) = self.slot(slot);
                 u16::from_le_bytes([s[off & mask], s[(off + 1) & mask]])
             }
-            None => 0,
+            None => 0xFFFF,
         }
     }
 
@@ -154,7 +154,7 @@ impl Memory {
                     s[(off + 3) & mask],
                 ])
             }
-            None => 0,
+            None => 0xFFFF_FFFF,
         }
     }
 

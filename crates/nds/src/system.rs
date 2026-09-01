@@ -27,43 +27,6 @@ use crate::timer::{TimerId, Timers};
 use crate::vram::Vram;
 use crate::{Cp15, Memory};
 
-/// Temporary per-ARM9-instruction cycle-trace capture (feature `cyctrace`), for
-/// validating cycle accuracy against a reference cycle trace. The bus records
-/// `(fetch_address, arm9_clock)` at the start of each ARM9 opcode fetch; consecutive
-/// clock deltas are the per-instruction cycle costs. Remove once validated.
-#[cfg(feature = "cyctrace")]
-pub mod cyctrace {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
-
-    pub static ENABLED: AtomicBool = AtomicBool::new(false);
-    pub static TRACE: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
-
-    /// Called from the bus at the start of each ARM9 opcode fetch.
-    pub fn record(address: u32, clock: u64) {
-        if ENABLED.load(Ordering::Relaxed) {
-            TRACE.lock().unwrap().push((address, clock));
-        }
-    }
-
-    pub fn enable() {
-        ENABLED.store(true, Ordering::Relaxed);
-    }
-    pub fn len() -> usize {
-        TRACE.lock().unwrap().len()
-    }
-    /// Dump `addr clock` lines to `path`.
-    pub fn dump(path: &str) {
-        use std::fmt::Write as _;
-        let t = TRACE.lock().unwrap();
-        let mut s = String::with_capacity(t.len() * 16);
-        for (a, c) in t.iter() {
-            let _ = writeln!(s, "{a:08x} {c}");
-        }
-        std::fs::write(path, s).unwrap();
-    }
-}
-
 /// Events on the shared DS timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NdsEvent {
@@ -161,6 +124,8 @@ pub struct Machine {
     pub(crate) ipc: Ipc,
     /// The gamecard slot: runtime ROM/filesystem streaming.
     pub(crate) cart: Cart,
+    /// The ARM7 SPI bus (firmware flash — the touchscreen calibration source).
+    pub(crate) spi: crate::spi::Spi,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
     /// the ARM946E-S 8 KB i-cache and 4 KB d-cache, both 4-way set-associative.
     pub(crate) icache: crate::icache::Cache,
@@ -193,6 +158,7 @@ impl Machine {
             ppu: Ppu::new(),
             ipc: Ipc::new(),
             cart: Cart::new(),
+            spi: crate::spi::Spi::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
             timing: [CoreTiming::default(), CoreTiming::default()],
@@ -341,6 +307,8 @@ impl Machine {
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
             0x0400_01A0 => self.cart.read_auxspicnt() as u32,
             0x0400_01A4 => self.cart.read_romctrl(),
+            0x0400_01C0 if core == Core::Arm7 => self.spi.read_cnt() as u32,
+            0x0400_01C2 if core == Core::Arm7 => self.spi.read_data() as u32,
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
             0x0400_0214 => self.interrupts[c].iflags(),
@@ -422,6 +390,15 @@ impl Machine {
             self.write_gamecard(core, addr, value, bytes);
             return;
         }
+        // ARM7 SPI bus: SPICNT (0x40001C0) / SPIDATA (0x40001C2), the firmware flash.
+        if core == Core::Arm7 && (0x0400_01C0..0x0400_01C4).contains(&addr) {
+            if addr < 0x0400_01C2 {
+                self.spi.write_cnt(value as u16);
+            } else {
+                self.spi.write_data(value as u16);
+            }
+            return;
+        }
         // Engine A 2D register block (BGxCNT..BLDY), ARM9 only.
         if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
             let base = addr - 0x0400_0000;
@@ -437,9 +414,7 @@ impl Machine {
         match addr {
             0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(value, bytes),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
-            0x0400_0180 => self
-                .ipc
-                .write_sync(core, value as u16, &mut self.interrupts),
+            0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self
                 .ipc
                 .write_fifocnt(core, value as u16, &mut self.interrupts),
