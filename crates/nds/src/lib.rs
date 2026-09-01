@@ -19,6 +19,7 @@ pub mod icache;
 pub mod interrupt;
 pub mod ipc;
 pub mod key1;
+pub mod math;
 pub mod memory;
 pub mod ppu;
 pub mod spi;

@@ -144,6 +144,10 @@ impl NdsCpuBus<'_> {
     /// Account an opcode fetch as the active core's `cFetch`. The ARM9 always fetches
     /// 32 bits (even in Thumb); the ARM7 fetches at the instruction width.
     fn advance_code(&mut self, address: u32, width: u32) {
+        #[cfg(feature = "cyctrace")]
+        if self.core == Core::Arm9 {
+            crate::system::cyctrace::record(address);
+        }
         let c = self.core.index();
         // ARM9 fetches are always 32-bit and step by 4; ARM7 by its instruction width.
         let step = if self.core == Core::Arm9 {
@@ -169,14 +173,39 @@ impl NdsCpuBus<'_> {
             return self.machine.vram.read(address, bytes);
         }
         let (mem, cp15) = (&self.machine.memory, &self.machine.cp15);
-        match bytes {
+        let value = match bytes {
             1 => mem.read8(self.core, address, instruction, cp15) as u32,
             2 => mem.read16(self.core, address, instruction, cp15) as u32,
             _ => mem.read32(self.core, address, instruction, cp15),
+        };
+        #[cfg(feature = "cyctrace")]
+        if !instruction {
+            let clock = self.machine.clock[self.core.index()];
+            crate::system::cyctrace::watch_access(
+                self.core.index() as u8,
+                address,
+                bytes,
+                false,
+                value,
+                clock,
+            );
         }
+        value
     }
 
     fn write(&mut self, address: u32, value: u32, bytes: u32) {
+        #[cfg(feature = "cyctrace")]
+        {
+            let clock = self.machine.clock[self.core.index()];
+            crate::system::cyctrace::watch_access(
+                self.core.index() as u8,
+                address,
+                bytes,
+                true,
+                value,
+                clock,
+            );
+        }
         if is_io(address) {
             self.machine
                 .io_write(self.core, address, value, bytes, self.scheduler);

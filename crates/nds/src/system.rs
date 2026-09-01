@@ -27,6 +27,83 @@ use crate::timer::{TimerId, Timers};
 use crate::vram::Vram;
 use crate::{Cp15, Memory};
 
+/// Debug instrumentation (feature `cyctrace`) for investigating DS boot divergences:
+/// an ARM9 opcode-fetch PC trace (diff against a reference to find where execution
+/// splits), an ARM9 register trap, and a Main-RAM byte watch. Compiled out by
+/// default; driven by `tests/cyc_capture.rs`.
+#[cfg(feature = "cyctrace")]
+pub mod cyctrace {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    /// ARM9 opcode-fetch PC trace (enabled via [`enable`]), for divergence diffing.
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub static TRACE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+    pub fn record(pc: u32) {
+        if ENABLED.load(Ordering::Relaxed) {
+            TRACE.lock().unwrap().push(pc);
+        }
+    }
+    pub fn len() -> usize {
+        TRACE.lock().unwrap().len()
+    }
+    pub fn dump(path: &str) {
+        use std::fmt::Write as _;
+        let t = TRACE.lock().unwrap();
+        let mut s = String::with_capacity(t.len() * 9);
+        for pc in t.iter() {
+            let _ = writeln!(s, "{pc:08X}");
+        }
+        std::fs::write(path, s).unwrap();
+    }
+
+    /// An ARM9 instruction address to trap on (registers snapshotted), or `u32::MAX`.
+    pub static TRIGGER: AtomicU32 = AtomicU32::new(u32::MAX);
+    pub static REGS: Mutex<Vec<[u32; 16]>> = Mutex::new(Vec::new());
+    /// A byte address to watch, or `u32::MAX`. Reads/writes touching it are logged.
+    pub static WATCH: AtomicU32 = AtomicU32::new(u32::MAX);
+    pub static WATCH_LOG: Mutex<Vec<(u8, bool, u32, u64)>> = Mutex::new(Vec::new());
+
+    pub fn trigger(addr: u32) {
+        TRIGGER.store(addr, Ordering::Relaxed);
+    }
+    pub fn is_trigger(pc: u32) -> bool {
+        pc == TRIGGER.load(Ordering::Relaxed)
+    }
+    pub fn snapshot(regs: [u32; 16]) {
+        REGS.lock().unwrap().push(regs);
+    }
+    pub fn take_regs() -> Vec<[u32; 16]> {
+        std::mem::take(&mut REGS.lock().unwrap())
+    }
+    pub fn watch(addr: u32) {
+        WATCH.store(addr, Ordering::Relaxed);
+    }
+    pub fn watch_access(core: u8, address: u32, bytes: u32, is_write: bool, value: u32, clock: u64) {
+        let target = WATCH.load(Ordering::Relaxed);
+        if target == u32::MAX {
+            return;
+        }
+        // Main RAM is compared modulo its 4 MB mirror; other regions exactly.
+        let hit = if (address >> 24) & 0x0F == 0x02 && (target >> 24) & 0x0F == 0x02 {
+            let off = address & 0x003F_FFFF;
+            (off..off + bytes).contains(&(target & 0x003F_FFFF))
+        } else {
+            (address..address + bytes).contains(&target)
+        };
+        if hit {
+            WATCH_LOG.lock().unwrap().push((core, is_write, value, clock));
+        }
+    }
+    pub fn take_watch_log() -> Vec<(u8, bool, u32, u64)> {
+        std::mem::take(&mut WATCH_LOG.lock().unwrap())
+    }
+}
+
 /// Events on the shared DS timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NdsEvent {
@@ -126,6 +203,8 @@ pub struct Machine {
     pub(crate) cart: Cart,
     /// The ARM7 SPI bus (firmware flash — the touchscreen calibration source).
     pub(crate) spi: crate::spi::Spi,
+    /// The ARM9 hardware division and square-root units.
+    pub(crate) math: crate::math::Math,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
     /// the ARM946E-S 8 KB i-cache and 4 KB d-cache, both 4-way set-associative.
     pub(crate) icache: crate::icache::Cache,
@@ -159,6 +238,7 @@ impl Machine {
             ipc: Ipc::new(),
             cart: Cart::new(),
             spi: crate::spi::Spi::new(),
+            math: crate::math::Math::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
             timing: [CoreTiming::default(), CoreTiming::default()],
@@ -309,6 +389,9 @@ impl Machine {
             0x0400_01A4 => self.cart.read_romctrl(),
             0x0400_01C0 if core == Core::Arm7 => self.spi.read_cnt() as u32,
             0x0400_01C2 if core == Core::Arm7 => self.spi.read_data() as u32,
+            0x0400_0280..=0x0400_02BF if core == Core::Arm9 => {
+                self.math.read(addr & 0xFFF, bytes)
+            }
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
             0x0400_0214 => self.interrupts[c].iflags(),
@@ -397,6 +480,11 @@ impl Machine {
             } else {
                 self.spi.write_data(value as u16);
             }
+            return;
+        }
+        // ARM9 hardware division / square-root units.
+        if core == Core::Arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
+            self.math.write(addr & 0xFFF, value, bytes);
             return;
         }
         // Engine A 2D register block (BGxCNT..BLDY), ARM9 only.
@@ -552,6 +640,10 @@ impl System {
     /// Execute one instruction on `core` against its view of the machine, first
     /// accepting a pending interrupt at the boundary if the core allows it.
     fn step_core(&mut self, core: Core) {
+        #[cfg(feature = "cyctrace")]
+        if core == Core::Arm9 && cyctrace::is_trigger(self.arm9.register(15)) {
+            cyctrace::snapshot(std::array::from_fn(|i| self.arm9.register(i)));
+        }
         // The ARM9 selects high exception vectors (0xFFFF0000) through CP15; keep
         // the core's base in sync so SWIs/IRQs reach the BIOS handlers.
         if core == Core::Arm9 {

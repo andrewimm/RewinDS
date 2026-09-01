@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Nintendo DS hardware semantics"
 
+[features]
+# Debug instrumentation for chasing DS boot divergences: an ARM9 PC trace, a
+# register trap, and a memory watch. Compiled out by default; enable with
+# `--features cyctrace` (see `tests/cyc_capture.rs`).
+cyctrace = []
+
 [dependencies]
 arm = { path = "../arm" }
 emu-core = { path = "../emu-core" }
 video2d = { path = "../video2d" }
+
+[dev-dependencies]
+arm = { path = "../arm" }
