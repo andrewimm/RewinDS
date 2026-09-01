@@ -199,10 +199,15 @@ fn dot3(a: &[i32; 3], b: &[i32; 3]) -> i64 {
     a[0] as i64 * b[0] as i64 + a[1] as i64 * b[1] as i64 + a[2] as i64 * b[2] as i64
 }
 
-/// Expand a 5-bit color channel to 6 bits (`31 -> 63`, `0 -> 0`).
+/// Expand a 5-bit color channel to 6 bits per GBATEK (`0 -> 0`, else `c·2+1`; so
+/// `31 -> 63`, `1 -> 3`).
 fn expand6(c5: u32) -> i32 {
     let c = (c5 & 0x1F) as i32;
-    (c << 1) | (c >> 4)
+    if c == 0 {
+        0
+    } else {
+        c * 2 + 1
+    }
 }
 
 /// Unpack an `RGB555` (bits 0-14 of `word`) to 6-bit `[r, g, b]`.

@@ -140,6 +140,42 @@ impl Vram {
         }
     }
 
+    /// Assemble the 3D texture image (512 KB = 4 slots × 128 KB) from banks A–D routed
+    /// to texture (`MST 3`), each at `0x2_0000 * OFS`. Texture VRAM is not
+    /// CPU-addressable, so this reads the banks directly. The rasterizer indexes into
+    /// this by the `TEXIMAGE_PARAM` VRAM offset.
+    pub fn assemble_texture_image(&self, out: &mut [u8]) {
+        out.fill(0);
+        for bank in 0..4usize {
+            let cnt = self.vramcnt[bank];
+            if cnt & 0x80 == 0 || cnt & 7 != 3 {
+                continue;
+            }
+            let ofs = ((cnt >> 3) & 3) as usize;
+            copy_into(out, ofs * 0x2_0000, &self.banks[bank], 0x2_0000);
+        }
+    }
+
+    /// Assemble the 3D texture palette (`0x18000` = 6 slots × 16 KB) from banks routed
+    /// to texture palette (`MST 3`): E fills slots 0-3 (its low 32 KB at offset 0);
+    /// F/G each fill one 16 KB slot selected by OFS (slot `(OFS.0) + (OFS.1)·4`).
+    pub fn assemble_texture_palette(&self, out: &mut [u8]) {
+        out.fill(0);
+        // Bank E: 64 KB at slot 0.
+        if self.vramcnt[4] & 0x80 != 0 && self.vramcnt[4] & 7 == 3 {
+            copy_into(out, 0, &self.banks[4], 0x1_0000);
+        }
+        for bank in [5usize, 6] {
+            let cnt = self.vramcnt[bank];
+            if cnt & 0x80 == 0 || cnt & 7 != 3 {
+                continue;
+            }
+            let ofs = ((cnt >> 3) & 3) as usize;
+            let slot = (ofs & 1) + ((ofs >> 1) & 1) * 4;
+            copy_into(out, slot * 0x4000, &self.banks[bank], 0x4000);
+        }
+    }
+
     /// Assemble the Engine-B OBJ extended palette (8 KB) from bank I (`MST 3`).
     pub fn assemble_obj_ext_b(&self, out: &mut [u8]) {
         out.fill(0);

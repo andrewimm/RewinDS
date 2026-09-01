@@ -18,6 +18,7 @@ pub mod fifo;
 pub mod geometry;
 pub mod matrix;
 pub mod raster;
+pub mod texture;
 
 use command::Decoder;
 use debug::{Polygon3dProvenance, Vertex3dProvenance};
@@ -38,10 +39,8 @@ mod reg {
     pub const VECMTX_HI: u32 = 0x6A4; // exclusive; 9 words
 }
 
-/// The 3D engine device: the command FIFO and its decoder, plus the GX control
-/// registers. The geometry engine, render buffers, and rasterizer attach in later
-/// phases.
-#[derive(Default)]
+/// The 3D engine device: the command FIFO and its decoder, the geometry engine, the
+/// rasterizer's output buffer, texture VRAM, and the GX control registers.
 pub struct Gpu3d {
     fifo: Fifo,
     decoder: Decoder,
@@ -52,11 +51,42 @@ pub struct Gpu3d {
     /// was rendered from (so it is rasterized at most once per swap).
     framebuffer: raster::Framebuffer3d,
     rendered_frame: u64,
+    /// The assembled texture-image VRAM (512 KB) and texture-palette VRAM (`0x18000`),
+    /// refreshed by the `nds` glue from banked VRAM before each render. The engine
+    /// owns the storage but stays ignorant of the VRAM banking that fills it.
+    tex_image: Box<[u8]>,
+    tex_palette: Box<[u8]>,
+}
+
+impl Default for Gpu3d {
+    fn default() -> Self {
+        Gpu3d::new()
+    }
 }
 
 impl Gpu3d {
     pub fn new() -> Self {
-        Gpu3d::default()
+        Gpu3d {
+            fifo: Fifo::default(),
+            decoder: Decoder::default(),
+            geometry: GeometryEngine::default(),
+            disp3dcnt: 0,
+            framebuffer: raster::Framebuffer3d::new(),
+            rendered_frame: 0,
+            tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
+            tex_palette: vec![0u8; 0x1_8000].into_boxed_slice(),
+        }
+    }
+
+    /// The texture-image VRAM buffer, for the `nds` glue to refresh from banked VRAM
+    /// before a render (512 KB, indexed by the `TEXIMAGE_PARAM` offset).
+    pub fn texture_image_mut(&mut self) -> &mut [u8] {
+        &mut self.tex_image
+    }
+
+    /// The texture-palette VRAM buffer, likewise refreshed before a render (`0x18000`).
+    pub fn texture_palette_mut(&mut self) -> &mut [u8] {
+        &mut self.tex_palette
     }
 
     // --- command submission -------------------------------------------------
@@ -104,11 +134,13 @@ impl Gpu3d {
     }
 
     /// Rasterize the sealed render list into the internal framebuffer (once per swap;
-    /// a no-op if already rendered for the current frame). Called at V-blank.
+    /// a no-op if already rendered for the current frame), sampling from the texture
+    /// VRAM the glue refreshed via [`Gpu3d::texture_image_mut`]. Called at V-blank.
     pub fn render_frame(&mut self) {
         let frame = self.geometry.render_list().frame;
         if frame != self.rendered_frame {
-            raster::render(self.geometry.render_list(), &mut self.framebuffer);
+            let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
+            raster::render(self.geometry.render_list(), &tex, &mut self.framebuffer);
             self.rendered_frame = frame;
         }
     }
@@ -116,6 +148,11 @@ impl Gpu3d {
     /// The rasterized 3D framebuffer (256×192), composited as Engine A's BG0.
     pub fn framebuffer_3d(&self) -> &raster::Framebuffer3d {
         &self.framebuffer
+    }
+
+    /// `DISP3DCNT` (`0x4000060`): the 3D display/blend/test/fog enable bits.
+    pub fn disp3dcnt(&self) -> u16 {
+        self.disp3dcnt
     }
 
     /// Execute every complete command buffered in the FIFO (a command is complete

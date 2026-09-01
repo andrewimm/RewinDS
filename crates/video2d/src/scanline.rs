@@ -17,8 +17,8 @@ use crate::memory::{PpuMemoryView, VramLayout};
 use crate::obj;
 use crate::priority;
 use crate::state::{
-    CandidatePixel, Color15, Framebuffer, LatchedState, LayerId, PixelFlags, Scratch,
-    ScanlineSegment,
+    CandidatePixel, Color15, ExternalBg0Pixel, Framebuffer, LatchedState, LayerId, PixelFlags,
+    Scratch, ScanlineSegment,
 };
 use crate::window;
 
@@ -54,7 +54,7 @@ pub fn render_scanline<S: ProvenanceSink>(
     y: u16,
     mem: &PpuMemoryView<'_>,
     layout: VramLayout,
-    external_bg0: Option<&[Option<Color15>]>,
+    external_bg0: Option<&[Option<ExternalBg0Pixel>]>,
     sink: &mut S,
 ) {
     let first_state = segments[0].state;
@@ -99,12 +99,15 @@ pub fn render_scanline<S: ProvenanceSink>(
         if let Some(line) = external_bg0 {
             let priority = (seg.state.regs.bgcnt[0] & 3) as u8;
             for (x, cell) in line.iter().enumerate().take(x_end).skip(x_start) {
-                if let Some(color) = *cell {
+                if let Some(px) = *cell {
+                    // Tag every 3D pixel with its coverage alpha so the effects stage
+                    // blends the 3D layer over the 2D behind it by the 3D alpha (opaque
+                    // 3D included, so it is not washed out by an additive BLDALPHA).
                     scratch.bg[0].pixels[x] = Some(CandidatePixel {
-                        color,
+                        color: px.color,
                         layer: LayerId::Bg0,
                         priority,
-                        flags: PixelFlags::default(),
+                        flags: PixelFlags { three_d_alpha: Some(px.alpha), ..PixelFlags::default() },
                     });
                 }
             }

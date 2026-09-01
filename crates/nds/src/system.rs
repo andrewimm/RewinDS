@@ -704,8 +704,11 @@ impl EventHandler<NdsEvent> for Machine {
                 self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
             }
             NdsEvent::Ppu(event) => {
-                // Rasterize the sealed 3D frame (cached, so at most once per swap)
+                // Refresh the 3D engine's texture VRAM from the banked VRAM, then
+                // rasterize the sealed 3D frame (cached, so at most once per swap)
                 // before the PPU composites it as Engine A's BG0.
+                self.vram.assemble_texture_image(self.gpu3d.texture_image_mut());
+                self.vram.assemble_texture_palette(self.gpu3d.texture_palette_mut());
                 self.gpu3d.render_frame();
                 // `ppu`, `interrupts`, `vram`, `memory`, and `gpu3d` are disjoint fields.
                 self.ppu.handle_event(
@@ -788,11 +791,40 @@ impl System {
         (rl.polygons().len(), rl.vertices().len())
     }
 
+    /// The sealed render list's `(viewport, per-vertex clip coords)` — for debugging
+    /// projection/viewport conventions.
+    pub fn gpu3d_render_geometry(&self) -> (u32, Vec<[i32; 4]>) {
+        let rl = self.machine.gpu3d.render_list();
+        (rl.viewport, rl.vertices().iter().map(|v| v.clip).collect())
+    }
+
+    /// `DISP3DCNT` plus each sealed polygon's `(texture format, polygon alpha, blend
+    /// mode)` — for debugging the translucency/texture path.
+    pub fn gpu3d_poly_summary(&self) -> (u16, Vec<(u8, u8, u8)>) {
+        let rl = self.machine.gpu3d.render_list();
+        let polys = rl
+            .polygons()
+            .iter()
+            .map(|p| {
+                let fmt = ((p.tex_param >> 26) & 7) as u8;
+                let alpha = ((p.attr >> 16) & 0x1F) as u8;
+                let mode = ((p.attr >> 4) & 3) as u8;
+                (fmt, alpha, mode)
+            })
+            .collect();
+        (self.machine.gpu3d.disp3dcnt(), polys)
+    }
+
     /// Rasterize the 3D engine's sealed render list to a 256×192 RGB8 buffer (covered
     /// pixels as their color, uncovered as black), for debug visualization.
     pub fn gpu3d_rasterize_rgb(&self) -> Vec<u8> {
         let mut fb = gpu3d::raster::Framebuffer3d::new();
-        gpu3d::raster::render(self.machine.gpu3d.render_list(), &mut fb);
+        let mut image = vec![0u8; 0x8_0000];
+        let mut palette = vec![0u8; 0x1_8000];
+        self.machine.vram.assemble_texture_image(&mut image);
+        self.machine.vram.assemble_texture_palette(&mut palette);
+        let tex = gpu3d::texture::TextureSet { image: &image, palette: &palette };
+        gpu3d::raster::render(self.machine.gpu3d.render_list(), &tex, &mut fb);
         let mut rgb = Vec::with_capacity(gpu3d::raster::WIDTH * gpu3d::raster::HEIGHT * 3);
         for p in &fb.pixels {
             if p.covered {

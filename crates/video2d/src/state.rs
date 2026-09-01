@@ -92,6 +92,22 @@ pub struct PixelFlags {
     pub obj_window: bool,
     /// The pixel was produced through the mosaic sampler.
     pub mosaic: bool,
+    /// The pixel comes from the DS 3D engine (composited as Engine A's BG0), carrying
+    /// its 5-bit coverage alpha (`Some(0..=31)`, `31` = opaque). Set for **every** 3D
+    /// pixel — [`crate::effects`] needs it to blend the 3D layer over the 2D behind it
+    /// using the 3D alpha as the coefficient (EVA=A/2, EVB=16−A/2 per GBATEK) rather
+    /// than BLDALPHA, and to keep opaque 3D pixels from washing out against an additive
+    /// BLDALPHA. `None` for every ordinary 2D pixel; inert on the GBA (never set).
+    pub three_d_alpha: Option<u8>,
+}
+
+/// A pixel injected into Engine A's BG0 from the DS 3D engine: a color plus its 5-bit
+/// coverage alpha (`31` = opaque). Built by the DS PPU from the rasterized 3D frame and
+/// passed to [`crate::render_scanline`] as `external_bg0`.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalBg0Pixel {
+    pub color: Color15,
+    pub alpha: u8,
 }
 
 /// One resolved source pixel competing for a screen position.

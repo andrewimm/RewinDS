@@ -72,6 +72,9 @@ pub enum EffectMode {
     Alpha,
     Brighten,
     Darken,
+    /// The DS 3D layer (Engine A BG0) blended over the background behind it by its own
+    /// per-pixel coverage alpha — intrinsic to the 3D engine, not `BLDCNT`.
+    ThreeDBlend,
 }
 
 /// The color effect actually applied to the final pixel (spec §31).
@@ -91,6 +94,11 @@ pub enum AppliedEffect {
     Darken {
         source: LayerId,
         evy: u8,
+    },
+    /// The 3D layer blended over `second` by its 5-bit coverage `alpha`.
+    ThreeDBlend {
+        second: LayerId,
+        alpha: u8,
     },
 }
 

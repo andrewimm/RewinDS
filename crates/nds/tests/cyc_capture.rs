@@ -288,6 +288,25 @@ fn rasterize_3d() {
         sys.run_frame();
     }
     let (polys, verts) = sys.gpu3d_render_list();
+    let (vp, clips) = sys.gpu3d_render_geometry();
+    eprintln!("viewport={vp:#010x} (x1={} y1={} x2={} y2={})", vp & 0xFF, (vp >> 8) & 0xFF, (vp >> 16) & 0xFF, (vp >> 24) & 0xFF);
+    for (i, c) in clips.iter().enumerate().take(12) {
+        let w = c[3].max(1);
+        // ndc y and the screen y my projection produces (full-screen viewport).
+        let ndc_y = c[1] as f64 / w as f64;
+        let sy = (192.0 * (w - c[1]) as f64) / (2.0 * w as f64);
+        eprintln!("  v{i}: clip=[{},{},{},{}]  ndc_y={ndc_y:.3}  screen_y={sy:.0}", c[0], c[1], c[2], c[3]);
+    }
+    let (disp3dcnt, polys_summary) = sys.gpu3d_poly_summary();
+    eprintln!("DISP3DCNT={disp3dcnt:#06x} (alpha_test={} alpha_blend={})", (disp3dcnt >> 2) & 1, (disp3dcnt >> 3) & 1);
+    let dispcnt = sys.read(Core::Arm9, 0x0400_0000, 4);
+    let bldcnt = sys.read(Core::Arm9, 0x0400_0050, 2);
+    let bldalpha = sys.read(Core::Arm9, 0x0400_0052, 2);
+    let bldy = sys.read(Core::Arm9, 0x0400_0054, 2);
+    eprintln!("DISPCNT_A={dispcnt:#010x} BLDCNT={bldcnt:#06x} (mode={}) BLDALPHA={bldalpha:#06x} BLDY={bldy:#06x}", (bldcnt >> 6) & 3);
+    for (i, (fmt, alpha, mode)) in polys_summary.iter().enumerate().take(12) {
+        eprintln!("  poly{i}: tex_format={fmt} poly_alpha={alpha} blend_mode={mode}");
+    }
     let rgb = sys.gpu3d_rasterize_rgb();
     let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
     let mut ppm = b"P6\n256 192\n255\n".to_vec();

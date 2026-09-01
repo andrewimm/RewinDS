@@ -84,6 +84,24 @@ pub fn apply(
     regs: &Registers,
     effects_enabled: bool,
 ) -> EffectResult {
+    // The DS 3D layer (Engine A BG0) blends with the 2D layer behind it using its OWN
+    // per-pixel alpha as the coefficient — `EVA = A/2`, `EVB = 16 − A/2` (GBATEK) — not
+    // BLDALPHA. It is intrinsic to the 3D layer and not gated by the window's effect
+    // enable. Opaque 3D pixels (`A = 31`) are NOT alpha-blended here (they would wash out
+    // against an additive BLDALPHA); they fall through and may still be brightened/
+    // darkened by EVY below like an ordinary BG0.
+    let top_is_3d = top.flags.three_d_alpha.is_some();
+    if let Some(a) = top.flags.three_d_alpha {
+        if a < 31 && is_second_target(regs, second.layer) {
+            let eva = (a / 2) as u16;
+            return EffectResult {
+                color: alpha_blend(top.color, second.color, eva, 16 - eva),
+                mode: EffectMode::ThreeDBlend,
+                applied: AppliedEffect::ThreeDBlend { second: second.layer, alpha: a },
+            };
+        }
+    }
+
     if !effects_enabled {
         return EffectResult::none(top.color);
     }
@@ -108,8 +126,13 @@ pub fn apply(
     }
 
     match (regs.bldcnt >> 6) & 0x3 {
-        // Alpha blend: top must be a first target and second a second target.
-        1 if is_first_target(regs, top.layer) && is_second_target(regs, second.layer) => {
+        // Alpha blend via BLDALPHA: top a first target, second a second target. The 3D
+        // layer is excluded — its blend already ran above with its own coefficients (and
+        // an opaque 3D pixel must not be additively blended here).
+        1 if !top_is_3d
+            && is_first_target(regs, top.layer)
+            && is_second_target(regs, second.layer) =>
+        {
             EffectResult {
                 color: alpha_blend(top.color, second.color, eva, evb),
                 mode: EffectMode::Alpha,

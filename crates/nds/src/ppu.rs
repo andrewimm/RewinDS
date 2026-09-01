@@ -192,7 +192,10 @@ impl Engine {
                 for (x, cell) in l.iter_mut().enumerate() {
                     let p = fb.pixels[y as usize * gpu3d::raster::WIDTH + x];
                     if p.covered {
-                        *cell = Some(video2d::Color15(pack_bgr555(p.color)));
+                        *cell = Some(video2d::ExternalBg0Pixel {
+                            color: video2d::Color15(pack_bgr555(p.color)),
+                            alpha: p.alpha,
+                        });
                     }
                 }
                 l

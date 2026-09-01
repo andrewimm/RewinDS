@@ -197,6 +197,7 @@ pub fn rasterize<S: ProvenanceSink>(
                     semi_transparent_obj: semi,
                     obj_window: false,
                     mosaic: sprite.mosaic,
+                    ..PixelFlags::default()
                 },
             };
             obj.pixels[sx] = Some(candidate);

@@ -27,7 +27,7 @@ pub mod window;
 pub use memory::{ModeSemantics, PpuMemoryView, VramLayout};
 pub use registers::Registers;
 pub use scanline::{render_scanline, scanline_state_explanation};
-pub use state::{Color15, Framebuffer, LayerId, HEIGHT, MAX_WIDTH, WIDTH};
+pub use state::{Color15, ExternalBg0Pixel, Framebuffer, LayerId, HEIGHT, MAX_WIDTH, WIDTH};
 
 #[cfg(test)]
 mod test_support;
