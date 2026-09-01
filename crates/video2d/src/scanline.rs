@@ -16,7 +16,10 @@ use crate::effects;
 use crate::memory::{PpuMemoryView, VramLayout};
 use crate::obj;
 use crate::priority;
-use crate::state::{CandidatePixel, Color15, Framebuffer, LatchedState, LayerId, Scratch, ScanlineSegment};
+use crate::state::{
+    CandidatePixel, Color15, Framebuffer, LatchedState, LayerId, PixelFlags, Scratch,
+    ScanlineSegment,
+};
 use crate::window;
 
 /// Build the structured latched-state summary for scanline `y`.
@@ -43,6 +46,7 @@ pub fn scanline_state_explanation(state: &LatchedState, y: u16) -> ScanlineState
 /// The renderer. Fills scanline `y` of `framebuffer` from the pre-latched
 /// `segments`, feeding `sink` at each semantic stage. `scratch` is reused per
 /// span. `segments` must be non-empty (the caller latches first).
+#[allow(clippy::too_many_arguments)]
 pub fn render_scanline<S: ProvenanceSink>(
     framebuffer: &mut Framebuffer,
     segments: &[ScanlineSegment],
@@ -50,6 +54,7 @@ pub fn render_scanline<S: ProvenanceSink>(
     y: u16,
     mem: &PpuMemoryView<'_>,
     layout: VramLayout,
+    external_bg0: Option<&[Option<Color15>]>,
     sink: &mut S,
 ) {
     let first_state = segments[0].state;
@@ -88,6 +93,22 @@ pub fn render_scanline<S: ProvenanceSink>(
 
         scratch.clear();
         bg::generate(y, &seg.state, &seg.affine, mem, width, layout, scratch, sink);
+        // Inject the externally rendered BG0 line (the DS 3D engine's output). Under DS
+        // semantics generate() leaves BG0 empty when it is the 3D layer, so this fills
+        // it as an ordinary BG0 candidate at the BG0CNT priority; `None` = transparent.
+        if let Some(line) = external_bg0 {
+            let priority = (seg.state.regs.bgcnt[0] & 3) as u8;
+            for (x, cell) in line.iter().enumerate().take(x_end).skip(x_start) {
+                if let Some(color) = *cell {
+                    scratch.bg[0].pixels[x] = Some(CandidatePixel {
+                        color,
+                        layer: LayerId::Bg0,
+                        priority,
+                        flags: PixelFlags::default(),
+                    });
+                }
+            }
+        }
         obj::generate(y, &seg.state, mem, width, layout, scratch, sink);
         window::compute_line(y, &seg.state, &scratch.obj, width, height, &mut scratch.window);
 
@@ -147,7 +168,7 @@ mod generalization_tests {
         let mut latched = LatchedState::default();
         let mut segments = Vec::new();
         latch::latch_for_scanline(&regs, &AffineInternalState::default(), &mut latched, &mut segments);
-        render_scanline(&mut fb, &segments, &mut scratch, 0, &mem.view(), VramLayout::gba(), &mut NullSink);
+        render_scanline(&mut fb, &segments, &mut scratch, 0, &mem.view(), VramLayout::gba(), None, &mut NullSink);
 
         // Every one of the 256 columns holds the backdrop — including past 240.
         assert!((0..256).all(|x| fb.pixels[x] == Color15(0x1234)));

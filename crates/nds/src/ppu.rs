@@ -21,6 +21,11 @@ use crate::vram::Vram;
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 192;
 
+/// Pack the 3D engine's 6-bit-per-channel RGB into the 2D engines' BGR555.
+fn pack_bgr555(c: [u8; 3]) -> u16 {
+    ((c[0] as u16) >> 1) | (((c[1] as u16) >> 1) << 5) | (((c[2] as u16) >> 1) << 10)
+}
+
 /// Offset of the OBJ region inside an engine's flat VRAM view (after the 512 KB BG
 /// region); also the renderer's `obj_tile_base`.
 const OBJ_VIEW_BASE: u32 = 0x8_0000;
@@ -101,10 +106,16 @@ impl Engine {
     }
 
     /// Render this engine's frame from its display mode (`DISPCNT` bits 16-17).
-    fn render(&mut self, vram: &Vram, palette: &[u8], oam: &[u8]) {
+    fn render(
+        &mut self,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+    ) {
         match (self.dispcnt >> 16) & 3 {
             // Graphics: composite the BG/OBJ layers through the shared renderer.
-            1 => self.render_graphics(vram, palette, oam),
+            1 => self.render_graphics(vram, palette, oam, three_d),
             // "VRAM display": Engine A only — blit an LCDC VRAM block (A–D) as a bitmap.
             2 if !self.is_b => {
                 let block = ((self.dispcnt >> 18) & 3) as usize;
@@ -120,7 +131,13 @@ impl Engine {
     /// Composite the BG/OBJ layers through the shared `video2d` renderer: assemble a
     /// flat view of this engine's banked BG and OBJ VRAM, derive its base offsets, and
     /// draw every visible line.
-    fn render_graphics(&mut self, vram: &Vram, palette: &[u8], oam: &[u8]) {
+    fn render_graphics(
+        &mut self,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+    ) {
         video2d::latch::reload_affine_references(&self.registers, &mut self.affine);
         video2d::latch::latch_for_scanline(
             &self.registers,
@@ -167,7 +184,19 @@ impl Engine {
         };
         let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam)
             .with_ext_palettes(&self.bg_ext, &self.obj_ext);
+        // BG0 sources the 3D engine when DISPCNT bit 3 is set (Engine A only).
+        let bg0_3d = three_d.filter(|_| self.dispcnt & (1 << 3) != 0);
         for y in 0..HEIGHT as u16 {
+            let line = bg0_3d.map(|fb| {
+                let mut l = [None; WIDTH];
+                for (x, cell) in l.iter_mut().enumerate() {
+                    let p = fb.pixels[y as usize * gpu3d::raster::WIDTH + x];
+                    if p.covered {
+                        *cell = Some(video2d::Color15(pack_bgr555(p.color)));
+                    }
+                }
+                l
+            });
             video2d::render_scanline(
                 &mut self.render_fb,
                 &self.segments,
@@ -175,6 +204,7 @@ impl Engine {
                 y,
                 &mem,
                 layout,
+                line.as_ref().map(|l| &l[..]),
                 &mut video2d::debug::sink::NullSink,
             );
         }
@@ -290,6 +320,7 @@ impl Ppu {
         vram: &Vram,
         palette: &[u8],
         oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
         ctx: &mut EventContext<'_, NdsEvent>,
     ) {
         match event {
@@ -308,8 +339,8 @@ impl Ppu {
                     // and OAM are split A/B: Engine A takes the low 1 KB, Engine B the
                     // high 1 KB (each engine's slice is BG then OBJ, as the renderer
                     // expects).
-                    self.engines[0].render(vram, &palette[..0x400], &oam[..0x400]);
-                    self.engines[1].render(vram, &palette[0x400..], &oam[0x400..]);
+                    self.engines[0].render(vram, &palette[..0x400], &oam[..0x400], three_d);
+                    self.engines[1].render(vram, &palette[0x400..], &oam[0x400..], None);
                     self.frame += 1;
                     for (c, irq) in irqs.iter_mut().enumerate() {
                         if self.dispstat[c] & (1 << 3) != 0 {

@@ -48,6 +48,10 @@ pub struct Gpu3d {
     geometry: GeometryEngine,
     /// `DISP3DCNT` (`0x4000060`): 3D display/blend/fog/edge enables.
     disp3dcnt: u16,
+    /// The rasterized 256×192 output of the sealed render list, and the frame index it
+    /// was rendered from (so it is rasterized at most once per swap).
+    framebuffer: raster::Framebuffer3d,
+    rendered_frame: u64,
 }
 
 impl Gpu3d {
@@ -97,6 +101,21 @@ impl Gpu3d {
     /// draws (produced by `SWAP_BUFFERS`).
     pub fn render_list(&self) -> &geometry::RenderList {
         self.geometry.render_list()
+    }
+
+    /// Rasterize the sealed render list into the internal framebuffer (once per swap;
+    /// a no-op if already rendered for the current frame). Called at V-blank.
+    pub fn render_frame(&mut self) {
+        let frame = self.geometry.render_list().frame;
+        if frame != self.rendered_frame {
+            raster::render(self.geometry.render_list(), &mut self.framebuffer);
+            self.rendered_frame = frame;
+        }
+    }
+
+    /// The rasterized 3D framebuffer (256×192), composited as Engine A's BG0.
+    pub fn framebuffer_3d(&self) -> &raster::Framebuffer3d {
+        &self.framebuffer
     }
 
     /// Execute every complete command buffered in the FIFO (a command is complete

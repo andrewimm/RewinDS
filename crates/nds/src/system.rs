@@ -704,13 +704,17 @@ impl EventHandler<NdsEvent> for Machine {
                 self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
             }
             NdsEvent::Ppu(event) => {
-                // `ppu`, `interrupts`, `vram`, and `memory` are disjoint fields.
+                // Rasterize the sealed 3D frame (cached, so at most once per swap)
+                // before the PPU composites it as Engine A's BG0.
+                self.gpu3d.render_frame();
+                // `ppu`, `interrupts`, `vram`, `memory`, and `gpu3d` are disjoint fields.
                 self.ppu.handle_event(
                     event,
                     &mut self.interrupts,
                     &self.vram,
                     &self.memory.palette,
                     &self.memory.oam,
+                    Some(self.gpu3d.framebuffer_3d()),
                     ctx,
                 );
             }

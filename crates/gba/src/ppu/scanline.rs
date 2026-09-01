@@ -27,6 +27,7 @@ impl Ppu {
             y,
             mem,
             video2d::VramLayout::gba(),
+            None, // the GBA has no 3D engine
             sink,
         );
     }

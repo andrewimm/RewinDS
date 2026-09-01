@@ -66,6 +66,7 @@ impl TestPpu {
             y,
             mem,
             self.layout,
+            None,
             sink,
         );
     }
