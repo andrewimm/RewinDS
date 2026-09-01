@@ -274,6 +274,69 @@ fn backup_dump() {
     }
 }
 
+/// Drive the menu into gameplay (tap A repeatedly after `CYC_PRESS_FROM`), then report
+/// the render config, whether the ARM9 is spinning, and dump the final frame — to
+/// diagnose the "enter game → glitch + lockup" symptom.
+#[test]
+#[ignore]
+fn play_probe() {
+    use std::collections::BTreeSet;
+    let mut sys = booted();
+    let press_from = env_hex("CYC_PRESS_FROM", 520) as u64;
+    let key = env_hex("CYC_KEYS", 0x001); // A
+    for f in 0..frames() {
+        // Tap the key for 6 of every 40 frames once past the menu-reach point.
+        let down = f >= press_from && (f - press_from) % 40 < 6;
+        sys.set_keypad(if down { key } else { 0 });
+        sys.run_frame();
+    }
+    let dispcnt_a = sys.read(Core::Arm9, 0x0400_0000, 4);
+    let dispcnt_b = sys.read(Core::Arm9, 0x0400_1000, 4);
+    let bgcnt_a: Vec<u16> = (0..4).map(|i| sys.read(Core::Arm9, 0x0400_0008 + i * 2, 2) as u16).collect();
+    let vramcnt: Vec<u8> = (0..9).map(|b| sys.vram_control(b)).collect();
+    eprintln!("DISPCNT_A={dispcnt_a:#010x} mode={} dispmode={} BGCNT_A={bgcnt_a:04X?}",
+        dispcnt_a & 7, (dispcnt_a >> 16) & 3);
+    eprintln!("DISPCNT_B={dispcnt_b:#010x}  VRAMCNT={vramcnt:02X?}");
+    for core in [Core::Arm9, Core::Arm7] {
+        let (pc, irq_on) = if core == Core::Arm9 {
+            (sys.arm9.register(15), sys.arm9.irq_enabled())
+        } else {
+            (sys.arm7.register(15), sys.arm7.irq_enabled())
+        };
+        let irqs = sys.interrupts(core);
+        let who = if core == Core::Arm9 { "ARM9" } else { "ARM7" };
+        eprintln!("{who}: PC={pc:#010x} irq_on={irq_on} IME={} IE={:#010x} IF={:#010x} pending={}",
+            irqs.ime(), irqs.ie(), irqs.iflags(), irqs.pending());
+    }
+    cyctrace::enable();
+    let base = [cyctrace::len(0), cyctrace::len(1)];
+    let now = sys.now();
+    sys.run_until(now + _half_frame());
+    for core in 0..2 {
+        let pcs = cyctrace::slice(core, base[core]);
+        let set: BTreeSet<u32> = pcs.iter().copied().collect();
+        let who = if core == 0 { "ARM9" } else { "ARM7" };
+        eprintln!("{who} spin: {} instrs, {} distinct PCs: {:08X?}",
+            pcs.len(), set.len(), set.iter().take(24).collect::<Vec<_>>());
+    }
+    if let Ok(out) = std::env::var("CYC_OUT") {
+        let out = expand(&out);
+        let mut rgb = Vec::with_capacity(256 * 384 * 3);
+        for screen in 0..2 {
+            for &p in sys.screen(screen) {
+                let (r, g, b) = ((p & 0x1F) as u8, ((p >> 5) & 0x1F) as u8, ((p >> 10) & 0x1F) as u8);
+                rgb.push((r << 3) | (r >> 2));
+                rgb.push((g << 3) | (g >> 2));
+                rgb.push((b << 3) | (b >> 2));
+            }
+        }
+        let mut ppm = b"P6\n256 384\n255\n".to_vec();
+        ppm.extend_from_slice(&rgb);
+        std::fs::write(&out, ppm).unwrap();
+        eprintln!("-> {out}");
+    }
+}
+
 /// Dump the raw AUXSPI backup transactions (segmented by chip-select) with the ARM7
 /// PC that issued each, to see the exact command/address/data byte stream.
 #[test]

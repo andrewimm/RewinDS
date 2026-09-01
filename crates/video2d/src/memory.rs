@@ -36,6 +36,18 @@ pub struct VramLayout {
     /// (`0x3`, blocks 0-3); the DS uses 4 (`0xF`) — its BGxCNT bits 4-5 are the char
     /// base MSBs, which the GBA requires to be zero, so `0xF` stays GBA-identical.
     pub bg_char_base_mask: u32,
+    /// Which console's `DISPCNT` mode field to interpret. The two consoles number
+    /// their BG modes differently — the GBA's modes 3-5 are bitmap framebuffers, while
+    /// the DS's 3-5 are text + affine/extended tiled backgrounds — so the per-mode
+    /// layer dispatch forks on this.
+    pub mode_semantics: ModeSemantics,
+}
+
+/// Whether a [`VramLayout`]'s mode field follows GBA or DS conventions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeSemantics {
+    Gba,
+    Ds,
 }
 
 impl VramLayout {
@@ -50,6 +62,7 @@ impl VramLayout {
             bg_ext_palette: false,
             obj_ext_palette: false,
             bg_char_base_mask: 0x3,
+            mode_semantics: ModeSemantics::Gba,
         }
     }
 }

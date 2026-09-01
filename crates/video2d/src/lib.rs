@@ -24,7 +24,7 @@ pub mod scanline;
 pub mod state;
 pub mod window;
 
-pub use memory::{PpuMemoryView, VramLayout};
+pub use memory::{ModeSemantics, PpuMemoryView, VramLayout};
 pub use registers::Registers;
 pub use scanline::{render_scanline, scanline_state_explanation};
 pub use state::{Color15, Framebuffer, LayerId, HEIGHT, MAX_WIDTH, WIDTH};

@@ -163,6 +163,7 @@ impl Engine {
             obj_ext_palette: self.dispcnt & (1 << 31) != 0,
             // The DS character-base field is 4 bits (BGxCNT bits 2-5).
             bg_char_base_mask: 0xF,
+            mode_semantics: video2d::ModeSemantics::Ds,
         };
         let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam)
             .with_ext_palettes(&self.bg_ext, &self.obj_ext);
