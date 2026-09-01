@@ -91,6 +91,18 @@ impl Vram {
         self.assemble_region(out, 0x0640_0000, 0x0644_0000);
     }
 
+    /// Assemble the Engine-B BG region (`0x0620_0000`, max 128 KB: banks C/H/I) into
+    /// `out`, offset from the region base.
+    pub fn assemble_engine_b_bg(&self, out: &mut [u8]) {
+        self.assemble_region(out, 0x0620_0000, 0x0622_0000);
+    }
+
+    /// Assemble the Engine-B OBJ region (`0x0660_0000`, max 128 KB: banks D/I) into
+    /// `out`, offset from the region base.
+    pub fn assemble_engine_b_obj(&self, out: &mut [u8]) {
+        self.assemble_region(out, 0x0660_0000, 0x0662_0000);
+    }
+
     /// Gather every enabled bank whose mapped base falls in `[lo, hi)` into `out`,
     /// each at `base - lo`. Banks routed elsewhere contribute nothing.
     fn assemble_region(&self, out: &mut [u8], lo: u32, hi: u32) {
@@ -169,21 +181,30 @@ impl Vram {
         let range = match mst {
             // Plain LCDC access.
             0 => LCDC_BASE[bank],
-            // 2D Engine A, BG VRAM.
+            // 2D Engine A BG (banks A–G), and 2D Engine B BG for banks H, I.
             1 => match bank {
                 0..=3 => 0x0600_0000 + 0x20000 * ofs, // A–D
                 4 => 0x0600_0000,                     // E
                 5 | 6 => 0x0600_0000 + 0x4000 * (ofs & 1) + 0x10000 * (ofs >> 1), // F, G
+                7 => 0x0620_0000,                     // H -> Engine B BG
+                8 => 0x0620_8000,                     // I -> Engine B BG
                 _ => return None,
             },
-            // 2D Engine A, OBJ VRAM.
+            // 2D Engine A OBJ (banks A, B, E–G), and 2D Engine B OBJ for bank I.
             2 => match bank {
                 0 | 1 => 0x0640_0000 + 0x20000 * (ofs & 1), // A, B
                 4 => 0x0640_0000,                           // E
                 5 | 6 => 0x0640_0000 + 0x4000 * (ofs & 1) + 0x10000 * (ofs >> 1), // F, G
+                8 => 0x0660_0000,                           // I -> Engine B OBJ
                 _ => return None,
             },
-            // Texture / extended palette / Engine B / ARM7 — deferred.
+            // 2D Engine B, via banks C (BG) and D (OBJ).
+            4 => match bank {
+                2 => 0x0620_0000, // C -> Engine B BG
+                3 => 0x0660_0000, // D -> Engine B OBJ
+                _ => return None, // E/F/G MST 4 = BG extended palette (Phase 3)
+            },
+            // Texture / extended palette / ARM7 — deferred.
             _ => return None,
         };
         Some((range, size))

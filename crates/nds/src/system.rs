@@ -437,17 +437,24 @@ impl Machine {
         if (0x0400_00E0..0x0400_00F0).contains(&addr) {
             return self.dma[c].read_fill(addr - 0x0400_00E0);
         }
-        if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
-            let base = addr - 0x0400_0000;
-            let low = self.ppu.read_register(base) as u32;
+        // 2D engine register blocks (ARM9): Engine A at 0x4000008, Engine B at
+        // 0x4001008. `addr & 0xFFF` is the offset within the engine's block.
+        if core == Core::Arm9
+            && ((0x0400_0008..0x0400_0058).contains(&addr)
+                || (0x0400_1008..0x0400_1058).contains(&addr))
+        {
+            let engine = ((addr >> 12) & 1) as usize;
+            let base = addr & 0xFFF;
+            let low = self.ppu.read_register(engine, base) as u32;
             return if bytes == 4 {
-                low | (self.ppu.read_register(base + 2) as u32) << 16
+                low | (self.ppu.read_register(engine, base + 2) as u32) << 16
             } else {
                 low
             };
         }
         match addr {
-            0x0400_0000 => self.ppu.dispcnt(),
+            0x0400_0000 => self.ppu.dispcnt(0),
+            0x0400_1000 if core == Core::Arm9 => self.ppu.dispcnt(1),
             0x0400_0004 => self.ppu.read_dispstat(c) as u32,
             0x0400_0006 => self.ppu.vcount() as u32,
             0x0400_0180 => self.ipc.read_sync(core) as u32,
@@ -566,20 +573,26 @@ impl Machine {
             self.math.write(addr & 0xFFF, value, bytes);
             return;
         }
-        // Engine A 2D register block (BGxCNT..BLDY), ARM9 only.
-        if core == Core::Arm9 && (0x0400_0008..0x0400_0058).contains(&addr) {
-            let base = addr - 0x0400_0000;
+        // 2D engine register blocks (BGxCNT..BLDY), ARM9 only: Engine A at 0x4000008,
+        // Engine B at 0x4001008.
+        if core == Core::Arm9
+            && ((0x0400_0008..0x0400_0058).contains(&addr)
+                || (0x0400_1008..0x0400_1058).contains(&addr))
+        {
+            let engine = ((addr >> 12) & 1) as usize;
+            let base = addr & 0xFFF;
             if bytes == 4 {
-                self.ppu.write_register(base, value as u16, 0xFFFF);
+                self.ppu.write_register(engine, base, value as u16, 0xFFFF);
                 self.ppu
-                    .write_register(base + 2, (value >> 16) as u16, 0xFFFF);
+                    .write_register(engine, base + 2, (value >> 16) as u16, 0xFFFF);
             } else {
-                self.ppu.write_register(base, value as u16, 0xFFFF);
+                self.ppu.write_register(engine, base, value as u16, 0xFFFF);
             }
             return;
         }
         match addr {
-            0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(value, bytes),
+            0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(0, value, bytes),
+            0x0400_1000 if core == Core::Arm9 => self.ppu.write_dispcnt(1, value, bytes),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
             0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self
@@ -927,6 +940,10 @@ impl System {
 
         // Boot completed: retail games refuse to run while POSTFLG reads 0.
         self.machine.postflg = [1, 1];
+        // Firmware leaves `POWCNT1` with the LCDs and both 2D engines powered and the
+        // display swap set so Engine A drives the top screen (bit 15). Games override
+        // it, but this is the sensible post-firmware default a direct boot inherits.
+        self.machine.powcnt1 = 0x820F;
     }
 
     /// Copy a cartridge binary into a core's RAM, byte by byte through its map.
@@ -971,9 +988,18 @@ impl System {
         }
     }
 
-    /// Engine A's current output image, in BGR555.
+    /// Engine A's current output image, in BGR555. See [`Self::screen`] for the
+    /// physical-screen view (which honors the `POWCNT1` display swap).
     pub fn framebuffer(&self) -> &[u16] {
-        self.machine.ppu.framebuffer()
+        self.machine.ppu.framebuffer(0)
+    }
+
+    /// The BGR555 image shown on physical screen `index` (0 = top, 1 = bottom),
+    /// honoring `POWCNT1` bit 15 (1 = Engine A drives the top screen).
+    pub fn screen(&self, index: usize) -> &[u16] {
+        let a_on_top = self.machine.powcnt1 & (1 << 15) != 0;
+        let engine = if a_on_top { index } else { 1 - index };
+        self.machine.ppu.framebuffer(engine)
     }
 
     /// The completed-frame counter.

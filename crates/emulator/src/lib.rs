@@ -380,9 +380,16 @@ impl NdsEmulator {
 
     fn run_frame(&mut self) {
         self.system.run_frame();
-        // Top screen from Engine A's BGR555 framebuffer; bottom stays black.
-        for (px, &color) in self.rgba[0].as_chunks_mut::<4>().0.iter_mut().zip(self.system.framebuffer()) {
-            *px = bgr555_to_rgba8(color);
+        // Both physical screens, each from its POWCNT1-assigned 2D engine.
+        for screen in 0..2 {
+            for (px, &color) in self.rgba[screen]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(self.system.screen(screen))
+            {
+                *px = bgr555_to_rgba8(color);
+            }
         }
     }
 }

@@ -198,23 +198,25 @@ fn dump_frame() {
     for _ in 0..frames() {
         sys.run_frame();
     }
-    let dispcnt = sys.read(Core::Arm9, 0x0400_0000, 4);
-    let fb = sys.framebuffer();
-    let mut rgb = Vec::with_capacity(fb.len() * 3);
-    for &p in fb {
-        // BGR555 -> RGB888 (5-bit channels scaled to 8-bit).
-        let r = (p & 0x1F) as u8;
-        let g = ((p >> 5) & 0x1F) as u8;
-        let b = ((p >> 10) & 0x1F) as u8;
-        rgb.push((r << 3) | (r >> 2));
-        rgb.push((g << 3) | (g >> 2));
-        rgb.push((b << 3) | (b >> 2));
+    let dispcnt_a = sys.read(Core::Arm9, 0x0400_0000, 4);
+    let dispcnt_b = sys.read(Core::Arm9, 0x0400_1000, 4);
+    // Both physical screens stacked vertically (top over bottom): 256 x 384.
+    let mut rgb = Vec::with_capacity(256 * 384 * 3);
+    for screen in 0..2 {
+        for &p in sys.screen(screen) {
+            let r = (p & 0x1F) as u8;
+            let g = ((p >> 5) & 0x1F) as u8;
+            let b = ((p >> 10) & 0x1F) as u8;
+            rgb.push((r << 3) | (r >> 2));
+            rgb.push((g << 3) | (g >> 2));
+            rgb.push((b << 3) | (b >> 2));
+        }
     }
     let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
-    let mut ppm = format!("P6\n256 192\n255\n").into_bytes();
+    let mut ppm = b"P6\n256 384\n255\n".to_vec();
     ppm.extend_from_slice(&rgb);
     std::fs::write(&out, ppm).unwrap();
-    eprintln!("frame {} DISPCNT={dispcnt:#010x} -> {out}", frames());
+    eprintln!("frame {} DISPCNT_A={dispcnt_a:#010x} DISPCNT_B={dispcnt_b:#010x} -> {out}", frames());
 }
 
 /// Report DISPCNT + non-black pixel count each frame (has the game reached display?).
