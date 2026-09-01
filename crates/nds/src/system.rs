@@ -144,14 +144,20 @@ pub(crate) struct CoreTiming {
     pub internal: u32,
     pub did_load: bool,
     pub did_store: bool,
+    /// Number of data accesses this instruction made. >1 marks a block transfer
+    /// (`LDM`/`STM`/`PUSH`/`POP`), whose ALU base differs from a single load/store.
+    pub data_count: u32,
     /// Last code-fetch / data-access addresses, for sequential-access detection.
     pub code_last: u32,
     pub data_last: u32,
-    /// Whether the previous instruction took a branch. The next opcode fetch (the
-    /// branch target) then streams sequentially: the pipeline-refill cost is already
-    /// carried by the branch's execute base (3), so charging the target a
-    /// non-sequential fetch on top would count the refill twice.
-    pub prev_branched: bool,
+    /// The previous instruction's `cExecute`, carried forward for the prefetch model:
+    /// a step charges `max(cExecute(prev), cFetch(this))`, pairing this instruction's
+    /// opcode fetch with the previous instruction's execute (hardware fetches this
+    /// opcode while the previous one executes). Equivalent to the pipeline's
+    /// `max(cExecute(I), cFetch(I+1))` re-associated across the boundary, so a taken
+    /// branch's refill (its execute base) naturally absorbs the target's
+    /// non-sequential fetch — no separate branch-target special case is needed.
+    pub pending_execute: u32,
 }
 
 impl CoreTiming {
@@ -163,19 +169,44 @@ impl CoreTiming {
         self.internal = 0;
         self.did_load = false;
         self.did_store = false;
+        self.data_count = 0;
     }
 
-    /// The instruction's total cost in the core's own cycles = `max(cExecute, cFetch)`.
-    /// `cExecute` combines the ALU base with the memory cost — the ARM9 by `max`
-    /// (parallel pipeline stages), the ARM7 by `+` (same stage). `branched` is the
-    /// CPU's taken-branch signal (pipeline refill → execute base 3).
-    fn instruction_cost(&self, branched: bool, arm9: bool) -> u32 {
-        // A taken branch and a single load both cost 3 (pipeline refill / load base);
-        // a store costs 2; a plain ALU op costs 1.
-        let alu_base = if branched || self.did_load {
-            3
+    /// This instruction's `cExecute` in the core's own cycles: the ALU base combined
+    /// with the memory cost — the ARM9 by `max` (parallel 5-stage pipeline), the ARM7
+    /// by `+` (sequential 3-stage). `branched` is the CPU's taken-branch signal
+    /// (pipeline refill → execute base 3). The opcode fetch is combined separately at
+    /// the step boundary under the prefetch model (see [`Self::pending_execute`]).
+    fn execute_cost(&self, branched: bool, arm9: bool) -> u32 {
+        // ALU base by instruction class. A single load and a taken branch both cost 3
+        // (load base / pipeline refill); a single store costs 2; a plain ALU op 1. A
+        // block transfer (LDM/STM/PUSH/POP — more than one data access) is cheaper per
+        // the ARM946E-S/ARM7TDMI: LDM base 2 (4 when it loads PC, which also branches),
+        // STM base 1.
+        let block = self.data_count > 1;
+        let alu_base = if self.did_load {
+            if block {
+                // LDM: base 2, or 4 when it loads PC (which also branches).
+                if branched {
+                    4
+                } else {
+                    2
+                }
+            } else if branched {
+                // A single load into PC (`LDR pc`, a function/exception return) refills
+                // the pipeline: base 5, not the ordinary load's 3.
+                5
+            } else {
+                3
+            }
         } else if self.did_store {
-            2
+            if block {
+                1
+            } else {
+                2
+            }
+        } else if branched {
+            3
         } else {
             1
         };
@@ -187,12 +218,11 @@ impl CoreTiming {
         } else {
             alu_base.max(self.internal)
         };
-        let execute = if arm9 {
+        if arm9 {
             alu.max(self.mem)
         } else {
             alu + self.mem
-        };
-        execute.max(self.fetch)
+        }
     }
 }
 
@@ -737,10 +767,13 @@ impl System {
         } else {
             self.arm7.branched()
         };
-        let cost = self.machine.timing[c].instruction_cost(branched, arm9) as Timestamp;
-        // Record the branch for the next step: its target opcode fetch streams
-        // sequentially (the refill cost is in this branch's execute base).
-        self.machine.timing[c].prev_branched = branched;
+        // Prefetch model: charge `max(cExecute(prev), cFetch(this))` — this opcode was
+        // fetched while the previous instruction executed — then carry this
+        // instruction's execute forward to pair with the next fetch.
+        let execute = self.machine.timing[c].execute_cost(branched, arm9);
+        let t = &mut self.machine.timing[c];
+        let cost = t.pending_execute.max(t.fetch) as Timestamp;
+        t.pending_execute = execute;
         self.machine.clock[c] += if arm9 { cost } else { cost * 2 };
     }
 

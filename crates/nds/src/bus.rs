@@ -134,6 +134,7 @@ impl NdsCpuBus<'_> {
         };
         let t = &mut self.machine.timing[c];
         t.mem += cost;
+        t.data_count += 1;
         if is_read {
             t.did_load = true;
         } else {
@@ -157,11 +158,10 @@ impl NdsCpuBus<'_> {
         } else {
             width / 8
         };
-        // A branch target streams sequentially: the pipeline-refill penalty is already
-        // in the branch's execute base, so it is not charged again as a nonsequential
-        // fetch here.
-        let seq = self.machine.timing[c].prev_branched
-            || address == self.machine.timing[c].code_last.wrapping_add(step);
+        // Sequential iff this fetch continues from the previous one; a branch target's
+        // discontinuity yields a nonsequential fetch, whose penalty the prefetch model
+        // pairs with (and hides under) the branch's own execute cost.
+        let seq = address == self.machine.timing[c].code_last.wrapping_add(step);
         self.machine.timing[c].code_last = address;
         self.machine.timing[c].fetch = if self.core == Core::Arm9 {
             self.arm9_access_cost(address, 32, true, true, seq)
