@@ -18,6 +18,14 @@
 //! byte-correct. KEY2 matters only as a boot-time integrity check, which direct
 //! boot bypasses. The seed ports are accepted and ignored.
 
+/// Serial-FLASH backup size. Retail games use up to 8 Mbit; NSMB streams two save
+/// banks at `0x000000` and `0x100000`, so the chip must be ≥ 2 MB. A power of two, so
+/// an address wraps with a mask.
+const BACKUP_SIZE: usize = 2 * 1024 * 1024;
+/// The `RDID` (0x9F) reply: a plausible 4 Mbit flash JEDEC id. Retail games that hard-
+/// code their save type never read it; it's here for the ones that probe.
+const JEDEC_ID: [u8; 3] = [0x20, 0x40, 0x12];
+
 /// ROMCTRL bit 23: a data word is ready to read (`DRQ`).
 const ROMCTRL_DRQ: u32 = 1 << 23;
 /// ROMCTRL bit 31: block transfer start / busy.
@@ -53,11 +61,28 @@ pub struct Cart {
     /// Set when the final word of a block is consumed; the caller then raises the
     /// transfer-complete IRQ and clears it via [`Cart::take_completion`].
     completed: bool,
-    /// Backup-SPI (`AUXSPIDATA`, `40001A2h`) state: the in-flight command byte and
-    /// the byte last clocked back. Enough for save-type detection to get consistent
-    /// (empty-chip) responses; save contents are not persisted.
+    /// Backup-SPI (`AUXSPIDATA`, `40001A2h`) state machine over a serial FLASH chip:
+    /// the in-flight command, the address it accumulates over three bytes, how many
+    /// bytes into the transfer we are, the write-enable latch, and the byte last
+    /// clocked back. `backup` is the chip's contents (erased state `0xFF`); it is the
+    /// game's save data, persisted by the host.
+    backup: Vec<u8>,
     backup_command: u8,
+    backup_addr: u32,
+    backup_phase: u32,
+    backup_wel: bool,
+    backup_in_transfer: bool,
+    backup_dirty: bool,
     backup_data: u8,
+    /// How many address bytes the backup command stream carries. The DS header has no
+    /// save-type field, so we auto-detect the chip class from its protocol: EEPROMs
+    /// (2-byte addressing) are the common case, while a serial FLASH is identified by
+    /// its `RDID` (`0x9F`) probe — which every FLASH driver issues to read the JEDEC id
+    /// before any save access — and uses 3-byte addressing. We default to 2 and latch
+    /// to 3 on the first `RDID`. Getting this wrong shifts the first data byte into the
+    /// address, so a written record can never be read back (NSMB: "could not erase
+    /// data"). (A rare 512-byte EEPROM uses 1 address byte; not yet auto-detected.)
+    backup_addr_bytes: u32,
 }
 
 impl Default for Cart {
@@ -72,8 +97,15 @@ impl Default for Cart {
             reply: Reply::Fixed(0xFFFF_FFFF),
             words_left: 0,
             completed: false,
+            backup: vec![0xFF; BACKUP_SIZE],
             backup_command: 0,
+            backup_addr: 0,
+            backup_phase: 0,
+            backup_wel: false,
+            backup_in_transfer: false,
+            backup_dirty: false,
             backup_data: 0,
+            backup_addr_bytes: 2,
         }
     }
 }
@@ -114,22 +146,96 @@ impl Cart {
         self.backup_data
     }
 
-    /// Clock a byte to the backup chip. The first byte of a transfer is the command;
-    /// a read-status (`0x05`) reports "ready", other reads return the empty-chip
-    /// value (`0xFF`). Chip-select hold is `AUXSPICNT` bit 6.
+    /// Clock a byte to the backup FLASH chip and latch the byte clocked back. The
+    /// first byte of a transfer selects the command; the rest carry the address
+    /// (three bytes) and then data. `WREN`/`WRDI` (`06`/`04`) toggle the write-enable
+    /// latch; `RDSR` (`05`) reports it; `READ` (`03`) streams stored bytes; `PP`/`PW`
+    /// (`02`/`0A`) store bytes when write-enabled; `RDID` (`9F`) reports the chip id.
+    /// Chip-select hold is `AUXSPICNT` bit 6; releasing it ends the transfer (and
+    /// clears the latch after a write, as the hardware does).
     pub fn write_auxspidata(&mut self, value: u8) {
-        self.backup_data = if self.backup_command == 0 {
+        if !self.backup_in_transfer {
             self.backup_command = value;
-            0
-        } else {
-            match self.backup_command {
-                0x05 => 0x00, // RDSR: ready, not write-protected
-                _ => 0xFF,    // read data / unhandled: empty chip
+            self.backup_phase = 0;
+            self.backup_addr = 0;
+            self.backup_in_transfer = true;
+            self.backup_data = 0;
+            match value {
+                0x06 => self.backup_wel = true,  // WREN
+                0x04 => self.backup_wel = false, // WRDI
+                // A FLASH driver reads the JEDEC id before any save access; that probe
+                // identifies the chip as 3-byte-addressed serial FLASH.
+                0x9F | 0x9E => self.backup_addr_bytes = 3,
+                _ => {}
             }
-        };
-        if self.auxspicnt & (1 << 6) == 0 {
-            self.backup_command = 0; // chip-select released
+        } else {
+            self.backup_phase += 1;
+            let phase = self.backup_phase;
+            self.backup_data = match self.backup_command {
+                0x05 => (self.backup_wel as u8) << 1, // RDSR: WIP=0 (ready), WEL in bit 1
+                0x9F | 0x9E => JEDEC_ID[((phase - 1) % 3) as usize],
+                0x03 => {
+                    if phase <= self.backup_addr_bytes {
+                        self.backup_addr = (self.backup_addr << 8) | value as u32;
+                        0
+                    } else {
+                        let a = self.backup_addr as usize & (BACKUP_SIZE - 1);
+                        self.backup_addr = self.backup_addr.wrapping_add(1);
+                        self.backup[a]
+                    }
+                }
+                0x02 | 0x0A => {
+                    if phase <= self.backup_addr_bytes {
+                        self.backup_addr = (self.backup_addr << 8) | value as u32;
+                    } else if self.backup_wel {
+                        let a = self.backup_addr as usize & (BACKUP_SIZE - 1);
+                        self.backup[a] = value;
+                        self.backup_addr = self.backup_addr.wrapping_add(1);
+                        self.backup_dirty = true;
+                    }
+                    0
+                }
+                _ => 0,
+            };
         }
+        if self.auxspicnt & (1 << 6) == 0 {
+            if matches!(self.backup_command, 0x02 | 0x0A) {
+                self.backup_wel = false; // a program completes and disarms the latch
+            }
+            self.backup_in_transfer = false;
+            self.backup_command = 0;
+        }
+        #[cfg(feature = "cyctrace")]
+        {
+            let pc = crate::system::cyctrace::CUR_PC[1]
+                .load(std::sync::atomic::Ordering::Relaxed);
+            crate::system::cyctrace::aux_log(
+                pc,
+                value,
+                self.backup_data,
+                self.backup_in_transfer as u8,
+            );
+        }
+    }
+
+    /// The backup (save) contents, for the host to persist.
+    pub fn backup_bytes(&self) -> &[u8] {
+        &self.backup
+    }
+
+    /// Restore previously saved backup contents (truncated/padded to the chip size).
+    pub fn load_backup(&mut self, data: &[u8]) {
+        let n = data.len().min(BACKUP_SIZE);
+        self.backup[..n].copy_from_slice(&data[..n]);
+        self.backup_dirty = false;
+    }
+
+    /// Whether the backup has been written since the last [`Self::clear_backup_dirty`].
+    pub fn backup_dirty(&self) -> bool {
+        self.backup_dirty
+    }
+    pub fn clear_backup_dirty(&mut self) {
+        self.backup_dirty = false;
     }
 
     /// `ROMCTRL` with the live `DRQ`/`Start` status bits reflecting the transfer.
@@ -253,6 +359,55 @@ pub const DATA_PORT: u32 = 0x0410_0010;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clock a full backup-SPI transfer: hold chip-select for every byte but the
+    /// last. Returns the byte clocked back for each byte sent.
+    fn spi(cart: &mut Cart, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            let hold = if i + 1 == bytes.len() { 0 } else { 1 << 6 };
+            cart.write_auxspicnt(hold);
+            cart.write_auxspidata(b);
+            out.push(cart.read_auxspidata());
+        }
+        out
+    }
+
+    /// A programmed backup byte reads back through the FLASH (3-byte address) machine.
+    #[test]
+    fn backup_flash_write_then_read_is_coherent() {
+        let mut cart = Cart::new();
+        // RDID identifies a serial FLASH → 3-byte addressing.
+        spi(&mut cart, &[0x9F, 0, 0, 0]);
+        spi(&mut cart, &[0x06]); // WREN
+        // PP at 0x00110040, three data bytes 0xAA 0xBB 0xCC.
+        spi(&mut cart, &[0x02, 0x11, 0x00, 0x40, 0xAA, 0xBB, 0xCC]);
+        // READ at 0x00110040 (command + 3 address + 3 dummy read bytes).
+        let r = spi(&mut cart, &[0x03, 0x11, 0x00, 0x40, 0, 0, 0]);
+        assert_eq!(&r[4..], &[0xAA, 0xBB, 0xCC], "written bytes must read back");
+        // Without WREN, a program is ignored (write-enable latch clears after PP).
+        spi(&mut cart, &[0x02, 0x11, 0x00, 0x40, 0x11]);
+        let r = spi(&mut cart, &[0x03, 0x11, 0x00, 0x40, 0]);
+        assert_eq!(r[4], 0xAA, "a program without WREN must not take effect");
+    }
+
+    /// An EEPROM cart (no RDID probe) uses 2-byte addressing: the byte after two
+    /// address bytes is data, not a third address byte. This is the NSMB case — a
+    /// 3-byte decode would swallow the first data byte and fail read-back.
+    #[test]
+    fn backup_eeprom_uses_two_byte_addressing() {
+        let mut cart = Cart::new();
+        spi(&mut cart, &[0x06]); // WREN
+        // WRITE at 0x1100: header byte 0xCD then a signature, exactly like NSMB.
+        spi(&mut cart, &[0x02, 0x11, 0x00, 0xCD, b'M', b'a', b'r', b'i', b'o']);
+        // The game verifies by reading address 0x1100 back.
+        let r = spi(&mut cart, &[0x03, 0x11, 0x00, 0, 0, 0]);
+        assert_eq!(
+            &r[3..],
+            &[0xCD, b'M', b'a'],
+            "2-byte-addressed data must read back at the same address"
+        );
+    }
 
     /// A ROMCTRL value selecting a `bytes`-length block with the Start bit set.
     fn start_block(bytes: u32) -> u32 {

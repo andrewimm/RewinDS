@@ -145,11 +145,15 @@ impl NdsCpuBus<'_> {
     /// 32 bits (even in Thumb); the ARM7 fetches at the instruction width.
     fn advance_code(&mut self, address: u32, width: u32) {
         #[cfg(feature = "cyctrace")]
-        crate::system::cyctrace::record(
-            self.core.index(),
-            address,
-            self.machine.clock[self.core.index()],
-        );
+        {
+            crate::system::cyctrace::record(
+                self.core.index(),
+                address,
+                self.machine.clock[self.core.index()],
+            );
+            crate::system::cyctrace::CUR_PC[self.core.index()]
+                .store(address, std::sync::atomic::Ordering::Relaxed);
+        }
         let c = self.core.index();
         // ARM9 fetches are always 32-bit and step by 4; ARM7 by its instruction width.
         let step = if self.core == Core::Arm9 {

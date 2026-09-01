@@ -278,7 +278,7 @@ impl Emulator {
     pub fn save_data(&self) -> &[u8] {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.backup_bytes(),
-            Emulator::Nds(_) => &[],
+            Emulator::Nds(n) => n.system.cart_backup(),
         }
     }
 
@@ -286,7 +286,7 @@ impl Emulator {
     pub fn load_save_data(&mut self, data: &[u8]) {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.load_backup(data),
-            Emulator::Nds(_) => {}
+            Emulator::Nds(n) => n.system.load_cart_backup(data),
         }
     }
 
@@ -295,7 +295,7 @@ impl Emulator {
     pub fn save_dirty(&self) -> bool {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.backup_dirty(),
-            Emulator::Nds(_) => false,
+            Emulator::Nds(n) => n.system.cart_backup_dirty(),
         }
     }
 
@@ -303,7 +303,7 @@ impl Emulator {
     pub fn clear_save_dirty(&mut self) {
         match self {
             Emulator::Gba(g) => g.system.gba.bus.cartridge.clear_backup_dirty(),
-            Emulator::Nds(_) => {}
+            Emulator::Nds(n) => n.system.clear_cart_backup_dirty(),
         }
     }
 

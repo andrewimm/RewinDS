@@ -256,6 +256,102 @@ fn audio_probe() {
 /// Report DISPCNT + non-black pixel count each frame (has the game reached display?).
 #[test]
 #[ignore]
+fn backup_dump() {
+    // BACKUP_NONFF_PROBE
+    let mut sys = booted();
+    for f in 0..frames() { let k=env_hex("CYC_KEYS",0); sys.set_keypad(if k!=0 && f%8<4 {k} else {0}); sys.run_frame(); }
+    let b = sys.cart_backup();
+    let nonff = b.iter().filter(|&&x| x != 0xFF).count();
+    eprintln!("backup: {} bytes, {} non-0xFF", b.len(), nonff);
+    // show the first non-FF regions
+    let mut i = 0; let mut shown = 0;
+    while i < b.len() && shown < 6 {
+        if b[i] != 0xFF {
+            let end = (i+16).min(b.len());
+            eprintln!("  @{:#08x}: {:02X?}", i, &b[i..end]);
+            shown += 1; i += 16;
+        } else { i += 1; }
+    }
+}
+
+/// Dump the raw AUXSPI backup transactions (segmented by chip-select) with the ARM7
+/// PC that issued each, to see the exact command/address/data byte stream.
+#[test]
+#[ignore]
+fn aux_trace() {
+    nds::system::cyctrace::enable();
+    let mut sys = booted();
+    let keys = env_hex("CYC_KEYS", 0);
+    for f in 0..frames() {
+        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        sys.run_frame();
+    }
+    let log = nds::system::cyctrace::take_aux_log();
+    eprintln!("{} clocked bytes", log.len());
+    // Segment into transactions: a transaction's bytes run until in_transfer==0.
+    let mut i = 0;
+    let mut txn = 0;
+    let only = std::env::var("CYC_ONLY").ok(); // "02" to show only that command
+    while i < log.len() {
+        let start = i;
+        while i < log.len() && log[i].3 != 0 {
+            i += 1;
+        }
+        if i < log.len() {
+            i += 1;
+        } // include the terminating byte
+        let bytes = &log[start..i];
+        let cmd = bytes[0].1;
+        let pc = bytes[0].0;
+        if only.as_deref().map(|o| u8::from_str_radix(o, 16).ok()) == Some(Some(cmd)) || only.is_none()
+        {
+            let ins: Vec<u8> = bytes.iter().map(|b| b.1).collect();
+            let outs: Vec<u8> = bytes.iter().map(|b| b.2).collect();
+            eprintln!(
+                "txn {txn:3} pc={pc:08X} cmd={cmd:02X} n={} in={:02X?} out={:02X?}",
+                bytes.len(),
+                &ins[..ins.len().min(20)],
+                &outs[..outs.len().min(20)]
+            );
+        }
+        txn += 1;
+    }
+    eprintln!("{txn} transactions");
+}
+
+/// Search Main RAM for a byte substring (CYC_STR ASCII, or CYC_HEX hex bytes) after
+/// `CYC_FRAMES` frames — to locate error text / data in memory.
+#[test]
+#[ignore]
+fn find_bytes() {
+    let mut sys = booted();
+    let keys = env_hex("CYC_KEYS", 0);
+    for f in 0..frames() {
+        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        sys.run_frame();
+    }
+    let needle: Vec<u8> = if let Ok(s) = std::env::var("CYC_STR") {
+        s.into_bytes()
+    } else {
+        let h = std::env::var("CYC_HEX").expect("CYC_STR or CYC_HEX");
+        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+    };
+    let ram = &sys.memory().main;
+    let mut hits = 0;
+    for i in 0..ram.len().saturating_sub(needle.len()) {
+        if ram[i..i + needle.len()] == needle[..] {
+            eprintln!("hit @ {:#010x}", 0x0200_0000u32 + i as u32);
+            hits += 1;
+            if hits >= 16 {
+                break;
+            }
+        }
+    }
+    eprintln!("{hits} hit(s) for {} bytes", needle.len());
+}
+
+#[test]
+#[ignore]
 fn boot_probe() {
     let mut sys = booted();
     for f in 0..frames() {

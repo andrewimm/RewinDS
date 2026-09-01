@@ -93,6 +93,19 @@ pub mod cyctrace {
     pub fn watch(addr: u32) {
         WATCH.store(addr, Ordering::Relaxed);
     }
+
+    /// The most recently fetched opcode PC per core (0 = ARM9, 1 = ARM7), updated on
+    /// every fetch, so a bus-side hook (e.g. the AUXSPI backup) can attribute an
+    /// access to the instruction that issued it without threading the CPU through.
+    pub static CUR_PC: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    /// Raw AUXSPI backup byte log: `(arm7_pc, byte_in, byte_out, still_in_transfer)`.
+    pub static AUXLOG: Mutex<Vec<(u32, u8, u8, u8)>> = Mutex::new(Vec::new());
+    pub fn aux_log(pc: u32, byte_in: u8, byte_out: u8, in_transfer: u8) {
+        AUXLOG.lock().unwrap().push((pc, byte_in, byte_out, in_transfer));
+    }
+    pub fn take_aux_log() -> Vec<(u32, u8, u8, u8)> {
+        std::mem::take(&mut AUXLOG.lock().unwrap())
+    }
     pub fn watch_access(core: u8, address: u32, bytes: u32, is_write: bool, value: u32, clock: u64) {
         let target = WATCH.load(Ordering::Relaxed);
         if target == u32::MAX {
@@ -732,6 +745,24 @@ impl System {
     /// A VRAM bank's `VRAMCNT` byte (bank 0=A … 8=I), for debug tooling.
     pub fn vram_control(&self, bank: usize) -> u8 {
         self.machine.vram.control(bank)
+    }
+
+    /// The cartridge backup (save) bytes, for the host to persist.
+    pub fn cart_backup(&self) -> &[u8] {
+        self.machine.cart.backup_bytes()
+    }
+
+    /// Restore previously saved cartridge backup contents.
+    pub fn load_cart_backup(&mut self, data: &[u8]) {
+        self.machine.cart.load_backup(data);
+    }
+
+    /// Whether the backup changed since the last [`Self::clear_cart_backup_dirty`].
+    pub fn cart_backup_dirty(&self) -> bool {
+        self.machine.cart.backup_dirty()
+    }
+    pub fn clear_cart_backup_dirty(&mut self) {
+        self.machine.cart.clear_backup_dirty();
     }
 
     /// The ARM9's CP15 coprocessor state.
