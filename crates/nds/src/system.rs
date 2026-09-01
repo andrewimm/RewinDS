@@ -537,10 +537,13 @@ impl System {
         self.machine.cp15.write(0, 9, 1, 0, 0x0080_000A); // DTCM base 0x0080_0000, 16 KB
         self.machine.cp15.write(0, 9, 1, 1, 0x0000_000C); // ITCM 32 KB (base fixed at 0)
         self.machine.cp15.write(0, 1, 0, 0, (1 << 16) | (1 << 18)); // enable DTCM + ITCM
-        // Give the ARM9 the Shared WRAM its stack sits in.
-        self.machine.memory.wramcnt = 0;
+        // Give the ARM7 the Shared WRAM (WRAMCNT=3): its crt0 relocates code into
+        // the 32K Shared WRAM mirrored at 0x037F8000, using Shared + ARM7-WRAM as
+        // one continuous 96K block (GBATEK "Shared-RAM").
+        self.machine.memory.wramcnt = 3;
         // Entry points and conventional system-mode stacks (the cores boot in
-        // System mode; the ARM9 stack is in Shared WRAM, the ARM7's in ARM7-WRAM).
+        // System mode; each game's startup replaces these with its own). The ARM7
+        // stack sits in ARM7-WRAM; the ARM9's is a fallback it reconfigures early.
         self.arm9.set_pc(header.arm9_entry);
         self.arm9.set_register(13, 0x0300_2F7C);
         self.arm7.set_pc(header.arm7_entry);
@@ -1098,6 +1101,38 @@ mod tests {
         // User settings: version 5, English + settings-okay flags, no prompt.
         assert_eq!(system.read(Core::Arm9, 0x027F_FC80, 2), 5);
         assert_eq!(system.read(Core::Arm9, 0x027F_FC80 + 0x64, 2) & 0x7, 1); // language English
+    }
+
+    #[test]
+    fn direct_boot_gives_arm7_the_shared_wram_mirror() {
+        // WRAMCNT=3 hands the 32K Shared WRAM to the ARM7, mirrored at 0x037F8000
+        // (GBATEK "Shared-RAM": Shared + ARM7-WRAM form one continuous 96K block).
+        // A retail ARM7 relocates its code into that mirror; if it maps to ARM7-WRAM
+        // instead (WRAMCNT=0) the ARM7 reads zeroes and crashes into cleared BSS.
+        fn put(rom: &mut [u8], off: usize, v: u32) {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x6000];
+        put(&mut rom, 0x20, 0x4000);
+        put(&mut rom, 0x24, 0x0200_0000);
+        put(&mut rom, 0x28, 0x0200_0000);
+        put(&mut rom, 0x2C, 4);
+        put(&mut rom, 0x30, 0x5000);
+        put(&mut rom, 0x34, 0x0210_0000);
+        put(&mut rom, 0x38, 0x0210_0000);
+        put(&mut rom, 0x3C, 4);
+        put(&mut rom, 0x4000, 0xEAFF_FFFE);
+        put(&mut rom, 0x5000, 0xEAFF_FFFE);
+
+        let mut system = System::new();
+        system.direct_boot(&rom).unwrap();
+        // The ARM7 reads WRAMCNT as 3 (32K allocated to it).
+        assert_eq!(system.read(Core::Arm7, 0x0400_0241, 1) & 3, 3);
+        // A write the ARM7 makes to 0x037F8000 is visible via the 0x03000000 Shared
+        // WRAM window (same 32K), and NOT via ARM7-WRAM at 0x03808000.
+        system.write(Core::Arm7, 0x037F_8000, 0xC0DE_0007, 4);
+        assert_eq!(system.read(Core::Arm7, 0x0300_0000, 4), 0xC0DE_0007);
+        assert_eq!(system.read(Core::Arm7, 0x0380_8000, 4), 0);
     }
 
     #[test]
