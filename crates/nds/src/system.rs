@@ -203,6 +203,8 @@ pub struct Machine {
     pub(crate) cart: Cart,
     /// The ARM7 SPI bus (firmware flash — the touchscreen calibration source).
     pub(crate) spi: crate::spi::Spi,
+    /// The ARM7 serial real-time clock (`0x4000138`).
+    pub(crate) rtc: crate::rtc::Rtc,
     /// The ARM9 hardware division and square-root units.
     pub(crate) math: crate::math::Math,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
@@ -219,6 +221,14 @@ pub struct Machine {
     /// `POSTFLG` (`0x4000300`) per core: bit 0 = boot completed. Retail games
     /// refuse to run while it reads 0; direct boot sets it (GBATEK).
     pub(crate) postflg: [u8; 2],
+    /// `EXMEMCNT`/`EXMEMSTAT` (`0x4000204`): NDS/GBA-slot and main-memory arbitration.
+    /// One shared value both cores read; the ARM9 writes all bits, the ARM7 only the
+    /// low 7 (its GBA-slot timing). The two crt0s write it then read it back.
+    pub(crate) exmemcnt: u16,
+    /// `POWCNT1` (`0x4000304`, ARM9): LCD / 2D-engine / 3D power and display swap.
+    /// Stored and read back (games verify it); the display-swap bit acts once a
+    /// second screen exists.
+    pub(crate) powcnt1: u16,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
@@ -238,12 +248,15 @@ impl Machine {
             ipc: Ipc::new(),
             cart: Cart::new(),
             spi: crate::spi::Spi::new(),
+            rtc: crate::rtc::Rtc::new(),
             math: crate::math::Math::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
             timing: [CoreTiming::default(), CoreTiming::default()],
             keyinput: 0x03FF, // all released
             postflg: [0, 0],
+            exmemcnt: 0,
+            powcnt1: 0,
             clock: [0; 2],
         }
     }
@@ -385,6 +398,9 @@ impl Machine {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
+            0x0400_0138 if core == Core::Arm7 => self.rtc.read(),
+            0x0400_0204 => self.exmemcnt as u32, // EXMEMCNT/EXMEMSTAT (both cores)
+            0x0400_0304 if core == Core::Arm9 => self.powcnt1 as u32,
             0x0400_01A0 => self.cart.read_auxspicnt() as u32,
             0x0400_01A4 => self.cart.read_romctrl(),
             0x0400_01C0 if core == Core::Arm7 => self.spi.read_cnt() as u32,
@@ -507,6 +523,17 @@ impl Machine {
                 .ipc
                 .write_fifocnt(core, value as u16, &mut self.interrupts),
             0x0400_0188 => self.ipc.send(core, value, &mut self.interrupts),
+            0x0400_0138 if core == Core::Arm7 => self.rtc.write(value),
+            0x0400_0204 => {
+                // EXMEMCNT: the ARM9 owns every bit; the ARM7 may only change the low
+                // 7 (its own GBA-slot timing). Both cores read the same value back.
+                self.exmemcnt = if core == Core::Arm9 {
+                    value as u16
+                } else {
+                    (self.exmemcnt & !0x7F) | (value as u16 & 0x7F)
+                };
+            }
+            0x0400_0304 if core == Core::Arm9 => self.powcnt1 = value as u16,
             0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
             0x0400_0210 => self.interrupts[c].set_ie(value),
             0x0400_0214 => self.interrupts[c].acknowledge(value),

@@ -22,6 +22,7 @@ pub mod key1;
 pub mod math;
 pub mod memory;
 pub mod ppu;
+pub mod rtc;
 pub mod spi;
 pub mod system;
 pub mod timer;
