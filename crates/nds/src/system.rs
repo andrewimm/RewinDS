@@ -784,6 +784,24 @@ impl System {
         (rl.polygons().len(), rl.vertices().len())
     }
 
+    /// Rasterize the 3D engine's sealed render list to a 256×192 RGB8 buffer (covered
+    /// pixels as their color, uncovered as black), for debug visualization.
+    pub fn gpu3d_rasterize_rgb(&self) -> Vec<u8> {
+        let mut fb = gpu3d::raster::Framebuffer3d::new();
+        gpu3d::raster::render(self.machine.gpu3d.render_list(), &mut fb);
+        let mut rgb = Vec::with_capacity(gpu3d::raster::WIDTH * gpu3d::raster::HEIGHT * 3);
+        for p in &fb.pixels {
+            if p.covered {
+                for &c in &p.color {
+                    rgb.push((c << 2) | (c >> 4)); // 6-bit → 8-bit
+                }
+            } else {
+                rgb.extend_from_slice(&[0, 0, 0]);
+            }
+        }
+        rgb
+    }
+
     /// The cartridge backup (save) bytes, for the host to persist.
     pub fn cart_backup(&self) -> &[u8] {
         self.machine.cart.backup_bytes()

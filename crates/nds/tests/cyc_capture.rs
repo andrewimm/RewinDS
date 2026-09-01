@@ -276,6 +276,26 @@ fn backup_dump() {
     }
 }
 
+/// Rasterize the 3D engine's render list to a 256x192 PPM (`CYC_OUT`) after
+/// `CYC_FRAMES` — a visual check that the software rasterizer draws a game's geometry.
+#[test]
+#[ignore]
+fn rasterize_3d() {
+    let mut sys = booted();
+    let keys = env_hex("CYC_KEYS", 0);
+    for f in 0..frames() {
+        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        sys.run_frame();
+    }
+    let (polys, verts) = sys.gpu3d_render_list();
+    let rgb = sys.gpu3d_rasterize_rgb();
+    let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
+    let mut ppm = b"P6\n256 192\n255\n".to_vec();
+    ppm.extend_from_slice(&rgb);
+    std::fs::write(&out, ppm).unwrap();
+    eprintln!("3D render list: {polys} polys, {verts} verts -> {out}");
+}
+
 /// Drive the menu into gameplay (tap A repeatedly after `CYC_PRESS_FROM`), then report
 /// the render config, whether the ARM9 is spinning, and dump the final frame — to
 /// diagnose the "enter game → glitch + lockup" symptom.

@@ -17,6 +17,7 @@ pub mod debug;
 pub mod fifo;
 pub mod geometry;
 pub mod matrix;
+pub mod raster;
 
 use command::Decoder;
 use debug::{Polygon3dProvenance, Vertex3dProvenance};

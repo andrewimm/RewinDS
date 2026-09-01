@@ -105,6 +105,8 @@ pub struct RenderList {
     vertex_origins: Vec<VertexOrigin>,
     /// The `SWAP_BUFFERS` parameter (bit 0 = manual translucent sort, bit 1 = W-buffer).
     pub swap_flags: u32,
+    /// The `VIEWPORT` parameter (x1|y1<<8|x2<<16|y2<<24), or 0 for full-screen.
+    pub viewport: u32,
     /// Increments each swap — the sealed frame's index.
     pub frame: u64,
 }
@@ -332,6 +334,8 @@ struct State {
     cur_attr: u32,
     tex_param: u32,
     pltt_base: u32,
+    /// The `VIEWPORT` rectangle, sealed into the render list at swap.
+    viewport: u32,
     /// Command sequence number of the current list's `BEGIN_VTXS` (polygon provenance).
     begin_seq: u32,
 }
@@ -547,6 +551,7 @@ impl GeometryEngine {
                 self.state.begin_seq = self.command_seq;
                 self.assembler.begin(params[0] as u8);
             }
+            VIEWPORT => self.state.viewport = params[0],
             END_VTXS => {}
             SWAP_BUFFERS => self.swap_buffers(params[0]),
 
@@ -702,6 +707,7 @@ impl GeometryEngine {
         self.render_list.polygons = std::mem::take(&mut self.polygons);
         self.render_list.vertex_origins = std::mem::take(&mut self.vertex_origins);
         self.render_list.swap_flags = param;
+        self.render_list.viewport = self.state.viewport;
         self.render_list.frame += 1;
         self.assembler.run.clear();
         self.command_seq = 0;
