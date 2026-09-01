@@ -92,6 +92,12 @@ impl Gpu3d {
         self.geometry.explain_polygon(index)
     }
 
+    /// The sealed render list — the previous frame's geometry that the rasterizer
+    /// draws (produced by `SWAP_BUFFERS`).
+    pub fn render_list(&self) -> &geometry::RenderList {
+        self.geometry.render_list()
+    }
+
     /// Execute every complete command buffered in the FIFO (a command is complete
     /// once all its parameter entries are present), advancing the geometry engine.
     /// The `nds` glue calls this after each submission. Currently only the matrix

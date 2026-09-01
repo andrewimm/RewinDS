@@ -777,6 +777,13 @@ impl System {
         self.machine.gpu3d.peak_geometry()
     }
 
+    /// The `(polygons, vertices)` in the 3D engine's sealed render list (the geometry
+    /// the rasterizer would draw this frame).
+    pub fn gpu3d_render_list(&self) -> (usize, usize) {
+        let rl = self.machine.gpu3d.render_list();
+        (rl.polygons().len(), rl.vertices().len())
+    }
+
     /// The cartridge backup (save) bytes, for the host to persist.
     pub fn cart_backup(&self) -> &[u8] {
         self.machine.cart.backup_bytes()

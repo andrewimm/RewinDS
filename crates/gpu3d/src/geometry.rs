@@ -62,6 +62,76 @@ struct VertexOrigin {
     object_position: [i32; 3],
 }
 
+/// Build the full provenance of vertex `i` from a vertex slice and its parallel origins.
+fn explain_vertex_from(
+    vertices: &[Vertex],
+    origins: &[VertexOrigin],
+    i: usize,
+) -> Option<Vertex3dProvenance> {
+    let v = vertices.get(i)?;
+    let o = origins.get(i)?;
+    Some(Vertex3dProvenance {
+        index: i as u16,
+        source_op: o.source_op,
+        command_seq: o.command_seq,
+        object_position: o.object_position,
+        clip: v.clip,
+    })
+}
+
+/// Build the full provenance of polygon `i` from a polygon slice.
+fn explain_polygon_from(polygons: &[Polygon], i: usize) -> Option<Polygon3dProvenance> {
+    let p = polygons.get(i)?;
+    Some(Polygon3dProvenance {
+        index: i as u16,
+        primitive: p.primitive,
+        command_seq: p.begin_seq,
+        attr: p.attr,
+        poly_id: ((p.attr >> 24) & 0x3F) as u8,
+        tex_param: p.tex_param,
+        pltt_base: p.pltt_base,
+        vertices: p.verts[..p.count as usize].to_vec(),
+    })
+}
+
+/// A sealed, immutable snapshot of one frame's geometry — the seam between the
+/// geometry engine and the rasterizer. `SWAP_BUFFERS` moves the build buffer here; the
+/// rasterizer (Phase 8) consumes it. Carries the swap parameter (depth mode and
+/// translucent sort) and its own provenance so a rendered pixel is explainable.
+#[derive(Default)]
+pub struct RenderList {
+    vertices: Vec<Vertex>,
+    polygons: Vec<Polygon>,
+    vertex_origins: Vec<VertexOrigin>,
+    /// The `SWAP_BUFFERS` parameter (bit 0 = manual translucent sort, bit 1 = W-buffer).
+    pub swap_flags: u32,
+    /// Increments each swap — the sealed frame's index.
+    pub frame: u64,
+}
+
+impl RenderList {
+    pub fn vertices(&self) -> &[Vertex] {
+        &self.vertices
+    }
+    pub fn polygons(&self) -> &[Polygon] {
+        &self.polygons
+    }
+    /// Depth buffering uses the W value (vs Z) — `SWAP_BUFFERS` bit 1.
+    pub fn w_buffer(&self) -> bool {
+        self.swap_flags & (1 << 1) != 0
+    }
+    /// Translucent polygons are manually sorted (vs auto by depth) — bit 0.
+    pub fn manual_sort(&self) -> bool {
+        self.swap_flags & 1 != 0
+    }
+    pub fn explain_vertex(&self, i: usize) -> Option<Vertex3dProvenance> {
+        explain_vertex_from(&self.vertices, &self.vertex_origins, i)
+    }
+    pub fn explain_polygon(&self, i: usize) -> Option<Polygon3dProvenance> {
+        explain_polygon_from(&self.polygons, i)
+    }
+}
+
 /// A vertex flowing through primitive assembly and clipping — full attributes carried
 /// at interpolation precision (color as `i32`), plus its provenance origin.
 #[derive(Clone, Copy, Default)]
@@ -327,6 +397,8 @@ pub struct GeometryEngine {
     polygons: Vec<Polygon>,
     /// Provenance parallel to `vertices` (same index; cleared together on swap).
     vertex_origins: Vec<VertexOrigin>,
+    /// The sealed snapshot of the previous frame's geometry (the rasterizer's input).
+    render_list: RenderList,
     assembler: Assembler,
     /// Reused Sutherland–Hodgman ping-pong buffers (avoid per-polygon allocation).
     clip_a: Vec<ClipVertex>,
@@ -476,7 +548,7 @@ impl GeometryEngine {
                 self.assembler.begin(params[0] as u8);
             }
             END_VTXS => {}
-            SWAP_BUFFERS => self.swap_buffers(),
+            SWAP_BUFFERS => self.swap_buffers(params[0]),
 
             // BOX/POS/VEC_TEST and unknown opcodes — later phases.
             _ => {}
@@ -604,43 +676,33 @@ impl GeometryEngine {
         });
     }
 
-    /// Build the full provenance of vertex-RAM entry `i` from its durable origin.
+    /// Provenance of a build-buffer vertex (the frame being assembled).
     pub fn explain_vertex(&self, i: usize) -> Option<Vertex3dProvenance> {
-        let v = self.vertices.get(i)?;
-        let o = &self.vertex_origins[i];
-        Some(Vertex3dProvenance {
-            index: i as u16,
-            source_op: o.source_op,
-            command_seq: o.command_seq,
-            object_position: o.object_position,
-            clip: v.clip,
-        })
+        explain_vertex_from(&self.vertices, &self.vertex_origins, i)
     }
 
-    /// Build the full provenance of polygon-RAM entry `i`.
+    /// Provenance of a build-buffer polygon (the frame being assembled).
     pub fn explain_polygon(&self, i: usize) -> Option<Polygon3dProvenance> {
-        let p = self.polygons.get(i)?;
-        Some(Polygon3dProvenance {
-            index: i as u16,
-            primitive: p.primitive,
-            command_seq: p.begin_seq,
-            attr: p.attr,
-            poly_id: ((p.attr >> 24) & 0x3F) as u8,
-            tex_param: p.tex_param,
-            pltt_base: p.pltt_base,
-            vertices: p.verts[..p.count as usize].to_vec(),
-        })
+        explain_polygon_from(&self.polygons, i)
     }
 
-    /// `SWAP_BUFFERS`: reset the build buffers. Phase 7 first seals them into an
-    /// immutable render list for the rasterizer; for now it only clears them so the
-    /// next frame starts fresh (and RAM does not overflow across frames).
-    fn swap_buffers(&mut self) {
+    /// The sealed render list (the previous frame's geometry) the rasterizer consumes.
+    pub fn render_list(&self) -> &RenderList {
+        &self.render_list
+    }
+
+    /// `SWAP_BUFFERS`: seal the build buffer into the render list (moving the vertices,
+    /// polygons, and their provenance) and reset the build buffer for the next frame.
+    /// On hardware the swap waits for V-blank; here it takes effect on the command
+    /// (still one frame ahead of the rasterizer, which reads the sealed list).
+    fn swap_buffers(&mut self, param: u32) {
         self.peak.0 = self.peak.0.max(self.polygons.len());
         self.peak.1 = self.peak.1.max(self.vertices.len());
-        self.vertices.clear();
-        self.vertex_origins.clear();
-        self.polygons.clear();
+        self.render_list.vertices = std::mem::take(&mut self.vertices);
+        self.render_list.polygons = std::mem::take(&mut self.polygons);
+        self.render_list.vertex_origins = std::mem::take(&mut self.vertex_origins);
+        self.render_list.swap_flags = param;
+        self.render_list.frame += 1;
         self.assembler.run.clear();
         self.command_seq = 0;
     }
@@ -988,6 +1050,36 @@ mod tests {
         e.execute(op::SWAP_BUFFERS, &[0]);
         assert_eq!(e.vertices().len(), 0);
         assert_eq!(e.ram_count(), 0);
+    }
+
+    #[test]
+    fn swap_buffers_seals_geometry_into_the_render_list() {
+        let mut e = engine();
+        begin(&mut e, 0);
+        vtx(&mut e, 0, 0, 0);
+        vtx(&mut e, 2, 0, 0);
+        vtx(&mut e, 0, 2, 0);
+        // Before the swap: geometry is in the build buffer, the render list is empty.
+        assert_eq!(e.polygons().len(), 1);
+        assert_eq!(e.render_list().polygons().len(), 0);
+
+        e.execute(op::SWAP_BUFFERS, &[0b10]); // W-buffer depth mode
+
+        // After: the build buffer reset, the render list holds the sealed frame.
+        assert_eq!(e.polygons().len(), 0);
+        let rl = e.render_list();
+        assert_eq!(rl.polygons().len(), 1);
+        assert_eq!(rl.vertices().len(), 3);
+        assert!(rl.w_buffer() && !rl.manual_sort());
+        assert_eq!(rl.frame, 1);
+        // Provenance travels into the sealed list.
+        assert_eq!(rl.explain_vertex(0).unwrap().source_op, op::VTX_16);
+        assert_eq!(rl.explain_polygon(0).unwrap().primitive, 0);
+
+        // A second swap advances the frame counter.
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        assert_eq!(e.render_list().frame, 2);
+        assert_eq!(e.render_list().polygons().len(), 0); // empty build buffer sealed
     }
 }
 
