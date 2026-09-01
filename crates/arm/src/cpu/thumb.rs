@@ -419,6 +419,7 @@ impl Cpu {
 
     fn thumb_push_pop<B: Bus>(&mut self, bus: &mut B, pop: bool, include_pc_lr: bool, list: u8) {
         self.data_access = true;
+        self.block_transfer = true;
         let count = list.count_ones() + include_pc_lr as u32;
         let mut sequential = false;
         if pop {
@@ -461,6 +462,7 @@ impl Cpu {
 
     fn thumb_block_transfer<B: Bus>(&mut self, bus: &mut B, load: bool, rb: Register, list: u8) {
         self.data_access = true;
+        self.block_transfer = true;
         let base = self.reg(rb);
         if list == 0 {
             // ARM7TDMI empty-list edge case: only r15 is transferred, and the base

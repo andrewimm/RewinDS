@@ -134,7 +134,6 @@ impl NdsCpuBus<'_> {
         };
         let t = &mut self.machine.timing[c];
         t.mem += cost;
-        t.data_count += 1;
         if is_read {
             t.did_load = true;
         } else {

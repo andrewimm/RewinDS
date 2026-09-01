@@ -224,6 +224,10 @@ pub struct Cpu {
     /// Whether the current instruction performed a data access (which breaks the
     /// fetch sequence for the next opcode).
     data_access: bool,
+    /// Whether the current instruction is a block transfer (`LDM`/`STM`/`PUSH`/`POP`).
+    /// Reset at the start of each step. Cycle-accurate hosts charge a block transfer a
+    /// lower ALU base than a single load/store, even when it moves a single register.
+    block_transfer: bool,
     /// The architecture variant this core implements. Gates the ARMv5TE-only
     /// behaviours (interworking rules, and trapping v5 instructions as undefined on
     /// ArmV4T). ARM7 cores keep the default [`ArmVersion::Armv4T`].
@@ -261,6 +265,7 @@ impl Cpu {
             branched: false,
             sequential: false,
             data_access: false,
+            block_transfer: false,
             version,
             exception_base: 0,
         }
@@ -301,6 +306,14 @@ impl Cpu {
     /// pipeline-refill cost to the branch itself, as the hardware does.
     pub fn branched(&self) -> bool {
         self.branched
+    }
+
+    /// Whether the instruction most recently executed by [`Self::step`] was a block
+    /// transfer (`LDM`/`STM`/`PUSH`/`POP`). Reset at the start of each step. Lets a
+    /// cycle-accurate host apply the block-transfer ALU base even for a single-register
+    /// list, which a data-access count alone cannot distinguish from `LDR`/`STR`.
+    pub fn block_transfer(&self) -> bool {
+        self.block_transfer
     }
 
     /// Read the raw stored register (no pipeline adjustment). For `r15` this is
@@ -400,6 +413,7 @@ impl Cpu {
     /// Execute one instruction.
     pub fn step<B: Bus>(&mut self, bus: &mut B) {
         self.branched = false;
+        self.block_transfer = false;
         if self.cpsr.thumb() {
             self.step_thumb(bus);
         } else {
@@ -632,6 +646,7 @@ impl Cpu {
 
     fn execute_block_transfer<B: Bus>(&mut self, op: BlockTransfer, bus: &mut B) {
         self.data_access = true;
+        self.block_transfer = true;
         let base = self.reg(op.rn);
         let count = op.register_list.count_ones();
         if count == 0 {

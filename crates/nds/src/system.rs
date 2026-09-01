@@ -144,9 +144,6 @@ pub(crate) struct CoreTiming {
     pub internal: u32,
     pub did_load: bool,
     pub did_store: bool,
-    /// Number of data accesses this instruction made. >1 marks a block transfer
-    /// (`LDM`/`STM`/`PUSH`/`POP`), whose ALU base differs from a single load/store.
-    pub data_count: u32,
     /// Last code-fetch / data-access addresses, for sequential-access detection.
     pub code_last: u32,
     pub data_last: u32,
@@ -169,21 +166,19 @@ impl CoreTiming {
         self.internal = 0;
         self.did_load = false;
         self.did_store = false;
-        self.data_count = 0;
     }
 
     /// This instruction's `cExecute` in the core's own cycles: the ALU base combined
     /// with the memory cost — the ARM9 by `max` (parallel 5-stage pipeline), the ARM7
     /// by `+` (sequential 3-stage). `branched` is the CPU's taken-branch signal
-    /// (pipeline refill → execute base 3). The opcode fetch is combined separately at
-    /// the step boundary under the prefetch model (see [`Self::pending_execute`]).
-    fn execute_cost(&self, branched: bool, arm9: bool) -> u32 {
+    /// (pipeline refill → execute base 3); `block` marks an `LDM`/`STM`/`PUSH`/`POP`.
+    /// The opcode fetch is combined separately at the step boundary under the prefetch
+    /// model (see [`Self::pending_execute`]).
+    fn execute_cost(&self, branched: bool, block: bool, arm9: bool) -> u32 {
         // ALU base by instruction class. A single load and a taken branch both cost 3
         // (load base / pipeline refill); a single store costs 2; a plain ALU op 1. A
-        // block transfer (LDM/STM/PUSH/POP — more than one data access) is cheaper per
-        // the ARM946E-S/ARM7TDMI: LDM base 2 (4 when it loads PC, which also branches),
-        // STM base 1.
-        let block = self.data_count > 1;
+        // block transfer (LDM/STM/PUSH/POP) is cheaper regardless of register count:
+        // LDM base 2 (4 when it loads PC, which also branches), STM base 1.
         let alu_base = if self.did_load {
             if block {
                 // LDM: base 2, or 4 when it loads PC (which also branches).
@@ -762,15 +757,15 @@ impl System {
         // The cost is in the core's own cycles; the ARM9 runs at the master rate, the
         // ARM7 at half (one ARM7 cycle = two master ticks).
         let arm9 = core == Core::Arm9;
-        let branched = if arm9 {
-            self.arm9.branched()
+        let (branched, block) = if arm9 {
+            (self.arm9.branched(), self.arm9.block_transfer())
         } else {
-            self.arm7.branched()
+            (self.arm7.branched(), self.arm7.block_transfer())
         };
         // Prefetch model: charge `max(cExecute(prev), cFetch(this))` — this opcode was
         // fetched while the previous instruction executed — then carry this
         // instruction's execute forward to pair with the next fetch.
-        let execute = self.machine.timing[c].execute_cost(branched, arm9);
+        let execute = self.machine.timing[c].execute_cost(branched, block, arm9);
         let t = &mut self.machine.timing[c];
         let cost = t.pending_execute.max(t.fetch) as Timestamp;
         t.pending_execute = execute;
