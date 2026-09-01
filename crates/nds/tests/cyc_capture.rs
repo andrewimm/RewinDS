@@ -298,7 +298,12 @@ fn rasterize_3d() {
         eprintln!("  v{i}: clip=[{},{},{},{}]  ndc_y={ndc_y:.3}  screen_y={sy:.0}", c[0], c[1], c[2], c[3]);
     }
     let (disp3dcnt, polys_summary) = sys.gpu3d_poly_summary();
-    eprintln!("DISP3DCNT={disp3dcnt:#06x} (alpha_test={} alpha_blend={})", (disp3dcnt >> 2) & 1, (disp3dcnt >> 3) & 1);
+    eprintln!(
+        "DISP3DCNT={disp3dcnt:#06x} (tex_enable={} alpha_test={} alpha_blend={} rear_bitmap={})",
+        disp3dcnt & 1, (disp3dcnt >> 2) & 1, (disp3dcnt >> 3) & 1, (disp3dcnt >> 14) & 1
+    );
+    let cc = sys.gpu3d_clear_color();
+    eprintln!("CLEAR_COLOR={cc:#010x} (rgb=[{},{},{}] alpha={})", cc & 0x1F, (cc >> 5) & 0x1F, (cc >> 10) & 0x1F, (cc >> 16) & 0x1F);
     let dispcnt = sys.read(Core::Arm9, 0x0400_0000, 4);
     let bldcnt = sys.read(Core::Arm9, 0x0400_0050, 2);
     let bldalpha = sys.read(Core::Arm9, 0x0400_0052, 2);

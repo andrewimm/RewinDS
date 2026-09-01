@@ -815,6 +815,11 @@ impl System {
         (self.machine.gpu3d.disp3dcnt(), polys)
     }
 
+    /// `CLEAR_COLOR` (`0x4000350`) — the rear-plane color/alpha register, for debug.
+    pub fn gpu3d_clear_color(&self) -> u32 {
+        self.machine.gpu3d.clear_color()
+    }
+
     /// Rasterize the 3D engine's sealed render list to a 256×192 RGB8 buffer (covered
     /// pixels as their color, uncovered as black), for debug visualization.
     pub fn gpu3d_rasterize_rgb(&self) -> Vec<u8> {

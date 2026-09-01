@@ -58,15 +58,27 @@ impl Framebuffer3d {
         self.pixels.iter_mut().for_each(|p| *p = Pixel3d::default());
         self.depth.iter_mut().for_each(|d| *d = i32::MAX);
     }
+    /// Initialise every pixel to the rear-plane fill (the 3D "clear color") and the
+    /// depth buffer to the clear depth. A rear-plane alpha of 0 is transparent (the
+    /// pixel is uncovered, so the 2D layers show through).
+    pub fn clear_rear(&mut self, color: [u8; 3], alpha: u8, depth: i32) {
+        let fill = Pixel3d { color, alpha, covered: alpha > 0 };
+        self.pixels.iter_mut().for_each(|p| *p = fill);
+        self.depth.iter_mut().for_each(|d| *d = depth);
+    }
     /// The pixel at `(x, y)` (both in range).
     pub fn at(&self, x: usize, y: usize) -> Pixel3d {
         self.pixels[y * WIDTH + x]
     }
 }
 
-/// Per-frame rendering controls from `DISP3DCNT` + `ALPHA_TEST_REF`.
+/// Per-frame rendering controls from `DISP3DCNT`, `ALPHA_TEST_REF`, and the rear-plane
+/// clear registers.
 #[derive(Clone, Copy)]
 pub struct RenderConfig {
+    /// `DISP3DCNT` bit 0: global texture-mapping enable. When clear, polygons render
+    /// with their vertex/lighting color only (no texture sampling).
+    pub texture_enable: bool,
     /// `DISP3DCNT` bit 3: when clear, translucent polygons are drawn opaque (their
     /// pixels overwrite the framebuffer rather than blending).
     pub alpha_blend: bool,
@@ -74,13 +86,28 @@ pub struct RenderConfig {
     pub alpha_test: bool,
     /// `ALPHA_TEST_REF` (0-31): the alpha-test comparison value.
     pub alpha_ref: u8,
+    /// The rear-plane fill (`CLEAR_COLOR`): 6-bit RGB and 5-bit alpha (`0` = the 3D
+    /// layer is transparent there, so the 2D layers behind show through).
+    pub clear_color: [u8; 3],
+    pub clear_alpha: u8,
+    /// The rear-plane depth (`CLEAR_DEPTH` expanded to 24 bits); the depth buffer is
+    /// initialised to this, so polygons must be nearer to draw.
+    pub clear_depth: i32,
 }
 
 impl Default for RenderConfig {
-    /// The common case: alpha-blending on, no alpha test — the configuration the
-    /// rasterizer unit tests assume. Real frames build this from the registers.
+    /// The common case for unit tests: texture + alpha-blending on, no alpha test, and
+    /// a transparent far rear-plane. Real frames build this from the registers.
     fn default() -> Self {
-        RenderConfig { alpha_blend: true, alpha_test: false, alpha_ref: 0 }
+        RenderConfig {
+            texture_enable: true,
+            alpha_blend: true,
+            alpha_test: false,
+            alpha_ref: 0,
+            clear_color: [0, 0, 0],
+            clear_alpha: 0,
+            clear_depth: i32::MAX,
+        }
     }
 }
 
@@ -235,9 +262,9 @@ enum Pass {
 
 /// Combine a (possibly textured) polygon's interpolated vertex color with a sampled
 /// texel per the blend mode, yielding the final 6-bit color and 5-bit alpha.
-fn shade(rp: &RPoly, tex: &TextureSet, vtx: [i32; 3], st: [i32; 2]) -> ([u8; 3], u8) {
+fn shade(rp: &RPoly, tex: &TextureSet, cfg: &RenderConfig, vtx: [i32; 3], st: [i32; 2]) -> ([u8; 3], u8) {
     let vtx = [vtx[0].clamp(0, 63), vtx[1].clamp(0, 63), vtx[2].clamp(0, 63)];
-    if !rp.tex.textured() {
+    if !cfg.texture_enable || !rp.tex.textured() {
         return ([vtx[0] as u8, vtx[1] as u8, vtx[2] as u8], rp.poly_alpha);
     }
     let texel = rp.tex.sample(tex, st[0] >> 4, st[1] >> 4);
@@ -312,7 +339,7 @@ fn fill_span(
         }
         let color = [lerp(l.color[0], r.color[0]), lerp(l.color[1], r.color[1]), lerp(l.color[2], r.color[2])];
         let st = [lerp(l.st[0], r.st[0]), lerp(l.st[1], r.st[1])];
-        let (rgb, alpha) = shade(rp, tex, color, st);
+        let (rgb, alpha) = shade(rp, tex, cfg, color, st);
         if !cfg.alpha_passes(alpha) {
             continue; // failed the alpha test (or fully transparent)
         }
@@ -387,7 +414,7 @@ fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, cfg: &RenderC
 /// pixels are laid down first (with depth), then — if alpha-blending is enabled —
 /// translucent pixels blend over them.
 pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut Framebuffer3d) {
-    fb.clear();
+    fb.clear_rear(cfg.clear_color, cfg.clear_alpha, cfg.clear_depth);
     let vp = Viewport::decode(list.viewport);
     let w_buffer = list.w_buffer();
     let verts = list.vertices();
@@ -630,5 +657,46 @@ mod tests {
         let p = rasterize_cfg(&e, &no_blend).at(128, 96);
         assert_eq!(p.color, [63, 0, 0], "translucent poly drawn opaque, overwriting blue");
         assert_eq!(p.alpha, 8, "its own alpha is still written to the buffer");
+    }
+
+    #[test]
+    fn global_texture_disable_uses_the_vertex_color() {
+        // A textured (format 4) polygon over an empty texture VRAM. With texturing on it
+        // samples transparent → nothing drawn; with texturing off it shows vertex color.
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]);
+        e.execute(op::COLOR, &[0x1F]); // red
+        e.execute(op::TEXIMAGE_PARAM, &[4 << 26]); // format 4
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | (31 << 16)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        for (x, y) in [(-4, 4), (4, 4), (0, -4)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, 0]);
+        }
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        assert!(!rasterize(&e).at(128, 96).covered, "textured over empty VRAM → transparent");
+        let no_tex = RenderConfig { texture_enable: false, ..Default::default() };
+        assert_eq!(rasterize_cfg(&e, &no_tex).at(128, 96).color, [63, 0, 0], "vertex color");
+    }
+
+    #[test]
+    fn rear_plane_fills_the_uncovered_background() {
+        // An opaque red triangle over an opaque blue rear-plane: inside is red, and the
+        // corners (outside the triangle) are the blue rear-plane, covered and opaque.
+        let e = one_triangle(0x1F, 31 << 16);
+        let cfg = RenderConfig { clear_color: [0, 0, 63], clear_alpha: 31, ..Default::default() };
+        let fb = rasterize_cfg(&e, &cfg);
+        assert_eq!(fb.at(128, 96).color, [63, 0, 0], "the triangle draws over the rear-plane");
+        let corner = fb.at(0, 0);
+        assert!(corner.covered && corner.alpha == 31, "rear-plane covers the background");
+        assert_eq!(corner.color, [0, 0, 63], "the rear-plane clear color");
+    }
+
+    #[test]
+    fn transparent_rear_plane_leaves_the_background_uncovered() {
+        // Clear alpha 0 (the default): pixels the polygons miss stay transparent so the
+        // 2D layers show through — the behavior NSMB relies on.
+        let fb = render_triangle(0x1F, [(-4, 4), (4, 4), (0, -4)]);
+        assert!(!fb.at(0, 0).covered, "transparent rear-plane → uncovered background");
     }
 }

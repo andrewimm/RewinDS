@@ -29,6 +29,9 @@ use geometry::GeometryEngine;
 mod reg {
     pub const DISP3DCNT: u32 = 0x060;
     pub const ALPHA_TEST_REF: u32 = 0x340;
+    pub const CLEAR_COLOR: u32 = 0x350;
+    pub const CLEAR_COLOR_HI: u32 = 0x352;
+    pub const CLEAR_DEPTH: u32 = 0x354;
     pub const GXFIFO_LO: u32 = 0x400;
     pub const GXFIFO_HI: u32 = 0x440; // exclusive end of the GXFIFO region
     pub const PORT_HI: u32 = 0x600; // exclusive end of the command-port region
@@ -50,6 +53,10 @@ pub struct Gpu3d {
     disp3dcnt: u16,
     /// `ALPHA_TEST_REF` (`0x4000340`): the alpha-test comparison value (bits 0-4).
     alpha_test_ref: u8,
+    /// `CLEAR_COLOR` (`0x4000350`): the rear-plane color/alpha/poly-id (blank mode).
+    clear_color: u32,
+    /// `CLEAR_DEPTH` (`0x4000354`): the rear-plane depth (bits 0-14).
+    clear_depth: u16,
     /// The rasterized 256×192 output of the sealed render list, and the frame index it
     /// was rendered from (so it is rasterized at most once per swap).
     framebuffer: raster::Framebuffer3d,
@@ -75,6 +82,8 @@ impl Gpu3d {
             geometry: GeometryEngine::default(),
             disp3dcnt: 0,
             alpha_test_ref: 0,
+            clear_color: 0,
+            clear_depth: 0x7FFF,
             framebuffer: raster::Framebuffer3d::new(),
             rendered_frame: 0,
             tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
@@ -137,12 +146,19 @@ impl Gpu3d {
         self.geometry.render_list()
     }
 
-    /// The rasterizer controls decoded from `DISP3DCNT` + `ALPHA_TEST_REF`.
+    /// The rasterizer controls decoded from `DISP3DCNT`, `ALPHA_TEST_REF`, and the
+    /// rear-plane clear registers (blank-mode rear-plane; the bitmap mode — `DISP3DCNT`
+    /// bit 14 — is not yet modelled).
     pub fn render_config(&self) -> raster::RenderConfig {
+        let cc = self.clear_color;
         raster::RenderConfig {
+            texture_enable: self.disp3dcnt & (1 << 0) != 0,
             alpha_blend: self.disp3dcnt & (1 << 3) != 0,
             alpha_test: self.disp3dcnt & (1 << 2) != 0,
             alpha_ref: self.alpha_test_ref & 0x1F,
+            clear_color: [expand6(cc), expand6(cc >> 5), expand6(cc >> 10)],
+            clear_alpha: ((cc >> 16) & 0x1F) as u8,
+            clear_depth: expand_depth(self.clear_depth & 0x7FFF),
         }
     }
 
@@ -167,6 +183,11 @@ impl Gpu3d {
     /// `DISP3DCNT` (`0x4000060`): the 3D display/blend/test/fog enable bits.
     pub fn disp3dcnt(&self) -> u16 {
         self.disp3dcnt
+    }
+
+    /// `CLEAR_COLOR` (`0x4000350`): the raw rear-plane color/alpha register, for debug.
+    pub fn clear_color(&self) -> u32 {
+        self.clear_color
     }
 
     /// Execute every complete command buffered in the FIFO (a command is complete
@@ -235,8 +256,22 @@ impl Gpu3d {
             reg::ALPHA_TEST_REF => {
                 self.alpha_test_ref = value as u8 & 0x1F;
             }
-            // Other clear/fog/toon/edge control registers are consumed by the rasterizer
-            // (later phases); accept and ignore their writes for now.
+            // CLEAR_COLOR is a 32-bit register; handle a full word or either halfword.
+            reg::CLEAR_COLOR => {
+                self.clear_color = if bytes == 4 {
+                    value
+                } else {
+                    (self.clear_color & 0xFFFF_0000) | (value & 0xFFFF)
+                };
+            }
+            reg::CLEAR_COLOR_HI => {
+                self.clear_color = (self.clear_color & 0x0000_FFFF) | ((value & 0xFFFF) << 16);
+            }
+            reg::CLEAR_DEPTH => {
+                self.clear_depth = merge16(self.clear_depth, value, bytes);
+            }
+            // Other fog/toon/edge/rear-bitmap control registers are consumed by the
+            // rasterizer (later phases); accept and ignore their writes for now.
             _ => {}
         }
     }
@@ -264,6 +299,24 @@ impl Gpu3d {
     fn gxstat(&self) -> u32 {
         self.fifo.gxstat_bits() | self.geometry.gxstat_bits()
     }
+}
+
+/// Expand a 5-bit color channel (low 5 bits of `word`) to 6 bits per GBATEK
+/// (`0 -> 0`, else `c·2+1`).
+fn expand6(word: u32) -> u8 {
+    let c = (word & 0x1F) as u8;
+    if c == 0 {
+        0
+    } else {
+        c * 2 + 1
+    }
+}
+
+/// Expand a 15-bit `CLEAR_DEPTH` value to the 24-bit depth buffer scale per GBATEK:
+/// `X·0x200 + ((X+1)/0x8000)·0x1FF` (so `0x7FFF -> 0xFFFFFF`, the far plane).
+fn expand_depth(x: u16) -> i32 {
+    let x = x as i32;
+    x * 0x200 + ((x + 1) / 0x8000) * 0x1FF
 }
 
 /// Merge a partial (byte/halfword) write into a 16-bit register, honouring the write
