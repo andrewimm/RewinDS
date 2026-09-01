@@ -12,6 +12,20 @@
 
 use emu_core::Timestamp;
 
+/// IMA-ADPCM index adjustment, selected by the low three bits of each 4-bit value.
+const ADPCM_INDEX_TABLE: [i32; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
+/// IMA-ADPCM step table (89 entries), indexed by the running table index (0..=88).
+const ADPCM_STEP_TABLE: [i32; 89] = [
+    0x0007, 0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E, 0x0010, 0x0011, 0x0013, 0x0015,
+    0x0017, 0x0019, 0x001C, 0x001F, 0x0022, 0x0025, 0x0029, 0x002D, 0x0032, 0x0037, 0x003C, 0x0042,
+    0x0049, 0x0050, 0x0058, 0x0061, 0x006B, 0x0076, 0x0082, 0x008F, 0x009D, 0x00AD, 0x00BE, 0x00D1,
+    0x00E6, 0x00FD, 0x0117, 0x0133, 0x0151, 0x0173, 0x0198, 0x01C1, 0x01EE, 0x0220, 0x0256, 0x0292,
+    0x02D4, 0x031C, 0x036C, 0x03C3, 0x0424, 0x048E, 0x0502, 0x0583, 0x0610, 0x06AB, 0x0756, 0x0812,
+    0x08E0, 0x09C3, 0x0ABD, 0x0BD0, 0x0CFF, 0x0E4C, 0x0FBA, 0x114C, 0x1307, 0x14EE, 0x1706, 0x1954,
+    0x1BDC, 0x1EA5, 0x21B6, 0x2515, 0x28CA, 0x2CDF, 0x315B, 0x364B, 0x3BB9, 0x41B2, 0x4844, 0x4F7E,
+    0x5771, 0x602F, 0x69CE, 0x7462, 0x7FFF,
+];
+
 /// The DS sound timer clock (the ARM7 clock), in Hz.
 const SOUND_CLOCK: f64 = 33_513_982.0;
 /// The mixer's output sample rate.
@@ -31,6 +45,8 @@ enum Format {
 /// One of the 16 sound channels: its registers plus the playback cursor.
 #[derive(Default)]
 struct Channel {
+    /// The channel's index 0..=15 (8-13 are PSG square, 14-15 are PSG noise).
+    index: usize,
     /// `SOUNDxCNT`: volume/divider, panning, wave duty, repeat mode, format, start.
     cnt: u32,
     /// `SOUNDxSAD`: source byte address of the sample data.
@@ -45,6 +61,21 @@ struct Channel {
     active: bool,
     /// Fractional sample cursor (units of source samples from `sad`).
     pos: f64,
+    /// IMA-ADPCM decoder state (only used for format 2). The header is read lazily on
+    /// the first sample; the decoder runs sequentially, capturing its predictor/index
+    /// at the loop point and restoring them on each loop (as the hardware does).
+    adpcm_started: bool,
+    adpcm_pcm: i32,
+    adpcm_index: i32,
+    /// Index of the last nibble decoded into `adpcm_pcm`.
+    adpcm_decoded: u32,
+    adpcm_loop_pcm: i32,
+    adpcm_loop_index: i32,
+    adpcm_loop_captured: bool,
+    /// PSG-noise 15-bit LFSR state (only channels 14-15).
+    noise_started: bool,
+    noise_lfsr: u16,
+    noise_stepped: u32,
 }
 
 impl Channel {
@@ -57,22 +88,31 @@ impl Channel {
         }
     }
 
-    /// Samples per 32-bit source word for the current format.
-    fn samples_per_word(&self) -> u32 {
-        match self.format() {
-            Format::Pcm8 => 4,
-            Format::Pcm16 => 2,
-            // ADPCM packs 8 nibbles/word after a 4-byte header; PSG has no data.
-            _ => 1,
-        }
+    /// Whether the repeat mode (bits 27-28) is "loop infinite".
+    fn loops(&self) -> bool {
+        (self.cnt >> 27) & 3 == 1
     }
 
-    /// Total playable samples (`(pnt + len)` words) and the loop-start sample.
+    /// Total playable samples and the loop-start sample. PCM counts 4 (PCM8) or 2
+    /// (PCM16) samples per word; ADPCM counts 8 nibbles per word after the one-word
+    /// header (so its word counts drop the header).
     fn total_samples(&self) -> u32 {
-        (self.pnt as u32 + self.len) * self.samples_per_word()
+        let words = self.pnt as u32 + self.len;
+        match self.format() {
+            Format::Pcm8 => words * 4,
+            Format::Pcm16 => words * 2,
+            Format::Adpcm => words.saturating_sub(1) * 8,
+            Format::Psg => 0,
+        }
     }
     fn loop_start_samples(&self) -> u32 {
-        self.pnt as u32 * self.samples_per_word()
+        let words = self.pnt as u32;
+        match self.format() {
+            Format::Pcm8 => words * 4,
+            Format::Pcm16 => words * 2,
+            Format::Adpcm => words.saturating_sub(1) * 8,
+            Format::Psg => 0,
+        }
     }
 
     /// Source samples advanced per output sample: the channel rate over the mix rate.
@@ -81,47 +121,158 @@ impl Channel {
         SOUND_CLOCK / (period * SAMPLE_RATE as f64)
     }
 
-    /// Start (or restart) playback: cursor to the top of the sample data.
+    /// Start (or restart) playback: cursor to the top of the sample data. The ADPCM
+    /// header is read lazily on the first sample (memory isn't reachable here).
     fn start(&mut self) {
         self.active = true;
         self.pos = 0.0;
+        self.adpcm_started = false;
+        self.adpcm_decoded = 0;
+        self.adpcm_loop_captured = false;
+        self.noise_started = false;
     }
 
-    /// The current mono sample, scaled to the i16 range, via `read` (a raw byte fetch).
-    fn sample(&self, read: &impl Fn(u32) -> u8) -> i32 {
-        let i = self.pos as u32;
+    /// Advance the PSG-noise 15-bit LFSR to the current sample position; the output is
+    /// its inverted low bit at full scale.
+    fn noise_sample(&mut self) -> i32 {
+        if !self.noise_started {
+            self.noise_lfsr = 0x7FFF;
+            self.noise_stepped = 0;
+            self.noise_started = true;
+        }
+        let target = self.pos as u32;
+        while self.noise_stepped < target {
+            self.noise_stepped += 1;
+            let carry = (self.noise_lfsr ^ (self.noise_lfsr >> 1)) & 1;
+            self.noise_lfsr = (self.noise_lfsr >> 1) | (carry << 14);
+        }
+        if self.noise_lfsr & 1 != 0 {
+            -0x7FFF
+        } else {
+            0x7FFF
+        }
+    }
+
+    /// A PSG square-wave sample: `SOUNDxCNT` wave duty (bits 24-26) sets how many of
+    /// the eight phase steps are high (`duty+1` of 8 → 12.5%..100%).
+    fn square_sample(&self) -> i32 {
+        let duty = (self.cnt >> 24) & 7;
+        if (self.pos as u32) & 7 <= duty {
+            0x7FFF
+        } else {
+            -0x7FFF
+        }
+    }
+
+    /// Decode one IMA-ADPCM nibble (index `n` from the first data nibble) into the
+    /// running predictor `adpcm_pcm`, and update the step `adpcm_index`.
+    fn decode_nibble(&mut self, n: u32, read: &impl Fn(u32) -> u8) {
+        // The 4-byte header precedes the nibble stream; two nibbles per byte.
+        let byte = read(self.sad + 4 + n / 2);
+        let data = if n & 1 == 0 { byte & 0xF } else { byte >> 4 } as i32;
+        let step = ADPCM_STEP_TABLE[self.adpcm_index as usize];
+        let mut diff = step >> 3;
+        if data & 1 != 0 {
+            diff += step >> 2;
+        }
+        if data & 2 != 0 {
+            diff += step >> 1;
+        }
+        if data & 4 != 0 {
+            diff += step;
+        }
+        if data & 8 != 0 {
+            self.adpcm_pcm = (self.adpcm_pcm - diff).max(-0x7FFF);
+        } else {
+            self.adpcm_pcm = (self.adpcm_pcm + diff).min(0x7FFF);
+        }
+        self.adpcm_index = (self.adpcm_index + ADPCM_INDEX_TABLE[(data & 7) as usize]).clamp(0, 88);
+    }
+
+    /// Capture the decoder's predictor/index once, when it reaches the loop point, so
+    /// a loop can restore exactly that state (as the hardware does).
+    fn maybe_capture_loop(&mut self) {
+        if self.loops() && !self.adpcm_loop_captured && self.adpcm_decoded == self.loop_start_samples()
+        {
+            self.adpcm_loop_pcm = self.adpcm_pcm;
+            self.adpcm_loop_index = self.adpcm_index;
+            self.adpcm_loop_captured = true;
+        }
+    }
+
+    /// Decode ADPCM forward until `adpcm_pcm` reflects the sample at `pos`.
+    fn decode_forward(&mut self, read: &impl Fn(u32) -> u8) {
+        if !self.adpcm_started {
+            let h = read(self.sad) as u32
+                | (read(self.sad + 1) as u32) << 8
+                | (read(self.sad + 2) as u32) << 16
+                | (read(self.sad + 3) as u32) << 24;
+            self.adpcm_pcm = (h & 0xFFFF) as i16 as i32;
+            self.adpcm_index = ((h >> 16) & 0x7F).min(88) as i32;
+            self.adpcm_started = true;
+            self.decode_nibble(0, read);
+            self.adpcm_decoded = 0;
+            self.maybe_capture_loop();
+        }
+        let target = self.pos as u32;
+        while self.adpcm_decoded < target {
+            self.adpcm_decoded += 1;
+            self.decode_nibble(self.adpcm_decoded, read);
+            self.maybe_capture_loop();
+        }
+    }
+
+    /// The current mono sample (i16 range): a stateless PCM read, or the running
+    /// ADPCM predictor decoded up to the cursor.
+    fn current_sample(&mut self, read: &impl Fn(u32) -> u8) -> i32 {
         match self.format() {
-            Format::Pcm8 => (read(self.sad + i) as i8 as i32) << 8,
+            Format::Pcm8 => {
+                let i = self.pos as u32;
+                (read(self.sad + i) as i8 as i32) << 8
+            }
             Format::Pcm16 => {
+                let i = self.pos as u32;
                 let lo = read(self.sad + i * 2) as u16;
                 let hi = read(self.sad + i * 2 + 1) as u16;
                 (lo | (hi << 8)) as i16 as i32
             }
-            // ADPCM / PSG: later phases.
-            _ => 0,
+            Format::Adpcm => {
+                self.decode_forward(read);
+                self.adpcm_pcm
+            }
+            // PSG is only valid on channels 8-15: 8-13 square, 14-15 noise.
+            Format::Psg if self.index >= 14 => self.noise_sample(),
+            Format::Psg if self.index >= 8 => self.square_sample(),
+            Format::Psg => 0,
         }
     }
 
     /// Advance the cursor one output sample, wrapping at the loop point or stopping.
+    /// On an ADPCM loop the captured predictor/index are restored.
     fn advance(&mut self) {
         self.pos += self.step();
         let total = self.total_samples() as f64;
         if total <= 0.0 || self.pos < total {
             return;
         }
-        // Repeat mode (bits 27-28): 1 = loop, else one-shot/manual → stop.
-        if (self.cnt >> 27) & 3 == 1 {
-            let loop_start = self.loop_start_samples() as f64;
-            let loop_len = (total - loop_start).max(1.0);
-            self.pos = loop_start + (self.pos - loop_start) % loop_len;
+        if self.loops() {
+            let ls = self.loop_start_samples() as f64;
+            let ll = (total - ls).max(1.0);
+            self.pos = ls + (self.pos - ls) % ll;
+            if self.format() == Format::Adpcm {
+                self.adpcm_pcm = self.adpcm_loop_pcm;
+                self.adpcm_index = self.adpcm_loop_index;
+                self.adpcm_decoded = self.loop_start_samples();
+            }
         } else {
             self.active = false;
         }
     }
 
-    /// `(left, right)` contribution, after the channel's own volume and panning.
-    fn output(&self, read: &impl Fn(u32) -> u8) -> (i32, i32) {
-        let sample = self.sample(read);
+    /// This channel's `(left, right)` contribution for one output sample: fetch the
+    /// current sample, apply volume and panning, then advance the cursor.
+    fn next(&mut self, read: &impl Fn(u32) -> u8) -> (i32, i32) {
+        let sample = self.current_sample(read);
         // Volume: a 0..127 multiplier and a 0/1/2/4 → ÷1/÷2/÷4/÷16 divider.
         let mul = (self.cnt & 0x7F) as i32;
         let div_shift = match (self.cnt >> 8) & 3 {
@@ -133,6 +284,7 @@ impl Channel {
         let v = ((sample * mul) >> 7) >> div_shift;
         // Panning: 0 = full left, 127 = full right, 64 = centered.
         let pan = ((self.cnt >> 16) & 0x7F) as i32;
+        self.advance();
         ((v * (127 - pan)) >> 7, (v * pan) >> 7)
     }
 }
@@ -157,7 +309,10 @@ impl Default for Sound {
 impl Sound {
     pub fn new() -> Self {
         Sound {
-            channels: std::array::from_fn(|_| Channel::default()),
+            channels: std::array::from_fn(|i| Channel {
+                index: i,
+                ..Channel::default()
+            }),
             soundcnt: 0,
             soundbias: 0x200,
             buffer: Vec::new(),
@@ -227,10 +382,9 @@ impl Sound {
                 if !ch.active {
                     continue;
                 }
-                let (cl, cr) = ch.output(&read);
+                let (cl, cr) = ch.next(&read);
                 l += cl;
                 r += cr;
-                ch.advance();
             }
             // Master volume (bits 0-6, 0..127).
             let mvol = (self.soundcnt & 0x7F) as i32;
@@ -304,6 +458,76 @@ mod tests {
             s.generate_sample(data);
         }
         assert!(!s.channels[0].active, "one-shot channel stops after its length");
+    }
+
+    /// An IMA-ADPCM channel decodes its nibble stream: a run of +step nibbles drives
+    /// the predictor upward from the header's initial value.
+    #[test]
+    fn adpcm_decodes_a_rising_predictor() {
+        let mut s = Sound::new();
+        // Header (pcm=0, index=0) at 0x0200_0000; then nibbles all 4 (positive step).
+        let data = |addr: u32| -> u8 {
+            if (0x0200_0000..0x0200_0004).contains(&addr) {
+                0 // header: initial pcm 0, index 0
+            } else {
+                0x44 // two nibbles of 4: add a step each
+            }
+        };
+        s.write(0x500, (1 << 15) | 127, 2); // master enable + full volume
+        s.write(0x404, 0x0200_0000, 4); // SAD
+        s.write(0x408, 0xFC00, 2); // TMR → ~1 nibble per output sample
+        s.write(0x40C, 8, 4); // LEN = 8 words
+        // Start: one-shot, ADPCM (format 2), full channel volume, center pan.
+        s.write(0x400, (1 << 31) | (2 << 27) | (2 << 29) | (64 << 16) | 127, 4);
+        let mut first = 0;
+        let mut last = 0;
+        for k in 0..8 {
+            s.generate_sample(data);
+            let v = s.buffer[s.buffer.len() - 2] as i32; // left channel
+            if k == 0 {
+                first = v;
+            }
+            last = v;
+        }
+        assert!(last > first, "the ADPCM predictor should rise ({first} -> {last})");
+        assert!(last > 0, "a run of positive nibbles yields positive output");
+    }
+
+    /// A PSG square channel (ch 8) oscillates: over one duty cycle it takes both a
+    /// positive and a negative value.
+    #[test]
+    fn psg_square_oscillates() {
+        let mut s = Sound::new();
+        s.write(0x500, (1 << 15) | 127, 2); // master enable + full volume
+        // Channel 8 registers start at 0x400 + 8*0x10 = 0x480.
+        s.write(0x488, 0xF000, 2); // TMR: a few phase steps per output sample
+        // Start ch8: PSG (format 3), 50% duty (3), full vol, center pan, loop.
+        s.write(0x480, (1 << 31) | (1 << 27) | (3 << 29) | (3 << 24) | (64 << 16) | 127, 4);
+        let mut saw_pos = false;
+        let mut saw_neg = false;
+        for _ in 0..64 {
+            s.generate_sample(|_| 0);
+            let v = s.buffer[s.buffer.len() - 2] as i32;
+            saw_pos |= v > 0;
+            saw_neg |= v < 0;
+        }
+        assert!(saw_pos && saw_neg, "a square wave should swing both ways");
+    }
+
+    /// A PSG noise channel (ch 15) produces a varying, non-constant signal.
+    #[test]
+    fn psg_noise_varies() {
+        let mut s = Sound::new();
+        s.write(0x500, (1 << 15) | 127, 2);
+        // Channel 15 registers start at 0x400 + 15*0x10 = 0x4F0.
+        s.write(0x4F8, 0xFC00, 2); // TMR
+        s.write(0x4F0, (1 << 31) | (1 << 27) | (3 << 29) | (64 << 16) | 127, 4);
+        let mut values = std::collections::HashSet::new();
+        for _ in 0..64 {
+            s.generate_sample(|_| 0);
+            values.insert(s.buffer[s.buffer.len() - 2]);
+        }
+        assert!(values.len() > 1, "noise should not be a constant value");
     }
 
     #[test]
