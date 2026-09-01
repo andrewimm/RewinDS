@@ -581,10 +581,11 @@ impl Machine {
             && (addr == 0x0400_0060 || (0x0400_0320..0x0400_06A8).contains(&addr))
         {
             self.gpu3d.write_register(addr - 0x0400_0000, value, bytes);
-            // TODO(geometry phase): the geometry engine will drain the FIFO on a
-            // schedule. Until it exists, discard buffered commands so a full FIFO
-            // never stalls the CPU and GXSTAT reads as idle.
-            self.gpu3d.discard_fifo();
+            // Execute any now-complete commands (currently the matrix engine; vertex
+            // and later commands are consumed but not yet acted on). Runs
+            // synchronously until command timing lands, so the FIFO never stalls the
+            // CPU.
+            self.gpu3d.run_pending();
             return;
         }
         // The VRAMCNT_A..I block (with WRAMCNT sharing address 0x4000247), all

@@ -14,9 +14,11 @@
 
 pub mod command;
 pub mod fifo;
+pub mod matrix;
 
 use command::Decoder;
 use fifo::{Entry, Fifo};
+use matrix::MatrixEngine;
 
 /// IO register offsets relative to `0x0400_0000` (the ARM9 GX block).
 mod reg {
@@ -26,6 +28,10 @@ mod reg {
     pub const PORT_HI: u32 = 0x600; // exclusive end of the command-port region
     pub const GXSTAT: u32 = 0x600;
     pub const RAM_COUNT: u32 = 0x604;
+    pub const CLIPMTX_LO: u32 = 0x640;
+    pub const CLIPMTX_HI: u32 = 0x680; // exclusive; 16 words
+    pub const VECMTX_LO: u32 = 0x680;
+    pub const VECMTX_HI: u32 = 0x6A4; // exclusive; 9 words
 }
 
 /// The 3D engine device: the command FIFO and its decoder, plus the GX control
@@ -35,6 +41,7 @@ mod reg {
 pub struct Gpu3d {
     fifo: Fifo,
     decoder: Decoder,
+    matrix: MatrixEngine,
     /// `DISP3DCNT` (`0x4000060`): 3D display/blend/fog/edge enables.
     disp3dcnt: u16,
 }
@@ -60,17 +67,52 @@ impl Gpu3d {
         self.fifo.push(Entry { command, param })
     }
 
-    /// Drain the next buffered command entry (the geometry engine's input).
+    /// Drain the next buffered command entry (raw, for the future async drain).
     pub fn pop_command(&mut self) -> Option<Entry> {
         self.fifo.pop()
     }
 
-    /// Drain and discard every buffered command. **Temporary integration scaffolding:**
-    /// until the geometry engine consumes the FIFO, the `nds` glue calls this after
-    /// each submission so a full FIFO never back-pressures the CPU (and `GXSTAT` reads
-    /// as empty/idle). Replaced by real command execution in the geometry phase.
-    pub fn discard_fifo(&mut self) {
-        while self.fifo.pop().is_some() {}
+    /// Execute every complete command buffered in the FIFO (a command is complete
+    /// once all its parameter entries are present), advancing the geometry engine.
+    /// The `nds` glue calls this after each submission. Currently only the matrix
+    /// engine is driven; vertex/lighting/swap commands are consumed and ignored until
+    /// their phases land. (Until command timing exists this runs synchronously, so
+    /// the FIFO never back-pressures the CPU.)
+    pub fn run_pending(&mut self) {
+        while let Some(front) = self.fifo.front() {
+            let cmd = front.command;
+            let n = command::param_count(cmd) as usize;
+            let needed = n.max(1); // a zero-parameter command still occupies one entry
+            if self.fifo.len() < needed {
+                break; // wait for the rest of this command's parameters
+            }
+            let mut params = [0u32; 32];
+            for p in params.iter_mut().take(needed) {
+                *p = self.fifo.pop().expect("checked len").param;
+            }
+            self.execute(cmd, &params[..n]);
+        }
+    }
+
+    /// Dispatch one fully-assembled command to the geometry engine.
+    fn execute(&mut self, cmd: u8, params: &[u32]) {
+        use command::op::*;
+        match cmd {
+            MTX_MODE => self.matrix.set_mode(params[0] as u8),
+            MTX_PUSH => self.matrix.push(),
+            MTX_POP => self.matrix.pop(params[0]),
+            MTX_STORE => self.matrix.store(params[0]),
+            MTX_RESTORE => self.matrix.restore(params[0]),
+            MTX_IDENTITY => self.matrix.load_identity(),
+            MTX_LOAD_4X4 => self.matrix.load_4x4(params),
+            MTX_LOAD_4X3 => self.matrix.load_4x3(params),
+            MTX_MULT_4X4 => self.matrix.mult_4x4(params),
+            MTX_MULT_4X3 => self.matrix.mult_4x3(params),
+            MTX_MULT_3X3 => self.matrix.mult_3x3(params),
+            MTX_SCALE => self.matrix.scale(params),
+            MTX_TRANS => self.matrix.translate(params),
+            _ => {} // vertices, lighting, primitives, swap — later phases
+        }
     }
 
     // --- FIFO status for the host bus ---------------------------------------
@@ -104,9 +146,12 @@ impl Gpu3d {
                 self.write_port(command, value);
             }
             reg::GXSTAT => {
-                // Only the IRQ mode (bits 30-31) is writable here; bit 15 (write-1)
-                // clears the matrix-stack error, handled by the matrix engine later.
+                // The IRQ mode (bits 30-31) is writable, and a write-1 to bit 15
+                // clears the matrix-stack error.
                 self.fifo.set_irq_mode_bits(value >> 30);
+                if value & (1 << 15) != 0 {
+                    self.matrix.clear_error();
+                }
             }
             reg::DISP3DCNT => {
                 self.disp3dcnt = merge16(self.disp3dcnt, value, bytes);
@@ -123,14 +168,20 @@ impl Gpu3d {
             reg::GXSTAT => self.gxstat(),
             reg::RAM_COUNT => 0, // vertex/polygon RAM counts — geometry phase
             reg::DISP3DCNT => self.disp3dcnt as u32,
+            reg::CLIPMTX_LO..reg::CLIPMTX_HI => {
+                self.matrix.clip_read(((offset - reg::CLIPMTX_LO) / 4) as usize)
+            }
+            reg::VECMTX_LO..reg::VECMTX_HI => {
+                self.matrix.vector_read_3x3(((offset - reg::VECMTX_LO) / 4) as usize)
+            }
             _ => 0,
         }
     }
 
-    /// `GXSTAT` (`0x4000600`): the FIFO's own bits plus (later) matrix-stack level,
-    /// stack error, and geometry-busy.
+    /// `GXSTAT` (`0x4000600`): the FIFO's fill bits merged with the matrix-stack level
+    /// and error bits. (Geometry-busy is added when command timing lands.)
     fn gxstat(&self) -> u32 {
-        self.fifo.gxstat_bits()
+        self.fifo.gxstat_bits() | self.matrix.gxstat_bits()
     }
 }
 
@@ -180,6 +231,23 @@ mod tests {
         assert_eq!((stat >> 16) & 0x1FF, 4); // count == 4
         assert_eq!(stat & (1 << 26), 0); // not empty
         assert_eq!(stat & (1 << 25), 1 << 25); // less than half
+    }
+
+    #[test]
+    fn fifo_driven_matrix_command_reaches_clip_readback() {
+        let mut g = Gpu3d::new();
+        // MTX_MODE = position (1), then MTX_TRANS (2,0,0) — all via the packed FIFO.
+        g.write_register(reg::GXFIFO_LO, command::op::MTX_MODE as u32, 4);
+        g.write_register(reg::GXFIFO_LO, 1, 4);
+        g.write_register(reg::GXFIFO_LO, command::op::MTX_TRANS as u32, 4);
+        g.write_register(reg::GXFIFO_LO, (2 * matrix::ONE) as u32, 4);
+        g.write_register(reg::GXFIFO_LO, 0, 4);
+        g.write_register(reg::GXFIFO_LO, 0, 4);
+        g.run_pending();
+        // Clip matrix element 12 (column 3, row 0) is the translation x = 2.0, and the
+        // FIFO drains to empty/idle.
+        assert_eq!(g.read_register(reg::CLIPMTX_LO + 12 * 4, 4), (2 * matrix::ONE) as u32);
+        assert_eq!(g.read_register(reg::GXSTAT, 4) & (1 << 26), 1 << 26); // empty
     }
 
     #[test]
