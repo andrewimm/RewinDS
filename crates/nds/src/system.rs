@@ -36,27 +36,33 @@ pub mod cyctrace {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Mutex;
 
-    /// ARM9 opcode-fetch PC trace (enabled via [`enable`]), for divergence diffing.
+    /// Per-core opcode-fetch PC traces (enabled via [`enable`]), for divergence
+    /// diffing against a reference. Index 0 = ARM9, index 1 = ARM7.
     pub static ENABLED: AtomicBool = AtomicBool::new(false);
-    pub static TRACE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    pub static TRACE: [Mutex<Vec<u32>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
+    /// Master clock captured alongside each recorded PC (same index as [`TRACE`]),
+    /// so a captured trace can be sliced by a clock window to locate a mistimed span.
+    pub static CLOCKS: [Mutex<Vec<u64>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
 
     pub fn enable() {
         ENABLED.store(true, Ordering::Relaxed);
     }
-    pub fn record(pc: u32) {
+    pub fn record(core: usize, pc: u32, clock: u64) {
         if ENABLED.load(Ordering::Relaxed) {
-            TRACE.lock().unwrap().push(pc);
+            TRACE[core].lock().unwrap().push(pc);
+            CLOCKS[core].lock().unwrap().push(clock);
         }
     }
-    pub fn len() -> usize {
-        TRACE.lock().unwrap().len()
+    pub fn len(core: usize) -> usize {
+        TRACE[core].lock().unwrap().len()
     }
-    pub fn dump(path: &str) {
+    pub fn dump(core: usize, path: &str) {
         use std::fmt::Write as _;
-        let t = TRACE.lock().unwrap();
-        let mut s = String::with_capacity(t.len() * 9);
-        for pc in t.iter() {
-            let _ = writeln!(s, "{pc:08X}");
+        let t = TRACE[core].lock().unwrap();
+        let clk = CLOCKS[core].lock().unwrap();
+        let mut s = String::with_capacity(t.len() * 18);
+        for (pc, c) in t.iter().zip(clk.iter()) {
+            let _ = writeln!(s, "{pc:08X} {c}");
         }
         std::fs::write(path, s).unwrap();
     }
@@ -141,6 +147,11 @@ pub(crate) struct CoreTiming {
     /// Last code-fetch / data-access addresses, for sequential-access detection.
     pub code_last: u32,
     pub data_last: u32,
+    /// Whether the previous instruction took a branch. The next opcode fetch (the
+    /// branch target) then streams sequentially: the pipeline-refill cost is already
+    /// carried by the branch's execute base (3), so charging the target a
+    /// non-sequential fetch on top would count the refill twice.
+    pub prev_branched: bool,
 }
 
 impl CoreTiming {
@@ -727,6 +738,9 @@ impl System {
             self.arm7.branched()
         };
         let cost = self.machine.timing[c].instruction_cost(branched, arm9) as Timestamp;
+        // Record the branch for the next step: its target opcode fetch streams
+        // sequentially (the refill cost is in this branch's execute base).
+        self.machine.timing[c].prev_branched = branched;
         self.machine.clock[c] += if arm9 { cost } else { cost * 2 };
     }
 

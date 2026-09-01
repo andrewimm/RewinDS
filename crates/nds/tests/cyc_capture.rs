@@ -36,21 +36,23 @@ fn env_hex(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Capture the ARM9 PC trace to CYC_OUT (for resync-diffing against a reference).
+/// Capture a core's PC trace to CYC_OUT (CYC_CORE=0 ARM9 [default], 1 ARM7), for
+/// resync-diffing against a reference.
 #[test]
 #[ignore]
 fn capture() {
     let mut sys = booted();
     let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
+    let core = std::env::var("CYC_CORE").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize);
     let target: usize = std::env::var("CYC_N").ok().and_then(|s| s.parse().ok()).unwrap_or(11_000_000);
     cyctrace::enable();
     let mut now = sys.now();
-    while cyctrace::len() < target {
+    while cyctrace::len(core) < target {
         now += 1_000_000;
         sys.run_until(now);
     }
-    cyctrace::dump(&out);
-    eprintln!("captured {} ARM9 PCs -> {}", cyctrace::len(), out);
+    cyctrace::dump(core, &out);
+    eprintln!("captured {} PCs (core {core}) -> {}", cyctrace::len(core), out);
 }
 
 /// Trap an ARM9 address (CYC_TRIG) and dump the register file at each hit.
@@ -87,10 +89,28 @@ fn watch() {
     }
     let log = cyctrace::take_watch_log();
     eprintln!("=== {addr:#010x}: {} accesses ===", log.len());
-    for (core, write, value, clock) in log.iter().take(40) {
-        let who = if *core == 0 { "ARM9" } else { "ARM7" };
-        let kind = if *write { "WROTE" } else { "read " };
-        eprintln!("  {who} {kind} {value:#010x} @ clock {clock}");
+    // With CYC_OUT set, dump the full raw timeline ("core W/R addr value clock", one
+    // per line) for offline cadence analysis. Otherwise print the filtered view.
+    if let Ok(path) = std::env::var("CYC_OUT") {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for (core, write, value, clock) in log.iter() {
+            let kind = if *write { 'W' } else { 'R' };
+            let _ = writeln!(s, "{core} {kind} {addr:08X} {value:08X} {clock}");
+        }
+        std::fs::write(expand(&path), s).unwrap();
+        eprintln!("dumped {} accesses -> {}", log.len(), expand(&path));
+        return;
+    }
+    // Only writes, or reads whose value differs from the previous (to skip spin polls).
+    let mut prev = u32::MAX;
+    for (core, write, value, clock) in log.iter() {
+        if *write || *value != prev {
+            let who = if *core == 0 { "ARM9" } else { "ARM7" };
+            let kind = if *write { "WROTE" } else { "read " };
+            eprintln!("  {who} {kind} {value:#010x} @ clock {clock}");
+        }
+        prev = *value;
     }
 }
 
@@ -105,15 +125,16 @@ fn disasm() {
     let addr = env_hex("CYC_ADDR", 0x0202_5e00);
     let len = std::env::var("CYC_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(0x80u32);
     let thumb = std::env::var("CYC_THUMB").map(|s| s != "0").unwrap_or(false);
+    let core = if std::env::var("CYC_CORE").ok().as_deref() == Some("1") { Core::Arm7 } else { Core::Arm9 };
     let mut a = 0;
     while a < len {
         let at = addr + a;
         if thumb {
-            let w = sys.read(Core::Arm9, at, 2) as u16;
+            let w = sys.read(core, at, 2) as u16;
             eprintln!("  {at:#010x}: {w:04x}      {}", arm::format_thumb(&arm::decode_thumb(w)));
             a += 2;
         } else {
-            let w = sys.read(Core::Arm9, at, 4);
+            let w = sys.read(core, at, 4);
             eprintln!("  {at:#010x}: {w:08x}  {}", arm::format_arm(&arm::decode_arm(w)));
             a += 4;
         }

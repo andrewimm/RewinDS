@@ -145,9 +145,11 @@ impl NdsCpuBus<'_> {
     /// 32 bits (even in Thumb); the ARM7 fetches at the instruction width.
     fn advance_code(&mut self, address: u32, width: u32) {
         #[cfg(feature = "cyctrace")]
-        if self.core == Core::Arm9 {
-            crate::system::cyctrace::record(address);
-        }
+        crate::system::cyctrace::record(
+            self.core.index(),
+            address,
+            self.machine.clock[self.core.index()],
+        );
         let c = self.core.index();
         // ARM9 fetches are always 32-bit and step by 4; ARM7 by its instruction width.
         let step = if self.core == Core::Arm9 {
@@ -155,7 +157,11 @@ impl NdsCpuBus<'_> {
         } else {
             width / 8
         };
-        let seq = address == self.machine.timing[c].code_last.wrapping_add(step);
+        // A branch target streams sequentially: the pipeline-refill penalty is already
+        // in the branch's execute base, so it is not charged again as a nonsequential
+        // fetch here.
+        let seq = self.machine.timing[c].prev_branched
+            || address == self.machine.timing[c].code_last.wrapping_add(step);
         self.machine.timing[c].code_last = address;
         self.machine.timing[c].fetch = if self.core == Core::Arm9 {
             self.arm9_access_cost(address, 32, true, true, seq)
