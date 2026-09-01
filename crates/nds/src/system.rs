@@ -771,6 +771,12 @@ impl System {
         self.machine.vram.control(bank)
     }
 
+    /// The 3D engine's `(polygons, vertices)` per-frame high-water mark, for debug
+    /// tooling (confirms a game drives geometry through the pipeline).
+    pub fn gpu3d_peak_geometry(&self) -> (usize, usize) {
+        self.machine.gpu3d.peak_geometry()
+    }
+
     /// The cartridge backup (save) bytes, for the host to persist.
     pub fn cart_backup(&self) -> &[u8] {
         self.machine.cart.backup_bytes()

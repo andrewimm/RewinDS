@@ -14,11 +14,12 @@
 
 pub mod command;
 pub mod fifo;
+pub mod geometry;
 pub mod matrix;
 
 use command::Decoder;
 use fifo::{Entry, Fifo};
-use matrix::MatrixEngine;
+use geometry::GeometryEngine;
 
 /// IO register offsets relative to `0x0400_0000` (the ARM9 GX block).
 mod reg {
@@ -41,7 +42,7 @@ mod reg {
 pub struct Gpu3d {
     fifo: Fifo,
     decoder: Decoder,
-    matrix: MatrixEngine,
+    geometry: GeometryEngine,
     /// `DISP3DCNT` (`0x4000060`): 3D display/blend/fog/edge enables.
     disp3dcnt: u16,
 }
@@ -72,6 +73,12 @@ impl Gpu3d {
         self.fifo.pop()
     }
 
+    /// The `(polygons, vertices)` high-water mark the geometry engine has built in a
+    /// single frame — confirms a game is submitting 3D geometry through the pipeline.
+    pub fn peak_geometry(&self) -> (usize, usize) {
+        self.geometry.peak()
+    }
+
     /// Execute every complete command buffered in the FIFO (a command is complete
     /// once all its parameter entries are present), advancing the geometry engine.
     /// The `nds` glue calls this after each submission. Currently only the matrix
@@ -90,28 +97,7 @@ impl Gpu3d {
             for p in params.iter_mut().take(needed) {
                 *p = self.fifo.pop().expect("checked len").param;
             }
-            self.execute(cmd, &params[..n]);
-        }
-    }
-
-    /// Dispatch one fully-assembled command to the geometry engine.
-    fn execute(&mut self, cmd: u8, params: &[u32]) {
-        use command::op::*;
-        match cmd {
-            MTX_MODE => self.matrix.set_mode(params[0] as u8),
-            MTX_PUSH => self.matrix.push(),
-            MTX_POP => self.matrix.pop(params[0]),
-            MTX_STORE => self.matrix.store(params[0]),
-            MTX_RESTORE => self.matrix.restore(params[0]),
-            MTX_IDENTITY => self.matrix.load_identity(),
-            MTX_LOAD_4X4 => self.matrix.load_4x4(params),
-            MTX_LOAD_4X3 => self.matrix.load_4x3(params),
-            MTX_MULT_4X4 => self.matrix.mult_4x4(params),
-            MTX_MULT_4X3 => self.matrix.mult_4x3(params),
-            MTX_MULT_3X3 => self.matrix.mult_3x3(params),
-            MTX_SCALE => self.matrix.scale(params),
-            MTX_TRANS => self.matrix.translate(params),
-            _ => {} // vertices, lighting, primitives, swap — later phases
+            self.geometry.execute(cmd, &params[..n]);
         }
     }
 
@@ -150,7 +136,7 @@ impl Gpu3d {
                 // clears the matrix-stack error.
                 self.fifo.set_irq_mode_bits(value >> 30);
                 if value & (1 << 15) != 0 {
-                    self.matrix.clear_error();
+                    self.geometry.matrix.clear_error();
                 }
             }
             reg::DISP3DCNT => {
@@ -166,13 +152,15 @@ impl Gpu3d {
     pub fn read_register(&self, offset: u32, _bytes: u32) -> u32 {
         match offset {
             reg::GXSTAT => self.gxstat(),
-            reg::RAM_COUNT => 0, // vertex/polygon RAM counts — geometry phase
+            reg::RAM_COUNT => self.geometry.ram_count(),
             reg::DISP3DCNT => self.disp3dcnt as u32,
             reg::CLIPMTX_LO..reg::CLIPMTX_HI => {
-                self.matrix.clip_read(((offset - reg::CLIPMTX_LO) / 4) as usize)
+                self.geometry.matrix.clip_read(((offset - reg::CLIPMTX_LO) / 4) as usize)
             }
             reg::VECMTX_LO..reg::VECMTX_HI => {
-                self.matrix.vector_read_3x3(((offset - reg::VECMTX_LO) / 4) as usize)
+                self.geometry
+                    .matrix
+                    .vector_read_3x3(((offset - reg::VECMTX_LO) / 4) as usize)
             }
             _ => 0,
         }
@@ -181,7 +169,7 @@ impl Gpu3d {
     /// `GXSTAT` (`0x4000600`): the FIFO's fill bits merged with the matrix-stack level
     /// and error bits. (Geometry-busy is added when command timing lands.)
     fn gxstat(&self) -> u32 {
-        self.fifo.gxstat_bits() | self.matrix.gxstat_bits()
+        self.fifo.gxstat_bits() | self.geometry.gxstat_bits()
     }
 }
 

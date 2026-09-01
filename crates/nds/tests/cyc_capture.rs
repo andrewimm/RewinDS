@@ -224,7 +224,8 @@ fn dump_frame() {
     let mut ppm = b"P6\n256 384\n255\n".to_vec();
     ppm.extend_from_slice(&rgb);
     std::fs::write(&out, ppm).unwrap();
-    eprintln!("frame {} DISPCNT_A={dispcnt_a:#010x} DISPCNT_B={dispcnt_b:#010x} -> {out}", frames());
+    let (polys, verts) = sys.gpu3d_peak_geometry();
+    eprintln!("frame {} DISPCNT_A={dispcnt_a:#010x} DISPCNT_B={dispcnt_b:#010x} 3D-peak polys={polys} verts={verts} -> {out}", frames());
 }
 
 /// Run `CYC_FRAMES` frames and report the sound mixer's output: sample count, peak
