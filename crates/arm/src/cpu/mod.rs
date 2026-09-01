@@ -295,6 +295,14 @@ impl Cpu {
         self.cycles
     }
 
+    /// Whether the instruction most recently executed by [`Self::step`] changed the
+    /// PC non-sequentially (a taken branch, interworking load, or exception entry).
+    /// Reset at the start of each step. Used by cycle-accurate hosts to charge the
+    /// pipeline-refill cost to the branch itself, as the hardware does.
+    pub fn branched(&self) -> bool {
+        self.branched
+    }
+
     /// Read the raw stored register (no pipeline adjustment). For `r15` this is
     /// the address of the instruction being executed.
     pub fn register(&self, index: usize) -> u32 {
@@ -359,7 +367,9 @@ impl Cpu {
     /// Write register `index` in the User-mode bank (see [`Self::reg_user`]).
     fn set_reg_user(&mut self, index: usize, value: u32) {
         match index {
-            8..=12 if self.cpsr.mode() == Some(Mode::Fiq) => self.banked_r8_r12[0][index - 8] = value,
+            8..=12 if self.cpsr.mode() == Some(Mode::Fiq) => {
+                self.banked_r8_r12[0][index - 8] = value
+            }
             13 | 14 if !matches!(self.cpsr.mode(), Some(Mode::User | Mode::System)) => {
                 self.banked_r13_r14[0][index - 13] = value
             }
@@ -628,11 +638,19 @@ impl Cpu {
             // ARM7TDMI empty-list edge case: only r15 is transferred, and the base
             // is adjusted by 0x40 (as though all sixteen registers had moved).
             let (address, writeback_value) = if op.add {
-                let start = if op.pre_indexed { base.wrapping_add(4) } else { base };
+                let start = if op.pre_indexed {
+                    base.wrapping_add(4)
+                } else {
+                    base
+                };
                 (start, base.wrapping_add(0x40))
             } else {
                 let low = base.wrapping_sub(0x40);
-                let start = if op.pre_indexed { low } else { low.wrapping_add(4) };
+                let start = if op.pre_indexed {
+                    low
+                } else {
+                    low.wrapping_add(4)
+                };
                 (start, low)
             };
             if op.load {
@@ -656,11 +674,19 @@ impl Cpu {
         // Registers always transfer lowest-first at the lowest address; the
         // base and direction set where that block sits.
         let (mut address, writeback_value) = if op.add {
-            let start = if op.pre_indexed { base.wrapping_add(4) } else { base };
+            let start = if op.pre_indexed {
+                base.wrapping_add(4)
+            } else {
+                base
+            };
             (start, base.wrapping_add(count * 4))
         } else {
             let low = base.wrapping_sub(count * 4);
-            let start = if op.pre_indexed { low } else { low.wrapping_add(4) };
+            let start = if op.pre_indexed {
+                low
+            } else {
+                low.wrapping_add(4)
+            };
             (start, low)
         };
 
@@ -869,7 +895,8 @@ impl Cpu {
             }
             DspMulOp::SmlaWY => {
                 let product = (rm as i32 as i64) * (rs_half as i64);
-                let (result, overflow) = ((product >> 16) as i32).overflowing_add(self.reg(op.rn) as i32);
+                let (result, overflow) =
+                    ((product >> 16) as i32).overflowing_add(self.reg(op.rn) as i32);
                 if overflow {
                     self.cpsr.set_q(true);
                 }
@@ -1167,7 +1194,9 @@ impl Cpu {
     fn execute_msr(&mut self, op: Msr) {
         let source = match op.source {
             MsrSource::Register(rm) => self.reg(rm),
-            MsrSource::Immediate { value, rotate } => (value as u32).rotate_right(rotate as u32 * 2),
+            MsrSource::Immediate { value, rotate } => {
+                (value as u32).rotate_right(rotate as u32 * 2)
+            }
         };
         let mut mask = 0u32;
         if op.write_flags {

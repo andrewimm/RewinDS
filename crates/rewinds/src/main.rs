@@ -16,9 +16,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Host key → console button bit. Arrow keys drive the D-pad; X/Z are A/B (VBA
-/// layout); A/S are the L/R shoulders; Enter/Backspace are Start/Select. Hold
-/// Space to fast-forward.
+/// Host key → console button bit. Arrow keys drive the D-pad; X/Z are A/B; A/S are
+/// the L/R shoulders; Enter/Backspace are Start/Select. Hold Space to fast-forward.
 const KEY_MAP: &[(Key, u32)] = &[
     (Key::X, button::A),
     (Key::Z, button::B),
@@ -160,8 +159,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Hold Space to fast-forward: run unthrottled for a display frame's worth
-        // of real time, presenting only the final frame and muting audio (like
-        // VBA's speed-up). Otherwise run one frame at 60 fps with audio.
+        // of real time, presenting only the final frame and muting audio. Otherwise
+        // run one frame at 60 fps with audio.
         let warp = window.is_key_down(Key::Space);
         window.set_target_fps(if warp { 10_000 } else { 60 });
         emulator.set_audio_muted(warp);

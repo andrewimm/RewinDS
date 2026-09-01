@@ -8,7 +8,7 @@
 //! ARM7 has no coprocessor, so they trap as Undefined via the trait defaults).
 
 use arm::cpu::{Bus, Timed};
-use emu_core::{Scheduler, Timestamp};
+use emu_core::Scheduler;
 
 use crate::memory::{is_vram, Core};
 use crate::system::{Machine, NdsEvent};
@@ -29,118 +29,139 @@ fn is_io(address: u32) -> bool {
 }
 
 impl NdsCpuBus<'_> {
-    /// Master ticks per CPU cycle: the ARM9 runs at the master rate, the ARM7 at
-    /// half, so each ARM7 cycle spans two master ticks.
-    fn ticks_per_cycle(&self) -> Timestamp {
-        match self.core {
-            Core::Arm9 => 1,
-            Core::Arm7 => 2,
+    /// The ARM7 (ARM7TDMI) cost in ARM7 cycles for one memory access: no cache, a
+    /// base waitstate from the region table (with the ARM7's 32-bit bus, `M32 = 1`),
+    /// plus a +1 nonsequential penalty. `size_bits` is the access width. Grounded in
+    /// GBATEK's DS memory timings.
+    fn arm7_access_cost(&self, address: u32, size_bits: u32, sequential: bool) -> u32 {
+        const M32: u32 = 1;
+        let m16 = if size_bits > 16 { 2 } else { 1 };
+        let base = match (address >> 24) & 0x0F {
+            0x0 | 0x1 => M32,       // BIOS / low
+            0x2 | 0x5 | 0x6 => m16, // Main RAM, palette, VRAM (no ARM7 cache)
+            0x8..=0xA => m16 * 8,   // GBA slot (slow)
+            _ => M32,               // WRAM, I/O, OAM, BIOS-high, etc.
+        };
+        if sequential {
+            base
+        } else {
+            base + 1
         }
     }
 
-    /// Advance the active core's local clock by `cycles` CPU cycles.
-    fn advance(&mut self, cycles: u32) {
-        self.machine.clock[self.core.index()] += cycles as Timestamp * self.ticks_per_cycle();
-    }
+    /// The ARM9 (ARM946E-S) cost in master ticks for one memory access. TCM is
+    /// single-cycle; cacheable Main RAM is a hit (1) or a miss (a nonsequential-read
+    /// line fill = 52 for 32-bit / 42 for 16-bit, a sequential-read miss = 36/34, a
+    /// write miss = 8/4 with no line fill); other regions pay a base waitstate plus a
+    /// +6 nonsequential penalty. Reads allocate a cache line; writes only probe (the
+    /// ARM946E-S is read-allocate). `size_bits` is the access width; `is_code` selects
+    /// the i-cache, otherwise the d-cache. Grounded in GBATEK's DS memory timings and
+    /// the ARM946E-S cache architecture.
+    fn arm9_access_cost(
+        &mut self,
+        address: u32,
+        size_bits: u32,
+        is_code: bool,
+        is_read: bool,
+        sequential: bool,
+    ) -> u32 {
+        const MC: u32 = 1; // cached / TCM speed
+        const M32: u32 = 2; // ARM9 32-bit bus cycle
+        let m16 = if size_bits > 16 { M32 * 2 } else { M32 }; // 4 (32-bit) or 2 (≤16-bit)
 
-    /// Master ticks (66 MHz units) for one **data** access, grounded in GBATEK's
-    /// "DS Memory Timings" tables (given in 33 MHz cycles; ×2 for our ticks, and the
-    /// ARM9's 0.5-cycle TCM = 1 tick). The ARM9's external-memory accesses carry a
-    /// heavy waitstate (I/O/WRAM = 4 cycles, VRAM = 4, Main RAM = 9), whereas the
-    /// ARM7 reaches WRAM/I/O in a single cycle — the asymmetry that governs the
-    /// inter-core IPC handshake phase. (Opcode fetches are charged separately in
-    /// [`Self::advance_code`], which models the ARM9 instruction cache.)
-    fn data_ticks(&self, address: u32, width: u32, sequential: bool) -> Timestamp {
-        let is32 = width == 4;
-        if self.core == Core::Arm9 {
-            // ARM9 TCM (ITCM at 0, DTCM at its movable base) is single-half-cycle.
-            let cp15 = &self.machine.cp15;
-            if (cp15.itcm_enabled() && address < cp15.itcm_size())
-                || (cp15.dtcm_enabled()
-                    && address >= cp15.dtcm_base()
-                    && address < cp15.dtcm_base().wrapping_add(cp15.dtcm_size()))
-            {
-                return 1;
-            }
-            match address >> 24 {
-                0x02 => {
-                    if is32 {
-                        if sequential { 4 } else { 20 }
-                    } else if sequential { 2 } else { 18 }
-                } // Main RAM
-                0x05 | 0x06 => {
-                    if is32 {
-                        if sequential { 4 } else { 10 }
-                    } else if sequential { 2 } else { 8 }
-                } // Palette, VRAM
-                _ => {
-                    if sequential { 2 } else { 8 }
-                } // WRAM, BIOS, I/O, OAM, GBA slot
-            }
-        } else {
-            // ARM7 (33 MHz): 1 native cycle = 2 ticks. WRAM/BIOS/I/O/OAM are single
-            // cycle; only Main RAM carries the nonsequential penalty.
-            match address >> 24 {
-                0x02 => {
-                    if is32 {
-                        if sequential { 4 } else { 20 }
-                    } else if sequential { 2 } else { 18 }
-                }
-                _ => 2,
-            }
+        let cp15 = &self.machine.cp15;
+        let in_itcm = cp15.itcm_enabled() && address < cp15.itcm_size();
+        let in_dtcm = cp15.dtcm_enabled()
+            && address >= cp15.dtcm_base()
+            && address < cp15.dtcm_base().wrapping_add(cp15.dtcm_size());
+        // ITCM serves code and data; DTCM serves data only.
+        if in_itcm || (!is_code && in_dtcm) {
+            return MC;
         }
-    }
 
-    /// Charge the active core's clock for a data access. On the ARM9, cacheable
-    /// Main RAM goes through the data-cache model (hit 0.5 cyc / cold miss 23 cyc)
-    /// rather than paying the full nonsequential waitstate on every access — most
-    /// game-data reads are cache hits, and charging them all as misses would leave
-    /// the ARM9 far too slow.
-    fn advance_data(&mut self, address: u32, width: u32, sequential: bool) {
-        let in_tcm = self.core == Core::Arm9 && {
-            let cp15 = &self.machine.cp15;
-            (cp15.itcm_enabled() && address < cp15.itcm_size())
-                || (cp15.dtcm_enabled()
-                    && address >= cp15.dtcm_base()
-                    && address < cp15.dtcm_base().wrapping_add(cp15.dtcm_size()))
-        };
-        let ticks = if self.core == Core::Arm9 && address >> 24 == 0x02 && !in_tcm {
-            if self.machine.dcache.access(address) { 1 } else { 46 }
-        } else {
-            self.data_ticks(address, width, sequential)
-        };
-        self.machine.clock[self.core.index()] += ticks;
-    }
-
-    /// Charge the active core's clock for an opcode fetch. On the ARM9, code in
-    /// cacheable Main RAM pays a cache hit (0.5 cyc) or a cold miss (23 cyc line
-    /// fill) via the instruction-cache model; TCM is single-half-cycle; other
-    /// regions carry their fetch waitstate. The ARM7 keeps its simple core-speed
-    /// fetch (its hot code runs from single-cycle WRAM).
-    fn advance_code(&mut self, address: u32, sequential: bool) {
-        if self.core == Core::Arm9 {
-            let cp15 = &self.machine.cp15;
-            let ticks: Timestamp = if cp15.itcm_enabled() && address < cp15.itcm_size() {
-                1 // ITCM: 0.5 cycle
-            } else if address >> 24 == 0x02 {
-                // Cacheable Main RAM: a cold line misses; a resident line hits, but
-                // the ARM9 has no fast sequential code fetch — a nonsequential fetch
-                // (a taken branch's target + pipeline refill) costs more than a
-                // sequential one. Matches DeSmuME's per-instruction cycle accounting.
-                if !self.machine.icache.access(address) {
-                    46 // cold cache miss (line fill)
-                } else if sequential {
-                    1
-                } else {
-                    2
-                }
+        // Cacheable Main RAM (0x02xxxxxx).
+        if address & 0x0F00_0000 == 0x0200_0000 {
+            let cached = if is_code {
+                self.machine.icache.access(address)
+            } else if is_read {
+                self.machine.dcache.access(address)
             } else {
-                8 // WRAM/BIOS/I/O code fetch: N32 = 4 cycles
+                self.machine.dcache.contains(address) // writes probe, never allocate
             };
-            self.machine.clock[0] += ticks;
-        } else {
-            self.advance(1); // ARM7: 1 cycle = 2 ticks
+            if cached {
+                return MC;
+            }
+            let mut c = if sequential && !is_code {
+                m16 // sequential-data bonus (read or write)
+            } else if is_read {
+                m16 * 5 // nonsequential read
+            } else {
+                m16 * 2 // write (no line fill; write buffer unmodelled)
+            };
+            if is_read {
+                c += 8 * M32 * 2; // 32-byte line fill = +32
+            }
+            return c;
         }
+
+        // Non-cached regions: a base waitstate (the DS memory-timing region table,
+        // repeating every 16 of the 256 map slots) plus the ARM9 nonsequential penalty.
+        let base = match (address >> 24) & 0x0F {
+            0x0 | 0x1 => MC,        // ITCM window / BIOS mirror
+            0x3 | 0x4 | 0x7 => M32, // WRAM, I/O registers, OAM
+            0x5 | 0x6 => m16,       // palette, VRAM
+            0x8..=0xA => m16 * 8,   // GBA slot (slow)
+            _ => M32,               // 0x2 handled above; 0xB..0xF incl BIOS
+        };
+        if sequential {
+            base
+        } else {
+            base + 6
+        }
+    }
+
+    /// Account a data access into the active core's per-instruction timing state
+    /// (combined at the boundary via the pipeline model). The access is sequential
+    /// iff its address is the previous data access's address plus its width.
+    fn advance_data(&mut self, address: u32, width: u32, _sequential: bool, is_read: bool) {
+        let c = self.core.index();
+        let seq = address == self.machine.timing[c].data_last.wrapping_add(width);
+        self.machine.timing[c].data_last = address;
+        let cost = if self.core == Core::Arm9 {
+            self.arm9_access_cost(address, width * 8, false, is_read, seq)
+        } else {
+            self.arm7_access_cost(address, width * 8, seq)
+        };
+        let t = &mut self.machine.timing[c];
+        t.mem += cost;
+        if is_read {
+            t.did_load = true;
+        } else {
+            t.did_store = true;
+        }
+    }
+
+    /// Account an opcode fetch as the active core's `cFetch`. The ARM9 always fetches
+    /// 32 bits (even in Thumb); the ARM7 fetches at the instruction width.
+    fn advance_code(&mut self, address: u32, width: u32) {
+        #[cfg(feature = "cyctrace")]
+        if self.core == Core::Arm9 {
+            crate::system::cyctrace::record(address, self.machine.clock[0]);
+        }
+        let c = self.core.index();
+        // ARM9 fetches are always 32-bit and step by 4; ARM7 by its instruction width.
+        let step = if self.core == Core::Arm9 {
+            4
+        } else {
+            width / 8
+        };
+        let seq = address == self.machine.timing[c].code_last.wrapping_add(step);
+        self.machine.timing[c].code_last = address;
+        self.machine.timing[c].fetch = if self.core == Core::Arm9 {
+            self.arm9_access_cost(address, 32, true, true, seq)
+        } else {
+            self.arm7_access_cost(address, width, seq)
+        };
     }
 
     fn read(&mut self, address: u32, instruction: bool, bytes: u32) -> u32 {
@@ -172,68 +193,87 @@ impl NdsCpuBus<'_> {
         // `memory` and `cp15` are disjoint fields, so the mutable memory borrow
         // (the receiver) and the shared cp15 borrow (the argument) coexist.
         match bytes {
-            1 => self.machine.memory.write8(self.core, address, value as u8, &self.machine.cp15),
-            2 => self.machine.memory.write16(self.core, address, value as u16, &self.machine.cp15),
-            _ => self.machine.memory.write32(self.core, address, value, &self.machine.cp15),
+            1 => self
+                .machine
+                .memory
+                .write8(self.core, address, value as u8, &self.machine.cp15),
+            2 => self
+                .machine
+                .memory
+                .write16(self.core, address, value as u16, &self.machine.cp15),
+            _ => self
+                .machine
+                .memory
+                .write32(self.core, address, value, &self.machine.cp15),
         }
     }
 }
 
 impl Bus for NdsCpuBus<'_> {
-    fn fetch32(&mut self, address: u32, sequential: bool) -> Timed<u32> {
+    fn fetch32(&mut self, address: u32, _sequential: bool) -> Timed<u32> {
         let value = self.read(address, true, 4);
-        self.advance_code(address, sequential);
+        self.advance_code(address, 32);
         Timed { value, cycles: 1 }
     }
 
-    fn fetch16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
+    fn fetch16(&mut self, address: u32, _sequential: bool) -> Timed<u16> {
         let value = self.read(address, true, 2) as u16;
-        self.advance_code(address, sequential);
+        self.advance_code(address, 16);
         Timed { value, cycles: 1 }
     }
 
     fn load32(&mut self, address: u32, sequential: bool) -> Timed<u32> {
         let value = self.read(address, false, 4);
-        self.advance_data(address, 4, sequential);
+        self.advance_data(address, 4, sequential, true);
         Timed { value, cycles: 1 }
     }
 
     fn load16(&mut self, address: u32, sequential: bool) -> Timed<u16> {
         let value = self.read(address, false, 2) as u16;
-        self.advance_data(address, 2, sequential);
+        self.advance_data(address, 2, sequential, true);
         Timed { value, cycles: 1 }
     }
 
     fn load8(&mut self, address: u32, sequential: bool) -> Timed<u8> {
         let value = self.read(address, false, 1) as u8;
-        self.advance_data(address, 1, sequential);
+        self.advance_data(address, 1, sequential, true);
         Timed { value, cycles: 1 }
     }
 
     fn store32(&mut self, address: u32, value: u32, sequential: bool) -> u32 {
         self.write(address, value, 4);
-        self.advance_data(address, 4, sequential);
+        self.advance_data(address, 4, sequential, false);
         1
     }
 
     fn store16(&mut self, address: u32, value: u16, sequential: bool) -> u32 {
         self.write(address, value as u32, 2);
-        self.advance_data(address, 2, sequential);
+        self.advance_data(address, 2, sequential, false);
         1
     }
 
     fn store8(&mut self, address: u32, value: u8, sequential: bool) -> u32 {
         self.write(address, value as u32, 1);
-        self.advance_data(address, 1, sequential);
+        self.advance_data(address, 1, sequential, false);
         1
     }
 
     fn internal(&mut self, cycles: u32) {
-        self.advance(cycles);
+        self.machine.timing[self.core.index()].internal += cycles;
     }
 
-    fn coprocessor_read(&mut self, cp: u8, opcode1: u8, crn: u8, crm: u8, opcode2: u8) -> Option<u32> {
+    fn coprocessor_read(
+        &mut self,
+        cp: u8,
+        opcode1: u8,
+        crn: u8,
+        crm: u8,
+        opcode2: u8,
+    ) -> Option<u32> {
         if self.core == Core::Arm9 && cp == 15 {
+            // MRC executes in 2 cycles on the ARM946E-S, independent of any fetch.
+            let t = &mut self.machine.timing[0];
+            t.internal = t.internal.max(2);
             self.machine.cp15.read(opcode1, crn, crm, opcode2)
         } else {
             None
@@ -250,6 +290,9 @@ impl Bus for NdsCpuBus<'_> {
         value: u32,
     ) -> bool {
         if self.core == Core::Arm9 && cp == 15 {
+            // MCR executes in 2 cycles on the ARM946E-S, independent of any fetch.
+            let t = &mut self.machine.timing[0];
+            t.internal = t.internal.max(2);
             self.machine.cp15.write(opcode1, crn, crm, opcode2, value)
         } else {
             false

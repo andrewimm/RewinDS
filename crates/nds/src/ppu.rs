@@ -262,7 +262,11 @@ impl Ppu {
                 &mut video2d::debug::sink::NullSink,
             );
         }
-        for (dst, src) in self.framebuffer.iter_mut().zip(self.render_fb.pixels.iter()) {
+        for (dst, src) in self
+            .framebuffer
+            .iter_mut()
+            .zip(self.render_fb.pixels.iter())
+        {
             *dst = src.0;
         }
     }

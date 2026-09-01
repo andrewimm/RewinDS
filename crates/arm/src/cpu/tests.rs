@@ -142,7 +142,10 @@ fn run_to(cpu: &mut Cpu, bus: &mut TestBus, stop: u32, budget: usize) {
         }
         cpu.step(bus);
     }
-    panic!("did not reach 0x{stop:08X}; pc = 0x{:08X}", cpu.register(15));
+    panic!(
+        "did not reach 0x{stop:08X}; pc = 0x{:08X}",
+        cpu.register(15)
+    );
 }
 
 #[test]
@@ -198,10 +201,7 @@ fn branch_and_link_sets_return_address() {
 fn store_then_load_word() {
     let mut bus = TestBus::new(0x100);
     // mov r0, #0x40 ; mov r1, #0xAB ; str r1, [r0] ; ldr r2, [r0]
-    bus.load(
-        0,
-        &[0xE3A0_0040, 0xE3A0_10AB, 0xE580_1000, 0xE590_2000],
-    );
+    bus.load(0, &[0xE3A0_0040, 0xE3A0_10AB, 0xE580_1000, 0xE590_2000]);
     let mut cpu = Cpu::new();
     for _ in 0..4 {
         cpu.step(&mut bus);
@@ -264,11 +264,8 @@ fn multiply_and_accumulate() {
 fn halfword_and_signed_loads() {
     let mut bus = TestBus::new(0x100);
     bus.write(0x40, 0x8123, 2); // a halfword with the sign bit set
-    // mov r0, #0x40 ; ldrh r1, [r0] ; ldrsh r2, [r0] ; ldrsb r3, [r0]
-    bus.load(
-        0,
-        &[0xE3A0_0040, 0xE1D0_10B0, 0xE1D0_20F0, 0xE1D0_30D0],
-    );
+                                // mov r0, #0x40 ; ldrh r1, [r0] ; ldrsh r2, [r0] ; ldrsb r3, [r0]
+    bus.load(0, &[0xE3A0_0040, 0xE1D0_10B0, 0xE1D0_20F0, 0xE1D0_30D0]);
     let mut cpu = Cpu::new();
     for _ in 0..4 {
         cpu.step(&mut bus);
@@ -512,14 +509,24 @@ fn clz_counts_leading_zeros_on_v5() {
     // clz r0, r1
     let cpu = run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0x0000_FFFF)]);
     assert_eq!(cpu.register(0), 16);
-    assert_eq!(run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0)]).register(0), 32);
-    assert_eq!(run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0x8000_0000)]).register(0), 0);
+    assert_eq!(
+        run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0)]).register(0),
+        32
+    );
+    assert_eq!(
+        run_one(super::ArmVersion::Armv5TE, 0xE16F_0F11, &[(1, 0x8000_0000)]).register(0),
+        0
+    );
 }
 
 #[test]
 fn clz_traps_as_undefined_on_v4t() {
     // On ARMv4T the CLZ encoding is not an instruction — it must not write rd.
-    let cpu = run_one(super::ArmVersion::Armv4T, 0xE16F_0F11, &[(0, 0xDEAD), (1, 0x0000_FFFF)]);
+    let cpu = run_one(
+        super::ArmVersion::Armv4T,
+        0xE16F_0F11,
+        &[(0, 0xDEAD), (1, 0x0000_FFFF)],
+    );
     assert_eq!(cpu.register(0), 0xDEAD); // untouched — trapped, not executed
     assert_eq!(cpu.mode(), Some(Mode::Undefined));
 }
@@ -559,7 +566,11 @@ fn qdadd_qdsub_double_the_second_operand() {
 
 #[test]
 fn saturating_traps_as_undefined_on_v4t() {
-    let cpu = run_one(super::ArmVersion::Armv4T, 0xE102_0051, &[(0, 0xBEEF), (1, 5), (2, 3)]);
+    let cpu = run_one(
+        super::ArmVersion::Armv4T,
+        0xE102_0051,
+        &[(0, 0xBEEF), (1, 5), (2, 3)],
+    );
     assert_eq!(cpu.register(0), 0xBEEF); // untouched
     assert_eq!(cpu.mode(), Some(Mode::Undefined));
 }
@@ -583,7 +594,11 @@ fn smla_halfword_accumulates_and_sets_q_on_overflow() {
     assert_eq!(cpu.register(0), 16);
     assert!(!cpu.cpsr().q());
     // Overflow of the 32-bit accumulate sets Q but does NOT saturate (wraps).
-    let cpu = run_one(Armv5TE, 0xE100_3281, &[(1, 0x7FFF), (2, 0x7FFF), (3, 0x7FFF_FFFF)]);
+    let cpu = run_one(
+        Armv5TE,
+        0xE100_3281,
+        &[(1, 0x7FFF), (2, 0x7FFF), (3, 0x7FFF_FFFF)],
+    );
     assert!(cpu.cpsr().q());
     assert_eq!(cpu.register(0), 0x3FFF_0001u32.wrapping_add(0x7FFF_FFFF));
 }
@@ -591,21 +606,33 @@ fn smla_halfword_accumulates_and_sets_q_on_overflow() {
 #[test]
 fn smulw_takes_the_top_32_of_the_48bit_product() {
     // smulwb r0, r1, r2 — (r1 * bottom(r2)) >> 16.
-    let cpu = run_one(super::ArmVersion::Armv5TE, 0xE120_02A1, &[(1, 0x0001_0000), (2, 2)]);
+    let cpu = run_one(
+        super::ArmVersion::Armv5TE,
+        0xE120_02A1,
+        &[(1, 0x0001_0000), (2, 2)],
+    );
     assert_eq!(cpu.register(0), 2); // 65536 * 2 >> 16
 }
 
 #[test]
 fn smlal_halfword_accumulates_into_64_bits() {
     // smlalbb r0(lo), r1(hi), r2, r3 — r1:r0 += bottom(r2)*bottom(r3).
-    let cpu = run_one(super::ArmVersion::Armv5TE, 0xE141_0382, &[(2, 0xFFFF), (3, 2)]); // (-1)*2 = -2
+    let cpu = run_one(
+        super::ArmVersion::Armv5TE,
+        0xE141_0382,
+        &[(2, 0xFFFF), (3, 2)],
+    ); // (-1)*2 = -2
     assert_eq!(cpu.register(0), 0xFFFF_FFFE);
     assert_eq!(cpu.register(1), 0xFFFF_FFFF); // sign-extended high word
 }
 
 #[test]
 fn dsp_multiply_traps_as_undefined_on_v4t() {
-    let cpu = run_one(super::ArmVersion::Armv4T, 0xE160_0281, &[(0, 0xCAFE), (1, 3), (2, 5)]);
+    let cpu = run_one(
+        super::ArmVersion::Armv4T,
+        0xE160_0281,
+        &[(0, 0xCAFE), (1, 3), (2, 5)],
+    );
     assert_eq!(cpu.register(0), 0xCAFE); // untouched
     assert_eq!(cpu.mode(), Some(Mode::Undefined));
 }
@@ -748,7 +775,7 @@ fn mcr_mrc_move_words_through_a_coprocessor_on_v5() {
     use super::ArmVersion::Armv5TE;
     let mut bus = TestBus::new(0x100);
     bus.coprocessor = Some(0); // a coprocessor is present
-    // mcr p15, 0, r1, c1, c0, 0  then  mrc p15, 0, r2, c1, c0, 0
+                               // mcr p15, 0, r1, c1, c0, 0  then  mrc p15, 0, r2, c1, c0, 0
     bus.load(0, &[0xEE01_1F10, 0xEE11_2F10]);
     let mut cpu = Cpu::with_version(Armv5TE);
     cpu.set_register(1, 0xCAFE_F00D);
@@ -821,7 +848,7 @@ fn q_flag_round_trips_through_cpsr_bits() {
     psr.set_q(true);
     assert!(psr.q());
     assert_eq!(psr.bits() & (1 << 27), 1 << 27); // CPSR bit 27
-    // The Q flag survives a bits round-trip (so it rides SPSR save/restore).
+                                                 // The Q flag survives a bits round-trip (so it rides SPSR save/restore).
     assert!(Psr::from_bits(psr.bits()).q());
     psr.set_q(false);
     assert!(!psr.q());

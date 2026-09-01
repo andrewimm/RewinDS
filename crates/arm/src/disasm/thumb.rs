@@ -38,7 +38,11 @@ pub fn format_thumb(inst: &ThumbInstruction) -> String {
             format!("{name}\t{}, {}, {operand}", reg(*rd), reg(*rs))
         }
 
-        ThumbInstruction::AluImmediate { op, rd, immediate: imm } => {
+        ThumbInstruction::AluImmediate {
+            op,
+            rd,
+            immediate: imm,
+        } => {
             let name = match op {
                 ThumbImmediateOp::Mov => "mov",
                 ThumbImmediateOp::Cmp => "cmp",
@@ -128,7 +132,11 @@ pub fn format_thumb(inst: &ThumbInstruction) -> String {
                 LoadAddressSource::Pc => "pc",
                 LoadAddressSource::Sp => "sp",
             };
-            format!("add\t{}, {base}, {}", reg(*rd), immediate(*word8 as u32 * 4))
+            format!(
+                "add\t{}, {base}, {}",
+                reg(*rd),
+                immediate(*word8 as u32 * 4)
+            )
         }
 
         ThumbInstruction::AdjustStackPointer { subtract, word7 } => {

@@ -42,7 +42,12 @@ impl Key1 {
     pub fn new(keytable: &[u8], idcode: u32, level: u8, modulo: usize) -> Self {
         assert!(keytable.len() >= KEYTABLE_LEN);
         let mut keybuf = Box::new([0u32; KEYBUF_WORDS]);
-        for (w, chunk) in keytable[..KEYTABLE_LEN].as_chunks::<4>().0.iter().enumerate() {
+        for (w, chunk) in keytable[..KEYTABLE_LEN]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
             keybuf[w] = u32::from_le_bytes(*chunk);
         }
         let mut key1 = Key1 {

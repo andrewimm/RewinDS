@@ -150,21 +150,14 @@ pub enum ThumbInstruction {
 
     /// Format 16 — conditional branch. The `offset` is already sign-extended and
     /// scaled to a byte displacement.
-    ConditionalBranch {
-        condition: Condition,
-        offset: i32,
-    },
+    ConditionalBranch { condition: Condition, offset: i32 },
 
     /// Format 17 — software interrupt with an 8-bit comment.
-    SoftwareInterrupt {
-        comment: u8,
-    },
+    SoftwareInterrupt { comment: u8 },
 
     /// Format 18 — unconditional branch. The `offset` is already sign-extended
     /// and scaled to a byte displacement.
-    Branch {
-        offset: i32,
-    },
+    Branch { offset: i32 },
 
     /// Format 19 — long branch with link, encoded as two consecutive halfwords.
     /// The `H` bit selects the half: the first (`second_half == false`) sets up
@@ -180,9 +173,7 @@ pub enum ThumbInstruction {
     /// A halfword the decoder does not assign to a known format (including the
     /// ARMv5 `BLX` space and the reserved `cond == 1110` conditional branch,
     /// both undefined on the ARM7TDMI). The raw value is retained.
-    Undefined {
-        raw: u16,
-    },
+    Undefined { raw: u16 },
 }
 
 /// Format 1 shift operations. Thumb's move-shifted form cannot encode `ROR`,

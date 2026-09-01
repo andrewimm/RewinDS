@@ -5,8 +5,7 @@ use crate::instruction::arm::{
     ArmInstruction, ArmOperation, BlockTransfer, Branch, BranchExchange, DataProcessing,
     DataProcessingOpcode, DoublewordTransfer, DspMulOp, HalfwordKind, HalfwordOffset,
     HalfwordTransfer, Mrs, Msr, MsrSource, Multiply, MultiplyLong, Operand2, SaturatingOp, Shift,
-    ShiftKind, ShiftSource,
-    SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
+    ShiftKind, ShiftSource, SingleOffset, SingleTransfer, SoftwareInterrupt, Swap,
 };
 
 /// Render a decoded ARM instruction as assembly text.
@@ -26,29 +25,56 @@ pub fn format_arm(inst: &ArmInstruction) -> String {
                 SaturatingOp::QDAdd => "qdadd",
                 SaturatingOp::QDSub => "qdsub",
             };
-            format!("{mnem}{cond}\t{}, {}, {}", reg(op.rd), reg(op.rm), reg(op.rn))
+            format!(
+                "{mnem}{cond}\t{}, {}, {}",
+                reg(op.rd),
+                reg(op.rm),
+                reg(op.rn)
+            )
         }
         ArmOperation::HalfwordMultiply(op) => {
             let h = |t: bool| if t { "t" } else { "b" };
             match op.op {
                 DspMulOp::SmulXY => format!(
                     "smul{}{}{cond}\t{}, {}, {}",
-                    h(op.x), h(op.y), reg(op.rd), reg(op.rm), reg(op.rs)
+                    h(op.x),
+                    h(op.y),
+                    reg(op.rd),
+                    reg(op.rm),
+                    reg(op.rs)
                 ),
                 DspMulOp::SmlaXY => format!(
                     "smla{}{}{cond}\t{}, {}, {}, {}",
-                    h(op.x), h(op.y), reg(op.rd), reg(op.rm), reg(op.rs), reg(op.rn)
+                    h(op.x),
+                    h(op.y),
+                    reg(op.rd),
+                    reg(op.rm),
+                    reg(op.rs),
+                    reg(op.rn)
                 ),
                 DspMulOp::SmulWY => format!(
-                    "smulw{}{cond}\t{}, {}, {}", h(op.y), reg(op.rd), reg(op.rm), reg(op.rs)
+                    "smulw{}{cond}\t{}, {}, {}",
+                    h(op.y),
+                    reg(op.rd),
+                    reg(op.rm),
+                    reg(op.rs)
                 ),
                 DspMulOp::SmlaWY => format!(
                     "smlaw{}{cond}\t{}, {}, {}, {}",
-                    h(op.y), reg(op.rd), reg(op.rm), reg(op.rs), reg(op.rn)
+                    h(op.y),
+                    reg(op.rd),
+                    reg(op.rm),
+                    reg(op.rs),
+                    reg(op.rn)
                 ),
                 DspMulOp::SmlalXY => format!(
                     "smlal{}{}{cond}\t{}, {}, {}, {}",
-                    h(op.x), h(op.y), reg(op.rn), reg(op.rd), reg(op.rm), reg(op.rs)
+                    h(op.x),
+                    h(op.y),
+                    reg(op.rn),
+                    reg(op.rd),
+                    reg(op.rm),
+                    reg(op.rs)
                 ),
             }
         }
@@ -110,7 +136,10 @@ fn format_data_processing(op: &DataProcessing, cond: &str) -> String {
         format!("{mnem}{cond}\t{}, {operand2}", reg(op.rn))
     } else {
         let s = if op.set_flags { "s" } else { "" };
-        if matches!(op.opcode, DataProcessingOpcode::Mov | DataProcessingOpcode::Mvn) {
+        if matches!(
+            op.opcode,
+            DataProcessingOpcode::Mov | DataProcessingOpcode::Mvn
+        ) {
             // Moves take no first operand.
             format!("{mnem}{cond}{s}\t{}, {operand2}", reg(op.rd))
         } else {

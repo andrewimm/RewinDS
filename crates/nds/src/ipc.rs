@@ -180,7 +180,7 @@ mod tests {
         let mut ipc = Ipc::new();
         let mut irq = irqs();
         ipc.write_sync(Core::Arm9, 0x0A << 8, &mut irq); // ARM9 outputs 0xA
-        // The ARM7 reads the ARM9's output in bits 0-3.
+                                                         // The ARM7 reads the ARM9's output in bits 0-3.
         assert_eq!(ipc.read_sync(Core::Arm7) & 0xF, 0x0A);
     }
 
@@ -217,11 +217,14 @@ mod tests {
         let mut ipc = Ipc::new();
         let mut irq = irqs();
         ipc.write_fifocnt(Core::Arm9, 1 << 15, &mut irq); // ARM9 FIFO enable
-        // ARM7 enables its receive-not-empty IRQ (bit 10) + FIFO.
+                                                          // ARM7 enables its receive-not-empty IRQ (bit 10) + FIFO.
         ipc.write_fifocnt(Core::Arm7, (1 << 15) | (1 << 10), &mut irq);
         assert_eq!(irq[Core::Arm7.index()].iflags(), 0);
         ipc.send(Core::Arm9, 0x1, &mut irq); // a word arrives for the ARM7
-        assert_eq!(irq[Core::Arm7.index()].iflags(), IrqSource::IpcRecvNotEmpty.mask());
+        assert_eq!(
+            irq[Core::Arm7.index()].iflags(),
+            IrqSource::IpcRecvNotEmpty.mask()
+        );
     }
 
     #[test]

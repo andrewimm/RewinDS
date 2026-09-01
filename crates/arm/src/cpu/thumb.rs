@@ -6,7 +6,9 @@
 //! implicit flag-setting, the `PC+4` pipeline offset, and a handful of dedicated
 //! forms (PC/SP-relative addressing, push/pop, the two-halfword `BL`).
 
-use super::{adc, multiply_cycles, sbc, shift_by_immediate, shift_by_register, sub, Bus, Cpu, Mode};
+use super::{
+    adc, multiply_cycles, sbc, shift_by_immediate, shift_by_register, sub, Bus, Cpu, Mode,
+};
 use crate::instruction::arm::ShiftKind;
 use crate::instruction::thumb::{
     AddSubOperand, LoadAddressSource, ThumbAluOp, ThumbHiRegOp, ThumbImmediateOp, ThumbInstruction,
@@ -44,13 +46,22 @@ impl Cpu {
                 self.set_reg(rd, result);
                 self.set_logical_flags(result, carry);
             }
-            AddSubtract { subtract, operand, rs, rd } => {
+            AddSubtract {
+                subtract,
+                operand,
+                rs,
+                rd,
+            } => {
                 let a = self.reg(rs);
                 let b = match operand {
                     AddSubOperand::Register(r) => self.reg(r),
                     AddSubOperand::Immediate(imm) => imm as u32,
                 };
-                let (result, carry, overflow) = if subtract { sub(a, b) } else { adc(a, b, false) };
+                let (result, carry, overflow) = if subtract {
+                    sub(a, b)
+                } else {
+                    adc(a, b, false)
+                };
                 self.set_reg(rd, result);
                 self.set_arithmetic_flags(result, carry, overflow);
             }
@@ -107,7 +118,13 @@ impl Cpu {
                 self.internal_cycles(bus, 1);
                 self.set_reg(rd, read.value);
             }
-            LoadStoreRegister { load, byte, ro, rb, rd } => {
+            LoadStoreRegister {
+                load,
+                byte,
+                ro,
+                rb,
+                rd,
+            } => {
                 let address = self.reg(rb).wrapping_add(self.reg(ro));
                 self.thumb_load_store(bus, load, byte, address, rd);
             }
@@ -115,12 +132,23 @@ impl Cpu {
                 let address = self.reg(rb).wrapping_add(self.reg(ro));
                 self.thumb_sign_extended(bus, op, address, rd);
             }
-            LoadStoreImmediate { load, byte, offset, rb, rd } => {
+            LoadStoreImmediate {
+                load,
+                byte,
+                offset,
+                rb,
+                rd,
+            } => {
                 let scale = if byte { 1 } else { 4 };
                 let address = self.reg(rb).wrapping_add(offset as u32 * scale);
                 self.thumb_load_store(bus, load, byte, address, rd);
             }
-            LoadStoreHalfword { load, offset, rb, rd } => {
+            LoadStoreHalfword {
+                load,
+                offset,
+                rb,
+                rd,
+            } => {
                 self.data_access = true;
                 let address = self.reg(rb).wrapping_add(offset as u32 * 2);
                 if load {
@@ -130,7 +158,11 @@ impl Cpu {
                     let value = read.value as u32;
                     // A misaligned (odd) LDRH reads the aligned halfword and
                     // rotates the zero-extended word right by 8.
-                    let value = if address & 1 != 0 { value.rotate_right(8) } else { value };
+                    let value = if address & 1 != 0 {
+                        value.rotate_right(8)
+                    } else {
+                        value
+                    };
                     self.set_reg(rd, value);
                 } else {
                     self.cycles += bus.store16(address, self.reg(rd) as u16, false) as u64;
@@ -157,10 +189,18 @@ impl Cpu {
                 };
                 self.set_reg(Register::SP, result);
             }
-            PushPop { pop, include_pc_lr, register_list } => {
+            PushPop {
+                pop,
+                include_pc_lr,
+                register_list,
+            } => {
                 self.thumb_push_pop(bus, pop, include_pc_lr, register_list);
             }
-            BlockTransfer { load, rb, register_list } => {
+            BlockTransfer {
+                load,
+                rb,
+                register_list,
+            } => {
                 self.thumb_block_transfer(bus, load, rb, register_list);
             }
             ConditionalBranch { condition, offset } => {
@@ -177,7 +217,11 @@ impl Cpu {
                 let target = self.reg(Register::PC).wrapping_add(offset as u32);
                 self.set_reg(Register::PC, target);
             }
-            LongBranchLink { second_half, exchange, offset } => {
+            LongBranchLink {
+                second_half,
+                exchange,
+                offset,
+            } => {
                 if exchange && !self.version.is_v5() {
                     // Thumb `BLX` is ARMv5-only; undefined on the ARM7TDMI.
                     let return_address = self.r[15].wrapping_add(2);
@@ -208,7 +252,13 @@ impl Cpu {
         }
     }
 
-    fn execute_thumb_alu<B: Bus>(&mut self, op: ThumbAluOp, rs: Register, rd: Register, bus: &mut B) {
+    fn execute_thumb_alu<B: Bus>(
+        &mut self,
+        op: ThumbAluOp,
+        rs: Register,
+        rd: Register,
+        bus: &mut B,
+    ) {
         let a = self.reg(rd);
         let b = self.reg(rs);
         let carry_in = self.cpsr.c();
@@ -336,7 +386,11 @@ impl Cpu {
                 let value = read.value as u32;
                 // A misaligned (odd) LDRH reads the aligned halfword and rotates
                 // the zero-extended word right by 8.
-                let value = if address & 1 != 0 { value.rotate_right(8) } else { value };
+                let value = if address & 1 != 0 {
+                    value.rotate_right(8)
+                } else {
+                    value
+                };
                 self.set_reg(rd, value);
             }
             ThumbSignExtendOp::LoadSignedByte => {
@@ -392,7 +446,8 @@ impl Cpu {
             let mut address = base;
             for i in 0..8 {
                 if list & (1 << i) != 0 {
-                    self.cycles += bus.store32(address, self.reg(Register::new(i)), sequential) as u64;
+                    self.cycles +=
+                        bus.store32(address, self.reg(Register::new(i)), sequential) as u64;
                     address = address.wrapping_add(4);
                     sequential = true;
                 }

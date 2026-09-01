@@ -168,7 +168,11 @@ impl DmaChannel {
         self.internal_source = source;
         if self.repeat() && self.timing() != DmaTiming::Immediate {
             self.internal_count = self.latched_count();
-            self.internal_dest = if self.dest_reloads() { self.masked_dest() } else { dest };
+            self.internal_dest = if self.dest_reloads() {
+                self.masked_dest()
+            } else {
+                dest
+            };
         } else {
             self.internal_dest = dest;
             self.enabled = false;

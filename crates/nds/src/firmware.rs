@@ -48,6 +48,6 @@ pub fn user_settings() -> [u8; 0x70] {
     let settings_ok = (1 << 10) | (1 << 11) | (1 << 13) | (1 << 14) | (1 << 15);
     put16(&mut s, 0x64, 1 | settings_ok);
     s[0x66] = 24; // Year (2024)
-    // 0x68 RTC offset = 0.
+                  // 0x68 RTC offset = 0.
     s
 }

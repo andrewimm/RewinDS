@@ -27,6 +27,43 @@ use crate::timer::{TimerId, Timers};
 use crate::vram::Vram;
 use crate::{Cp15, Memory};
 
+/// Temporary per-ARM9-instruction cycle-trace capture (feature `cyctrace`), for
+/// validating cycle accuracy against a reference cycle trace. The bus records
+/// `(fetch_address, arm9_clock)` at the start of each ARM9 opcode fetch; consecutive
+/// clock deltas are the per-instruction cycle costs. Remove once validated.
+#[cfg(feature = "cyctrace")]
+pub mod cyctrace {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub static TRACE: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+
+    /// Called from the bus at the start of each ARM9 opcode fetch.
+    pub fn record(address: u32, clock: u64) {
+        if ENABLED.load(Ordering::Relaxed) {
+            TRACE.lock().unwrap().push((address, clock));
+        }
+    }
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+    pub fn len() -> usize {
+        TRACE.lock().unwrap().len()
+    }
+    /// Dump `addr clock` lines to `path`.
+    pub fn dump(path: &str) {
+        use std::fmt::Write as _;
+        let t = TRACE.lock().unwrap();
+        let mut s = String::with_capacity(t.len() * 16);
+        for (a, c) in t.iter() {
+            let _ = writeln!(s, "{a:08x} {c}");
+        }
+        std::fs::write(path, s).unwrap();
+    }
+}
+
 /// Events on the shared DS timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NdsEvent {
@@ -39,6 +76,73 @@ pub enum NdsEvent {
     },
     /// A 2D-engine scanline boundary (line start or H-blank).
     Ppu(PpuEvent),
+}
+
+/// Per-core per-instruction timing state for the ARM pipeline model, where an
+/// instruction's cost is `max(cExecute, cFetch)` — the fetch and execute stages
+/// overlap, so their throughput is the larger, not the sum. The ARM9 (5-stage
+/// pipeline) also overlaps its ALU and memory stages, so `cExecute = max(aluBase,
+/// mem)`; the ARM7 (3-stage) runs them in sequence, so `cExecute = aluBase + mem`.
+/// The bus accumulates `fetch`/`mem`/`internal` and the load/store flags during a
+/// step; the boundary combines them (with the CPU's taken-branch signal) into one
+/// cost. `code_last`/`data_last` are the separate sequential-access trackers (an
+/// access is sequential iff its address is the previous one plus its width).
+#[derive(Default)]
+pub(crate) struct CoreTiming {
+    /// Code-fetch cost of this instruction (i-cache hit/miss on ARM9), the `cFetch`.
+    pub fetch: u32,
+    /// Sum of this instruction's data-access costs (d-cache hit/miss), the `mem` term.
+    pub mem: u32,
+    /// Internal (non-memory) execute cycles, e.g. multiply — combined for ops that
+    /// touch no memory (a load's spurious load-use cycle is excluded via the flags).
+    pub internal: u32,
+    pub did_load: bool,
+    pub did_store: bool,
+    /// Last code-fetch / data-access addresses, for sequential-access detection.
+    pub code_last: u32,
+    pub data_last: u32,
+}
+
+impl CoreTiming {
+    /// Clear the per-instruction accumulators (keeping the sequential-access
+    /// trackers, which persist across instructions).
+    fn begin_step(&mut self) {
+        self.fetch = 0;
+        self.mem = 0;
+        self.internal = 0;
+        self.did_load = false;
+        self.did_store = false;
+    }
+
+    /// The instruction's total cost in the core's own cycles = `max(cExecute, cFetch)`.
+    /// `cExecute` combines the ALU base with the memory cost — the ARM9 by `max`
+    /// (parallel pipeline stages), the ARM7 by `+` (same stage). `branched` is the
+    /// CPU's taken-branch signal (pipeline refill → execute base 3).
+    fn instruction_cost(&self, branched: bool, arm9: bool) -> u32 {
+        // A taken branch and a single load both cost 3 (pipeline refill / load base);
+        // a store costs 2; a plain ALU op costs 1.
+        let alu_base = if branched || self.did_load {
+            3
+        } else if self.did_store {
+            2
+        } else {
+            1
+        };
+        // Multiply/other internal-cycle ops (no memory access) contribute their
+        // internal cycles; a load/store's load-use cycle does not (its base already
+        // reflects the load/store execute cost).
+        let alu = if self.did_load || self.did_store {
+            alu_base
+        } else {
+            alu_base.max(self.internal)
+        };
+        let execute = if arm9 {
+            alu.max(self.mem)
+        } else {
+            alu + self.mem
+        };
+        execute.max(self.fetch)
+    }
 }
 
 /// Everything reachable through the bus: the memory image, CP15, the per-core
@@ -57,9 +161,14 @@ pub struct Machine {
     pub(crate) ipc: Ipc,
     /// The gamecard slot: runtime ROM/filesystem streaming.
     pub(crate) cart: Cart,
-    /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only).
-    pub(crate) icache: crate::icache::ICache,
-    pub(crate) dcache: crate::icache::ICache,
+    /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
+    /// the ARM946E-S 8 KB i-cache and 4 KB d-cache, both 4-way set-associative.
+    pub(crate) icache: crate::icache::Cache,
+    pub(crate) dcache: crate::icache::Cache,
+    /// Per-core per-instruction timing accumulators (the `max(execute, fetch)`
+    /// pipeline model), indexed by [`Core::index`]. The bus fills these during a step;
+    /// [`System::step_core`] combines them into the core's clock at the boundary.
+    pub(crate) timing: [CoreTiming; 2],
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
@@ -84,8 +193,9 @@ impl Machine {
             ppu: Ppu::new(),
             ipc: Ipc::new(),
             cart: Cart::new(),
-            icache: crate::icache::ICache::new(),
-            dcache: crate::icache::ICache::new(),
+            icache: crate::icache::Cache::instruction(),
+            dcache: crate::icache::Cache::data(),
+            timing: [CoreTiming::default(), CoreTiming::default()],
             keyinput: 0x03FF, // all released
             postflg: [0, 0],
             clock: [0; 2],
@@ -317,7 +427,8 @@ impl Machine {
             let base = addr - 0x0400_0000;
             if bytes == 4 {
                 self.ppu.write_register(base, value as u16, 0xFFFF);
-                self.ppu.write_register(base + 2, (value >> 16) as u16, 0xFFFF);
+                self.ppu
+                    .write_register(base + 2, (value >> 16) as u16, 0xFFFF);
             } else {
                 self.ppu.write_register(base, value as u16, 0xFFFF);
             }
@@ -326,8 +437,12 @@ impl Machine {
         match addr {
             0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(value, bytes),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
-            0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
-            0x0400_0184 => self.ipc.write_fifocnt(core, value as u16, &mut self.interrupts),
+            0x0400_0180 => self
+                .ipc
+                .write_sync(core, value as u16, &mut self.interrupts),
+            0x0400_0184 => self
+                .ipc
+                .write_fifocnt(core, value as u16, &mut self.interrupts),
             0x0400_0188 => self.ipc.send(core, value, &mut self.interrupts),
             0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
             0x0400_0210 => self.interrupts[c].set_ie(value),
@@ -356,7 +471,11 @@ fn vramcnt_bank(addr: u32) -> Option<usize> {
 impl EventHandler<NdsEvent> for Machine {
     fn handle(&mut self, event: NdsEvent, ctx: &mut EventContext<'_, NdsEvent>) {
         match event {
-            NdsEvent::TimerOverflow { core, timer, generation } => {
+            NdsEvent::TimerOverflow {
+                core,
+                timer,
+                generation,
+            } => {
                 let c = core.index();
                 // `timers[c]` and `interrupts[c]` are disjoint fields.
                 self.timers[c].handle_overflow(timer, generation, &mut self.interrupts[c], ctx);
@@ -476,12 +595,27 @@ impl System {
         if asserted && cpu.irq_enabled() {
             cpu.take_irq();
         }
+        // Each core charges its clock at the instruction boundary via the pipeline
+        // model: the bus accumulates fetch/data/internal costs during the step, and
+        // we combine them into one cost here.
+        let c = core.index();
+        self.machine.timing[c].begin_step();
         let mut bus = NdsCpuBus {
             machine: &mut self.machine,
             scheduler: &mut self.scheduler,
             core,
         };
         cpu.step(&mut bus);
+        // The cost is in the core's own cycles; the ARM9 runs at the master rate, the
+        // ARM7 at half (one ARM7 cycle = two master ticks).
+        let arm9 = core == Core::Arm9;
+        let branched = if arm9 {
+            self.arm9.branched()
+        } else {
+            self.arm7.branched()
+        };
+        let cost = self.machine.timing[c].instruction_cost(branched, arm9) as Timestamp;
+        self.machine.clock[c] += if arm9 { cost } else { cost * 2 };
     }
 
     /// Direct-boot a `.nds` image: copy the ARM9/ARM7 binaries to their RAM
@@ -542,9 +676,9 @@ impl System {
         self.machine.cp15.write(0, 9, 1, 0, 0x0080_000A); // DTCM base 0x0080_0000, 16 KB
         self.machine.cp15.write(0, 9, 1, 1, 0x0000_000C); // ITCM 32 KB (base fixed at 0)
         self.machine.cp15.write(0, 1, 0, 0, (1 << 16) | (1 << 18)); // enable DTCM + ITCM
-        // Give the ARM7 the Shared WRAM (WRAMCNT=3): its crt0 relocates code into
-        // the 32K Shared WRAM mirrored at 0x037F8000, using Shared + ARM7-WRAM as
-        // one continuous 96K block (GBATEK "Shared-RAM").
+                                                                    // Give the ARM7 the Shared WRAM (WRAMCNT=3): its crt0 relocates code into
+                                                                    // the 32K Shared WRAM mirrored at 0x037F8000, using Shared + ARM7-WRAM as
+                                                                    // one continuous 96K block (GBATEK "Shared-RAM").
         self.machine.memory.wramcnt = 3;
         // Entry points and conventional system-mode stacks (the cores boot in
         // System mode; each game's startup replaces these with its own). The ARM7
@@ -704,11 +838,11 @@ mod tests {
     /// parks in a self-branch. `off` and `value` must be 8-bit immediates.
     fn store_program(off: u32, value: u32) -> [u32; 5] {
         [
-            0xE3A0_1402,                 // mov r1, #0x02000000
-            0xE281_1C00 | (off >> 8),    // add r1, r1, #off  (off = imm8 ROR 24)
+            0xE3A0_1402,                  // mov r1, #0x02000000
+            0xE281_1C00 | (off >> 8),     // add r1, r1, #off  (off = imm8 ROR 24)
             0xE3A0_0000 | (value & 0xFF), // mov r0, #value
-            0xE581_0000,                 // str r0, [r1]
-            0xEAFF_FFFE,                 // b .
+            0xE581_0000,                  // str r0, [r1]
+            0xEAFF_FFFE,                  // b .
         ]
     }
 
@@ -762,7 +896,12 @@ mod tests {
         // arms its interrupt controller.
         system.io_write(Core::Arm9, FIFOCNT, 1 << 15, 2);
         system.io_write(Core::Arm7, FIFOCNT, (1 << 15) | (1 << 10), 2);
-        system.io_write(Core::Arm7, 0x0400_0210, IrqSource::IpcRecvNotEmpty.mask(), 4); // IE
+        system.io_write(
+            Core::Arm7,
+            0x0400_0210,
+            IrqSource::IpcRecvNotEmpty.mask(),
+            4,
+        ); // IE
         system.io_write(Core::Arm7, 0x0400_0208, 1, 4); // IME
 
         // ARM9 sends a request word; run the interleaved timeline forward.
@@ -806,15 +945,18 @@ mod tests {
         // The ARM7 arms its controller for the Timer 0 interrupt.
         system.io_write(Core::Arm7, 0x0400_0210, IrqSource::Timer0.mask(), 4); // IE
         system.io_write(Core::Arm7, 0x0400_0208, 1, 4); // IME
-        // Reload 0xFFFF (overflows after one increment = 2 master ticks), F/1,
-        // IRQ enabled, start.
+                                                        // Reload 0xFFFF (overflows after one increment = 2 master ticks), F/1,
+                                                        // IRQ enabled, start.
         system.io_write(Core::Arm7, 0x0400_0100, 0xFFFF, 2);
         system.io_write(Core::Arm7, 0x0400_0102, (1 << 7) | (1 << 6), 2);
         assert_eq!(system.interrupts(Core::Arm7).iflags(), 0);
 
         system.run_until(64);
         // The overflow fired on the ARM7 (and only there) and reloaded.
-        assert_eq!(system.interrupts(Core::Arm7).iflags(), IrqSource::Timer0.mask());
+        assert_eq!(
+            system.interrupts(Core::Arm7).iflags(),
+            IrqSource::Timer0.mask()
+        );
         assert_eq!(system.interrupts(Core::Arm9).iflags(), 0);
         assert_eq!(system.io_read(Core::Arm7, 0x0400_0100, 2), 0xFFFF);
     }
@@ -864,9 +1006,14 @@ mod tests {
             let mut system = run_on(core, 0x0200_0000, 0x0200_1000);
             for i in 0..4u32 {
                 let word = u32::from_le_bytes(
-                    system.memory().main[0x1000 + i as usize * 4..][..4].try_into().unwrap(),
+                    system.memory().main[0x1000 + i as usize * 4..][..4]
+                        .try_into()
+                        .unwrap(),
                 );
-                assert_eq!(word, [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444][i as usize]);
+                assert_eq!(
+                    word,
+                    [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444][i as usize]
+                );
             }
             // Completion raised the DMA0 interrupt and disabled the channel.
             assert_eq!(system.interrupts(core).iflags(), IrqSource::Dma0.mask());
@@ -898,7 +1045,7 @@ mod tests {
         system.io_write(Core::Arm9, 0x0400_00B4, 0x0200_0000, 4); // DAD
         system.io_write(Core::Arm9, 0x0400_00B8, 0x80, 2); // count = 0x200 bytes
         system.io_write(Core::Arm9, 0x0400_00BA, cnt_h, 2); // enabled, waits for cart start
-        // Not auto-run: the channel is armed but idle until the block starts.
+                                                            // Not auto-run: the channel is armed but idle until the block starts.
         assert_eq!(system.memory().main[0], 0);
 
         // Command B7, read from ROM address 0x8000 (MSB-first in the 8-byte buffer:
@@ -913,7 +1060,10 @@ mod tests {
         assert_eq!(&system.memory().main[..0x200], &rom[0x8000..0x8200]);
         // The block completed: busy clear and the transfer-complete IRQ pending.
         assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
-        assert_eq!(system.interrupts(Core::Arm9).iflags(), IrqSource::Gamecard.mask());
+        assert_eq!(
+            system.interrupts(Core::Arm9).iflags(),
+            IrqSource::Gamecard.mask()
+        );
     }
 
     #[test]
@@ -977,7 +1127,12 @@ mod tests {
         // block A mapped as LCDC and seeded with a gradient.
         system.io_write(Core::Arm9, 0x0400_0240, 0x80, 1); // VRAMCNT_A: enable, MST 0 (LCDC)
         for i in 0..(crate::ppu::WIDTH * crate::ppu::HEIGHT) {
-            system.write(Core::Arm9, 0x0680_0000 + i as u32 * 2, (i & 0x7FFF) as u32, 2);
+            system.write(
+                Core::Arm9,
+                0x0680_0000 + i as u32 * 2,
+                (i & 0x7FFF) as u32,
+                2,
+            );
         }
         system.io_write(Core::Arm9, 0x0400_0000, 2 << 16, 4); // DISPCNT: VRAM display, block A
 
@@ -987,8 +1142,14 @@ mod tests {
         assert_eq!(system.frame(), 1);
         assert!(system.io_read(Core::Arm9, 0x0400_0006, 2) as u16 <= 263);
         // The V-blank interrupt reached both cores.
-        assert_eq!(system.interrupts(Core::Arm9).iflags(), IrqSource::VBlank.mask());
-        assert_eq!(system.interrupts(Core::Arm7).iflags(), IrqSource::VBlank.mask());
+        assert_eq!(
+            system.interrupts(Core::Arm9).iflags(),
+            IrqSource::VBlank.mask()
+        );
+        assert_eq!(
+            system.interrupts(Core::Arm7).iflags(),
+            IrqSource::VBlank.mask()
+        );
         // The framebuffer holds the blitted gradient.
         let fb = system.framebuffer();
         assert_eq!(fb[0], 0);
@@ -1065,7 +1226,7 @@ mod tests {
         assert_eq!(system.read(Core::Arm9, 0x0200_0300, 1), 0xA9);
         assert_eq!(system.read(Core::Arm7, 0x0200_0400, 1), 0x77);
         assert_eq!(system.arm9.register(15) & !3, 0x0200_000C); // parked at the B .
-        // Direct boot seeds the BIOS TCM state so BIOS-less homebrew's stack works.
+                                                                // Direct boot seeds the BIOS TCM state so BIOS-less homebrew's stack works.
         assert!(system.cp15().dtcm_enabled());
         assert_eq!(system.cp15().dtcm_base(), 0x0080_0000);
     }
@@ -1086,7 +1247,7 @@ mod tests {
         put(&mut rom, 0x3C, 4);
         rom[0x15E..0x160].copy_from_slice(&0xABCDu16.to_le_bytes()); // header CRC
         rom[0x6C..0x6E].copy_from_slice(&0x1234u16.to_le_bytes()); // secure CRC
-        // Park both cores immediately.
+                                                                   // Park both cores immediately.
         put(&mut rom, 0x4000, 0xEAFF_FFFE);
         put(&mut rom, 0x5000, 0xEAFF_FFFE);
 
@@ -1145,7 +1306,7 @@ mod tests {
         let mut system = System::new();
         // Block A → 2D Engine-A BG VRAM at 0x0600_0000.
         system.io_write(Core::Arm9, 0x0400_0240, 0x80 | 1, 1); // VRAMCNT_A: enable, MST 1
-        // Tile 0 (4bpp, char base 0): every pixel is palette index 1 (bytes 0x11).
+                                                               // Tile 0 (4bpp, char base 0): every pixel is palette index 1 (bytes 0x11).
         for i in 0..8u32 {
             system.write(Core::Arm9, 0x0600_0000 + i * 4, 0x1111_1111, 4);
         }

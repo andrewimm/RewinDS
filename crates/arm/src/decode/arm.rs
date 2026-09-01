@@ -32,10 +32,16 @@ pub fn decode_arm(raw: u32) -> ArmInstruction {
     // model stays a NOP via the `Nv` condition.
     if raw >> 28 == 0xF {
         return if (raw >> 25) & 0b111 == 0b101 {
-            ArmInstruction { condition: Condition::Al, operation: decode_blx_immediate(raw) }
+            ArmInstruction {
+                condition: Condition::Al,
+                operation: decode_blx_immediate(raw),
+            }
         } else {
             // PLD and reserved hints: never-execute keeps them NOP on both cores.
-            ArmInstruction { condition: Condition::Nv, operation: ArmOperation::Undefined { raw } }
+            ArmInstruction {
+                condition: Condition::Nv,
+                operation: ArmOperation::Undefined { raw },
+            }
         };
     }
     ArmInstruction {
@@ -454,7 +460,9 @@ fn decode_branch_exchange(raw: u32) -> ArmOperation {
 
 fn decode_breakpoint(raw: u32) -> ArmOperation {
     let comment = (((raw >> 8) & 0xFFF) << 4) | (raw & 0xF);
-    ArmOperation::Breakpoint(Breakpoint { comment: comment as u16 })
+    ArmOperation::Breakpoint(Breakpoint {
+        comment: comment as u16,
+    })
 }
 
 fn decode_swi_or_coprocessor(raw: u32) -> ArmOperation {
@@ -515,7 +523,7 @@ mod tests {
     fn bx_is_matched() {
         assert!(matches_branch_exchange(0xE12F_FF1E)); // BX lr
         assert!(matches_branch_exchange(0x012F_FF13)); // BXEQ r3
-        // A data-processing word must not look like BX.
+                                                       // A data-processing word must not look like BX.
         assert!(!matches_branch_exchange(0xE281_1001)); // ADD r1, r1, #1
     }
 
@@ -534,7 +542,7 @@ mod tests {
     fn swap_is_matched_and_not_confused() {
         assert!(matches_swap(0xE104_3092)); // SWP r3, r2, [r4]
         assert!(matches_swap(0xE144_3092)); // SWPB r3, r2, [r4]
-        // A swap must not be picked up by the multiply or halfword matchers.
+                                            // A swap must not be picked up by the multiply or halfword matchers.
         assert!(!matches_multiply(0xE104_3092));
         assert!(!matches_halfword_transfer(0xE104_3092));
     }
@@ -544,7 +552,7 @@ mod tests {
         assert!(matches_halfword_transfer(0xE1D1_00B0)); // LDRH r0, [r1]
         assert!(matches_halfword_transfer(0xE1D1_00D0)); // LDRSB r0, [r1]
         assert!(matches_halfword_transfer(0xE1D1_00F0)); // LDRSH r0, [r1]
-        // SWP has SH == 00 and must not be treated as a halfword transfer.
+                                                         // SWP has SH == 00 and must not be treated as a halfword transfer.
         assert!(!matches_halfword_transfer(0xE104_3092));
     }
 
@@ -554,7 +562,7 @@ mod tests {
         // which would otherwise treat them as nonexistent signed stores.
         assert!(matches_doubleword_transfer(0xE1C2_00D0)); // LDRD r0, [r2]
         assert!(matches_doubleword_transfer(0xE1C2_00F0)); // STRD r0, [r2]
-        // The L=1 signed loads are halfword transfers, not doubleword.
+                                                           // The L=1 signed loads are halfword transfers, not doubleword.
         assert!(!matches_doubleword_transfer(0xE1D1_00D0)); // LDRSB
         assert!(!matches_doubleword_transfer(0xE1D1_00F0)); // LDRSH
 

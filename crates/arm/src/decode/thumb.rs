@@ -344,9 +344,7 @@ fn decode_conditional_branch(raw: u16) -> ThumbInstruction {
 
 /// Format 17 — software interrupt. The comment is bits 7..0.
 fn decode_software_interrupt(raw: u16) -> ThumbInstruction {
-    ThumbInstruction::SoftwareInterrupt {
-        comment: raw as u8,
-    }
+    ThumbInstruction::SoftwareInterrupt { comment: raw as u8 }
 }
 
 /// Format 18 — unconditional branch. The 11-bit signed displacement is
@@ -389,15 +387,17 @@ mod tests {
         // interpreter that traps it as undefined on an ARMv4T core.
         assert_eq!(
             decode_thumb(0b1110_1000_0000_0000),
-            ThumbInstruction::LongBranchLink { second_half: true, exchange: true, offset: 0 }
+            ThumbInstruction::LongBranchLink {
+                second_half: true,
+                exchange: true,
+                offset: 0
+            }
         );
         // Conditional-branch slot with the reserved cond == 1110.
         let reserved_cond = 0b1101_1110_0000_0000;
         assert_eq!(
             decode_thumb(reserved_cond),
-            ThumbInstruction::Undefined {
-                raw: reserved_cond
-            }
+            ThumbInstruction::Undefined { raw: reserved_cond }
         );
     }
 

@@ -12,7 +12,11 @@ use arm::{decode_arm, decode_thumb, format_arm, format_thumb};
 
 fn check_arm(program: &[(u32, &str)]) {
     for (raw, expected) in program {
-        assert_eq!(format_arm(&decode_arm(*raw)), *expected, "raw = 0x{raw:08X}");
+        assert_eq!(
+            format_arm(&decode_arm(*raw)),
+            *expected,
+            "raw = 0x{raw:08X}"
+        );
     }
 }
 
@@ -30,15 +34,15 @@ fn check_thumb(program: &[(u16, &str)]) {
 #[test]
 fn arm_sum_array() {
     check_arm(&[
-        (0xE3A02000, "mov\tr2, #0"),      // mov   r2, #0
-        (0xE3510000, "cmp\tr1, #0"),      // cmp   r1, #0
-        (0x0A000003, "beq\t#12"),         // beq   .Ldone
+        (0xE3A02000, "mov\tr2, #0"),       // mov   r2, #0
+        (0xE3510000, "cmp\tr1, #0"),       // cmp   r1, #0
+        (0x0A000003, "beq\t#12"),          // beq   .Ldone
         (0xE4903004, "ldr\tr3, [r0], #4"), // ldr  r3, [r0], #4
-        (0xE0822003, "add\tr2, r2, r3"),  // add   r2, r2, r3
-        (0xE2511001, "subs\tr1, r1, #1"), // subs  r1, r1, #1
-        (0x1AFFFFFB, "bne\t#-20"),        // bne   .Lloop
-        (0xE1A00002, "mov\tr0, r2"),      // mov   r0, r2
-        (0xE12FFF1E, "bx\tlr"),           // bx    lr
+        (0xE0822003, "add\tr2, r2, r3"),   // add   r2, r2, r3
+        (0xE2511001, "subs\tr1, r1, #1"),  // subs  r1, r1, #1
+        (0x1AFFFFFB, "bne\t#-20"),         // bne   .Lloop
+        (0xE1A00002, "mov\tr0, r2"),       // mov   r0, r2
+        (0xE12FFF1E, "bx\tlr"),            // bx    lr
     ]);
 }
 
@@ -61,15 +65,15 @@ fn arm_leaf_function() {
 #[test]
 fn thumb_program() {
     check_thumb(&[
-        (0xB510, "push\t{r4, lr}"),      // push  {r4, lr}
-        (0x200A, "mov\tr0, #0xa"),        // movs  r0, #10
-        (0x0081, "lsl\tr1, r0, #2"),      // lsls  r1, r0, #2
-        (0xAC02, "add\tr4, sp, #8"),      // add   r4, sp, #8
-        (0x6822, "ldr\tr2, [r4]"),        // ldr   r2, [r4]
-        (0xF000, "bl\t(high) #0x000"),    // bl    target (high half)
-        (0xF801, "bl\t(low) #0x001"),     // bl    target (low half)
-        (0xBD10, "pop\t{r4, pc}"),        // pop   {r4, pc}
-        (0x1C40, "add\tr0, r0, #1"),      // adds  r0, r0, #1
-        (0x4770, "bx\tlr"),               // bx    lr
+        (0xB510, "push\t{r4, lr}"),    // push  {r4, lr}
+        (0x200A, "mov\tr0, #0xa"),     // movs  r0, #10
+        (0x0081, "lsl\tr1, r0, #2"),   // lsls  r1, r0, #2
+        (0xAC02, "add\tr4, sp, #8"),   // add   r4, sp, #8
+        (0x6822, "ldr\tr2, [r4]"),     // ldr   r2, [r4]
+        (0xF000, "bl\t(high) #0x000"), // bl    target (high half)
+        (0xF801, "bl\t(low) #0x001"),  // bl    target (low half)
+        (0xBD10, "pop\t{r4, pc}"),     // pop   {r4, pc}
+        (0x1C40, "add\tr0, r0, #1"),   // adds  r0, r0, #1
+        (0x4770, "bx\tlr"),            // bx    lr
     ]);
 }

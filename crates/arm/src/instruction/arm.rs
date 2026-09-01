@@ -540,7 +540,10 @@ mod tests {
                 link: true,
                 offset: 0,
             }),
-            ArmOperation::BranchExchange(BranchExchange { rn: Register::LR, link: false }),
+            ArmOperation::BranchExchange(BranchExchange {
+                rn: Register::LR,
+                link: false,
+            }),
             ArmOperation::SoftwareInterrupt(SoftwareInterrupt { comment: 0 }),
         ] {
             assert!(op.is_control_flow());

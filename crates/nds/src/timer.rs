@@ -271,7 +271,7 @@ mod tests {
         timers.write_control(TimerId::Timer0, START, 0, &mut sched);
         assert_eq!(timers.read_counter(TimerId::Timer0, 0), 0xFFF0);
         assert_eq!(timers.read_counter(TimerId::Timer0, 10), 0xFFF5); // 10 ticks / 2
-        // Next overflow is (0x10000 - 0xFFF0) * 2 = 32 master ticks after start.
+                                                                      // Next overflow is (0x10000 - 0xFFF0) * 2 = 32 master ticks after start.
         assert_eq!(sched.next_deadline(), Some(32));
     }
 

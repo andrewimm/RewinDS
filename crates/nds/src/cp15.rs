@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(cp.read(0, 0, 0, 0), Some(0x4105_9461)); // ARMv5TE ARM946 rev1
         assert_eq!(cp.read(0, 0, 0, 1), Some(0x0F0D_2112)); // cache type
         assert_eq!(cp.read(0, 0, 0, 2), Some(0x0014_0180)); // TCM physical size
-        // C0,C0,3..7 mirror the Main ID.
+                                                            // C0,C0,3..7 mirror the Main ID.
         assert_eq!(cp.read(0, 0, 0, 5), Some(0x4105_9461));
         // ID registers are read-only: a write is accepted but changes nothing.
         let mut cp = cp;
@@ -253,7 +253,10 @@ mod tests {
         assert_eq!(cp.read(0, 1, 0, 0), Some(0x0000_0078));
         // Write all ones: only the R/W bits stick, and the fixed bits stay set.
         assert!(cp.write(0, 1, 0, 0, 0xFFFF_FFFF));
-        assert_eq!(cp.read(0, 1, 0, 0), Some(CONTROL_WRITABLE | CONTROL_ALWAYS_SET));
+        assert_eq!(
+            cp.read(0, 1, 0, 0),
+            Some(CONTROL_WRITABLE | CONTROL_ALWAYS_SET)
+        );
         // A reserved bit (e.g. bit 20) never sticks.
         assert!(cp.write(0, 1, 0, 0, 1 << 20));
         assert_eq!(cp.read(0, 1, 0, 0), Some(CONTROL_ALWAYS_SET));
