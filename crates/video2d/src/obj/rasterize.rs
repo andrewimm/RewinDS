@@ -181,7 +181,14 @@ pub fn rasterize<S: ProvenanceSink>(
             }
 
             let entry = palette_entry(sprite, texel);
-            let color = mem.palette15(entry);
+            let color = if matches!(sprite.color_mode, ObjColorMode::Bpp8) && layout.obj_ext_palette {
+                // Extended OBJ palette: attr2 bits 12-15 select the 256-color
+                // sub-palette (an 8bpp sprite otherwise uses the whole byte as an
+                // index into the single standard OBJ palette).
+                mem.obj_ext15(sprite.palette_bank as usize, texel as usize)
+            } else {
+                mem.palette15(entry)
+            };
             let candidate = CandidatePixel {
                 color,
                 layer: LayerId::Obj,

@@ -26,16 +26,30 @@ pub struct VramLayout {
     /// base tile number is scaled by this — tiles *within* a sprite stay 32-byte
     /// (4bpp) packed.
     pub obj_tile_boundary: u32,
+    /// DS: 8bpp text backgrounds resolve through the extended palette (`DISPCNT` bit
+    /// 30) instead of the standard palette. Always false on the GBA.
+    pub bg_ext_palette: bool,
+    /// DS: 8bpp sprites resolve through the OBJ extended palette (`DISPCNT` bit 31).
+    /// Always false on the GBA.
+    pub obj_ext_palette: bool,
+    /// Mask applied to `BGxCNT >> 2` for the character-base block. The GBA uses 2 bits
+    /// (`0x3`, blocks 0-3); the DS uses 4 (`0xF`) — its BGxCNT bits 4-5 are the char
+    /// base MSBs, which the GBA requires to be zero, so `0xF` stays GBA-identical.
+    pub bg_char_base_mask: u32,
 }
 
 impl VramLayout {
-    /// The GBA layout: no global BG base, OBJ tiles at `0x1_0000`, 32-byte boundary.
+    /// The GBA layout: no global BG base, OBJ tiles at `0x1_0000`, 32-byte boundary,
+    /// no extended palettes.
     pub const fn gba() -> Self {
         VramLayout {
             bg_char_base: 0,
             bg_screen_base: 0,
             obj_tile_base: 0x1_0000,
             obj_tile_boundary: 32,
+            bg_ext_palette: false,
+            obj_ext_palette: false,
+            bg_char_base_mask: 0x3,
         }
     }
 }
@@ -53,19 +67,60 @@ pub const VRAM_BASE: u32 = 0x0600_0000;
 /// Base guest address of OAM.
 pub const OAM_BASE: u32 = 0x0700_0000;
 
-/// An immutable view of the three graphics memory regions.
+/// An immutable view of the graphics memory regions. `bg_ext_palette` and
+/// `obj_ext_palette` are the DS's VRAM-mapped extended palettes (empty on the GBA);
+/// they are only consulted when the caller's [`VramLayout`] enables them.
 pub struct PpuMemoryView<'a> {
     pub vram: &'a [u8],
     pub palette: &'a [u8],
     pub oam: &'a [u8],
+    /// DS BG extended palette: 4 slots × 16 sub-palettes × 256 colors (32 KB).
+    pub bg_ext_palette: &'a [u8],
+    /// DS OBJ extended palette: 16 sub-palettes × 256 colors (8 KB).
+    pub obj_ext_palette: &'a [u8],
 }
 
 impl<'a> PpuMemoryView<'a> {
-    /// Build a view from the three region slices. The machine crate owns the
-    /// backing storage (its bus `Memory`, or the DS's banked VRAM) and supplies
-    /// the slices, keeping this renderer free of any bus dependency.
+    /// Build a view from the three standard region slices (no extended palettes —
+    /// the GBA case). The machine crate owns the backing storage and supplies the
+    /// slices, keeping this renderer free of any bus dependency.
     pub fn new(vram: &'a [u8], palette: &'a [u8], oam: &'a [u8]) -> Self {
-        PpuMemoryView { vram, palette, oam }
+        PpuMemoryView {
+            vram,
+            palette,
+            oam,
+            bg_ext_palette: &[],
+            obj_ext_palette: &[],
+        }
+    }
+
+    /// Attach the DS extended palettes to a view.
+    pub fn with_ext_palettes(mut self, bg: &'a [u8], obj: &'a [u8]) -> Self {
+        self.bg_ext_palette = bg;
+        self.obj_ext_palette = obj;
+        self
+    }
+
+    /// A DS BG extended-palette color: `slot` (0-3) selects the 8 KB block, `subpal`
+    /// (0-15, from the tilemap entry) the 256-color sub-palette, `index` the color.
+    #[inline]
+    pub fn bg_ext15(&self, slot: usize, subpal: usize, index: usize) -> Color15 {
+        self.ext15(self.bg_ext_palette, slot * 0x2000 + subpal * 0x200 + index * 2)
+    }
+
+    /// A DS OBJ extended-palette color: `subpal` (0-15, from OAM attr2) selects the
+    /// 256-color sub-palette, `index` the color.
+    #[inline]
+    pub fn obj_ext15(&self, subpal: usize, index: usize) -> Color15 {
+        self.ext15(self.obj_ext_palette, subpal * 0x200 + index * 2)
+    }
+
+    #[inline]
+    fn ext15(&self, pal: &[u8], off: usize) -> Color15 {
+        Color15(u16::from_le_bytes([
+            pal.get(off).copied().unwrap_or(0),
+            pal.get(off + 1).copied().unwrap_or(0),
+        ]))
     }
 
     /// Read a little-endian halfword from VRAM at byte offset `off`.

@@ -55,7 +55,7 @@ pub fn render_text_scanline<S: ProvenanceSink>(
     }
     let cnt = state.regs.bgcnt[bg];
     let priority = (cnt & 0x3) as u8;
-    let char_base = layout.bg_char_base + ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
+    let char_base = layout.bg_char_base + ((cnt >> 2) as u32 & layout.bg_char_base_mask) * CHARBLOCK_SIZE;
     let is_8bpp = cnt & (1 << 7) != 0;
     let screen_base = layout.bg_screen_base + ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
     let (tiles_w, tiles_h) = map_dimensions((cnt >> 14) & 0x3);
@@ -111,7 +111,15 @@ pub fn render_text_scanline<S: ProvenanceSink>(
         } else {
             (palette_bank as usize * 16 + texel as usize, BgColorMode::Bpp4 { palette_bank })
         };
-        let color = mem.palette15(palette_entry);
+        let color = if is_8bpp && layout.bg_ext_palette {
+            // Extended palette: the tilemap entry's bits 12-15 select the 256-color
+            // sub-palette within the BG's 8 KB slot. BG0/BG1 may borrow slot 2/3
+            // (BGxCNT bit 13); BG2/BG3 use their own slot.
+            let slot = if bg < 2 && cnt & (1 << 13) != 0 { bg + 2 } else { bg };
+            mem.bg_ext15(slot, palette_bank as usize, texel as usize)
+        } else {
+            mem.palette15(palette_entry)
+        };
 
         let flags = PixelFlags {
             mosaic,

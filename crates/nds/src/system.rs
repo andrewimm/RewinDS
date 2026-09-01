@@ -704,6 +704,11 @@ impl System {
         self.machine.memory.load_bios7(bios7);
     }
 
+    /// A VRAM bank's `VRAMCNT` byte (bank 0=A … 8=I), for debug tooling.
+    pub fn vram_control(&self, bank: usize) -> u8 {
+        self.machine.vram.control(bank)
+    }
+
     /// The ARM9's CP15 coprocessor state.
     pub fn cp15(&self) -> &Cp15 {
         &self.machine.cp15

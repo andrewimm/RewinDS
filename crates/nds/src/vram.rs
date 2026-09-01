@@ -103,6 +103,52 @@ impl Vram {
         self.assemble_region(out, 0x0660_0000, 0x0662_0000);
     }
 
+    /// Assemble the Engine-A BG extended palette (32 KB = 4 slots × 8 KB) from the
+    /// banks routed to it: E (`MST 4`) fills all four slots; F/G (`MST 4`) fill slots
+    /// 0-1 (OFS=0) or 2-3 (OFS=1). Extended-palette VRAM is not CPU-addressable, so
+    /// this reads the banks directly rather than through the address map.
+    pub fn assemble_bg_ext_a(&self, out: &mut [u8]) {
+        out.fill(0);
+        for bank in [4usize, 5, 6] {
+            let cnt = self.vramcnt[bank];
+            if cnt & 0x80 == 0 || cnt & 7 != 4 {
+                continue;
+            }
+            let ofs = ((cnt >> 3) & 3) as usize;
+            let (dst, len) = if bank == 4 { (0, 0x8000) } else { ((ofs & 1) * 0x4000, 0x4000) };
+            copy_into(out, dst, &self.banks[bank], len);
+        }
+    }
+
+    /// Assemble the Engine-A OBJ extended palette (8 KB) from banks F/G (`MST 5`).
+    pub fn assemble_obj_ext_a(&self, out: &mut [u8]) {
+        out.fill(0);
+        for bank in [5usize, 6] {
+            let cnt = self.vramcnt[bank];
+            if cnt & 0x80 != 0 && cnt & 7 == 5 {
+                copy_into(out, 0, &self.banks[bank], 0x2000);
+            }
+        }
+    }
+
+    /// Assemble the Engine-B BG extended palette (32 KB) from bank H (`MST 2`).
+    pub fn assemble_bg_ext_b(&self, out: &mut [u8]) {
+        out.fill(0);
+        let cnt = self.vramcnt[7];
+        if cnt & 0x80 != 0 && cnt & 7 == 2 {
+            copy_into(out, 0, &self.banks[7], 0x8000);
+        }
+    }
+
+    /// Assemble the Engine-B OBJ extended palette (8 KB) from bank I (`MST 3`).
+    pub fn assemble_obj_ext_b(&self, out: &mut [u8]) {
+        out.fill(0);
+        let cnt = self.vramcnt[8];
+        if cnt & 0x80 != 0 && cnt & 7 == 3 {
+            copy_into(out, 0, &self.banks[8], 0x2000);
+        }
+    }
+
     /// Gather every enabled bank whose mapped base falls in `[lo, hi)` into `out`,
     /// each at `base - lo`. Banks routed elsewhere contribute nothing.
     fn assemble_region(&self, out: &mut [u8], lo: u32, hi: u32) {
@@ -209,6 +255,12 @@ impl Vram {
         };
         Some((range, size))
     }
+}
+
+/// Copy up to `len` bytes of `src` into `out` at `dst`, clamped to both lengths.
+fn copy_into(out: &mut [u8], dst: usize, src: &[u8], len: usize) {
+    let n = len.min(src.len()).min(out.len().saturating_sub(dst));
+    out[dst..dst + n].copy_from_slice(&src[..n]);
 }
 
 #[cfg(test)]

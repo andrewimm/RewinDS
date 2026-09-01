@@ -195,11 +195,19 @@ fn _half_frame() -> u64 {
 #[ignore]
 fn dump_frame() {
     let mut sys = booted();
-    for _ in 0..frames() {
+    // Optionally pulse a keypad mask (CYC_KEYS, KEYINPUT bit order) to advance past
+    // input-gated screens: pressed for four frames, released for four.
+    let keys = env_hex("CYC_KEYS", 0);
+    for f in 0..frames() {
+        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
         sys.run_frame();
     }
     let dispcnt_a = sys.read(Core::Arm9, 0x0400_0000, 4);
     let dispcnt_b = sys.read(Core::Arm9, 0x0400_1000, 4);
+    // Engine config summary (Engine B DISPCNT, its BGxCNT, and the 9 VRAMCNT bytes).
+    let bgcnt_b: Vec<u16> = (0..4).map(|i| sys.read(Core::Arm9, 0x0400_1008 + i * 2, 2) as u16).collect();
+    let vramcnt: Vec<u8> = (0..9).map(|b| sys.vram_control(b)).collect();
+    eprintln!("EngineB DISPCNT={dispcnt_b:#010x} BGCNT={bgcnt_b:04X?}  VRAMCNT={vramcnt:02X?}");
     // Both physical screens stacked vertically (top over bottom): 256 x 384.
     let mut rgb = Vec::with_capacity(256 * 384 * 3);
     for screen in 0..2 {

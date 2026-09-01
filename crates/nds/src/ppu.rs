@@ -62,6 +62,10 @@ struct Engine {
     /// The Engine's flat VRAM view: BG region at offset 0, OBJ region at
     /// [`OBJ_VIEW_BASE`].
     vram_view: Vec<u8>,
+    /// Assembled extended palettes: BG (32 KB = 4 slots × 8 KB) and OBJ (8 KB),
+    /// consulted for 8bpp layers when `DISPCNT` bits 30/31 enable them.
+    bg_ext: Vec<u8>,
+    obj_ext: Vec<u8>,
 }
 
 impl Engine {
@@ -77,6 +81,8 @@ impl Engine {
             segments: Vec::new(),
             scratch: video2d::state::Scratch::default(),
             vram_view: vec![0; VRAM_VIEW_SIZE],
+            bg_ext: vec![0; 0x8000],
+            obj_ext: vec![0; 0x2000],
         }
     }
 
@@ -127,9 +133,13 @@ impl Engine {
         if self.is_b {
             vram.assemble_engine_b_bg(bg_view);
             vram.assemble_engine_b_obj(obj_view);
+            vram.assemble_bg_ext_b(&mut self.bg_ext);
+            vram.assemble_obj_ext_b(&mut self.obj_ext);
         } else {
             vram.assemble_engine_a_bg(bg_view);
             vram.assemble_engine_a_obj(obj_view);
+            vram.assemble_bg_ext_a(&mut self.bg_ext);
+            vram.assemble_obj_ext_a(&mut self.obj_ext);
         }
 
         // Engine A adds a global 64 KB-step char/screen base from DISPCNT (bits 24-26
@@ -148,8 +158,14 @@ impl Engine {
             bg_screen_base: screen_base,
             obj_tile_base: OBJ_VIEW_BASE,
             obj_tile_boundary: 32 << ((self.dispcnt >> 20) & 3),
+            // Extended-palette enables: DISPCNT bit 30 (BG), bit 31 (OBJ).
+            bg_ext_palette: self.dispcnt & (1 << 30) != 0,
+            obj_ext_palette: self.dispcnt & (1 << 31) != 0,
+            // The DS character-base field is 4 bits (BGxCNT bits 2-5).
+            bg_char_base_mask: 0xF,
         };
-        let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam);
+        let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam)
+            .with_ext_palettes(&self.bg_ext, &self.obj_ext);
         for y in 0..HEIGHT as u16 {
             video2d::render_scanline(
                 &mut self.render_fb,

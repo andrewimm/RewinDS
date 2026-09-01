@@ -57,7 +57,7 @@ pub fn render_affine_scanline<S: ProvenanceSink>(
     let k = bg - 2; // affine parameter index: BG2 -> 0, BG3 -> 1
     let cnt = state.regs.bgcnt[bg];
     let priority = (cnt & 0x3) as u8;
-    let char_base = layout.bg_char_base + ((cnt >> 2) & 0x3) as u32 * CHARBLOCK_SIZE;
+    let char_base = layout.bg_char_base + ((cnt >> 2) as u32 & layout.bg_char_base_mask) * CHARBLOCK_SIZE;
     let screen_base = layout.bg_screen_base + ((cnt >> 8) & 0x1F) as u32 * SCREENBLOCK_SIZE;
     let wrap = cnt & (1 << 13) != 0;
     let size_px = affine_size_pixels((cnt >> 14) & 0x3);
