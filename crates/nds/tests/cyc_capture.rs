@@ -188,6 +188,35 @@ fn _half_frame() -> u64 {
     nds::ppu::CYCLES_PER_LINE * 130
 }
 
+/// Run `CYC_FRAMES` frames and dump the final Engine-A framebuffer to `CYC_OUT` as a
+/// binary PPM-ish raw (width, height, then RGB bytes) for offline inspection. Also
+/// prints the DISPCNT so we can pick a frame that has OBJ enabled.
+#[test]
+#[ignore]
+fn dump_frame() {
+    let mut sys = booted();
+    for _ in 0..frames() {
+        sys.run_frame();
+    }
+    let dispcnt = sys.read(Core::Arm9, 0x0400_0000, 4);
+    let fb = sys.framebuffer();
+    let mut rgb = Vec::with_capacity(fb.len() * 3);
+    for &p in fb {
+        // BGR555 -> RGB888 (5-bit channels scaled to 8-bit).
+        let r = (p & 0x1F) as u8;
+        let g = ((p >> 5) & 0x1F) as u8;
+        let b = ((p >> 10) & 0x1F) as u8;
+        rgb.push((r << 3) | (r >> 2));
+        rgb.push((g << 3) | (g >> 2));
+        rgb.push((b << 3) | (b >> 2));
+    }
+    let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
+    let mut ppm = format!("P6\n256 192\n255\n").into_bytes();
+    ppm.extend_from_slice(&rgb);
+    std::fs::write(&out, ppm).unwrap();
+    eprintln!("frame {} DISPCNT={dispcnt:#010x} -> {out}", frames());
+}
+
 /// Report DISPCNT + non-black pixel count each frame (has the game reached display?).
 #[test]
 #[ignore]

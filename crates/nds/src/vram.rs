@@ -82,11 +82,23 @@ impl Vram {
     /// reads a flat slice offset from the region base — sees the banked memory as
     /// one image. Blocks routed elsewhere contribute nothing.
     pub fn assemble_engine_a_bg(&self, out: &mut [u8]) {
+        self.assemble_region(out, 0x0600_0000, 0x0608_0000);
+    }
+
+    /// Assemble the Engine-A OBJ region (`0x0640_0000`-`0x0643_FFFF`, `MST 2`) into
+    /// `out`, offset from the region base, for the shared renderer's OBJ tile fetch.
+    pub fn assemble_engine_a_obj(&self, out: &mut [u8]) {
+        self.assemble_region(out, 0x0640_0000, 0x0644_0000);
+    }
+
+    /// Gather every enabled bank whose mapped base falls in `[lo, hi)` into `out`,
+    /// each at `base - lo`. Banks routed elsewhere contribute nothing.
+    fn assemble_region(&self, out: &mut [u8], lo: u32, hi: u32) {
         out.fill(0);
         for bank in 0..9 {
             if let Some((base, size)) = self.mapped_range(bank) {
-                if (0x0600_0000..0x0608_0000).contains(&base) {
-                    let off = (base - 0x0600_0000) as usize;
+                if (lo..hi).contains(&base) {
+                    let off = (base - lo) as usize;
                     let n = (size as usize)
                         .min(self.banks[bank].len())
                         .min(out.len().saturating_sub(off));

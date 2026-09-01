@@ -20,6 +20,12 @@ use crate::vram::Vram;
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 192;
 
+/// Offset of the Engine A OBJ region inside [`Ppu::vram_view`] (after the 512 KB BG
+/// region). Also the renderer's `obj_tile_base`.
+const OBJ_VIEW_BASE: u32 = 0x8_0000;
+/// Size of the flat view: 512 KB BG + 256 KB OBJ.
+const VRAM_VIEW_SIZE: usize = 0xC_0000;
+
 /// Total scanlines per frame (192 visible + 71 blank).
 const TOTAL_LINES: u16 = 263;
 /// Master ticks per dot (67.03 MHz / 5.585664 MHz).
@@ -59,8 +65,11 @@ pub struct Ppu {
     affine: video2d::state::AffineInternalState,
     segments: Vec<video2d::state::ScanlineSegment>,
     scratch: video2d::state::Scratch,
-    /// Reused contiguous view of the Engine A BG VRAM region (up to 512 KB).
-    bg_vram: Vec<u8>,
+    /// Reused flat view the shared renderer reads: the Engine A BG region (512 KB)
+    /// at offset 0, then the Engine A OBJ region (256 KB) at [`OBJ_VIEW_BASE`]. The
+    /// renderer's `bg_char_base`/`bg_screen_base` index the BG half; `obj_tile_base`
+    /// points at the OBJ half.
+    vram_view: Vec<u8>,
     started: bool,
 }
 
@@ -84,7 +93,7 @@ impl Ppu {
             affine: video2d::state::AffineInternalState::default(),
             segments: Vec::new(),
             scratch: video2d::state::Scratch::default(),
-            bg_vram: vec![0; 0x8_0000],
+            vram_view: vec![0; VRAM_VIEW_SIZE],
             started: false,
         }
     }
@@ -113,9 +122,12 @@ impl Ppu {
         } else {
             self.dispcnt = (self.dispcnt & !0xFFFF) | (value & 0xFFFF);
         }
-        // Mirror the low half into the shared register snapshot (the DS shares the
-        // GBA's low DISPCNT bits: BG mode and per-layer enables).
-        self.registers.dispcnt = self.dispcnt as u16;
+        // Mirror the low half into the shared register snapshot. The DS shares the
+        // GBA's low DISPCNT bits (BG mode, per-layer enables) EXCEPT the OBJ tile
+        // mapping bit: DS = bit 4, the renderer expects the GBA's bit 6. Translate it.
+        let low = self.dispcnt as u16;
+        let obj_1d = (low >> 4) & 1;
+        self.registers.dispcnt = (low & !(1 << 6)) | (obj_1d << 6);
     }
 
     /// Write into the Engine A 2D register block (`BGxCNT` … `BLDY`, offset
@@ -240,17 +252,21 @@ impl Ppu {
             &mut self.latched,
             &mut self.segments,
         );
-        vram.assemble_engine_a_bg(&mut self.bg_vram);
+        let (bg_view, obj_view) = self.vram_view.split_at_mut(OBJ_VIEW_BASE as usize);
+        vram.assemble_engine_a_bg(bg_view);
+        vram.assemble_engine_a_obj(obj_view);
 
         // DS char/screen bases: BGxCNT (handled inside the renderer) plus the
-        // 64 KB-step offsets from DISPCNT (bits 24-26 char, 27-29 screen). OBJ
-        // VRAM is a separate region, not yet assembled, so its base stays 0.
+        // 64 KB-step offsets from DISPCNT (bits 24-26 char, 27-29 screen). OBJ tiles
+        // live in the OBJ half of the flat view.
         let layout = video2d::VramLayout {
             bg_char_base: ((self.dispcnt >> 24) & 7) * 0x1_0000,
             bg_screen_base: ((self.dispcnt >> 27) & 7) * 0x1_0000,
-            obj_tile_base: 0,
+            obj_tile_base: OBJ_VIEW_BASE,
+            // DS tile-OBJ 1D boundary (DISPCNT bits 20-21): 32/64/128/256 bytes.
+            obj_tile_boundary: 32 << ((self.dispcnt >> 20) & 3),
         };
-        let mem = video2d::PpuMemoryView::new(&self.bg_vram, palette, oam);
+        let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam);
         for y in 0..HEIGHT as u16 {
             video2d::render_scanline(
                 &mut self.render_fb,

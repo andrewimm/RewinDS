@@ -32,16 +32,27 @@ fn texel_address(
     ty: u32,
     one_dim: bool,
     obj_tile_base: u32,
+    obj_tile_boundary: u32,
 ) -> (u16, u32) {
     let is_8bpp = matches!(sprite.color_mode, ObjColorMode::Bpp8);
     let units_per_tile = if is_8bpp { 2 } else { 1 };
     let tiles_wide = (sprite.width / 8) as u32;
     let (tile_col, tile_row) = (tx / 8, ty / 8);
-    let row_stride = if one_dim { tiles_wide * units_per_tile } else { 32 };
-    let tile_number =
-        (sprite.tile_number as u32 + tile_row * row_stride + tile_col * units_per_tile) & 0x3FF;
-
-    let tile_base = obj_tile_base + tile_number * 32;
+    let base = sprite.tile_number as u32;
+    let (tile_number, tile_base) = if one_dim {
+        // 1D: the base tile number scales by the mapping boundary; tiles within the
+        // sprite step 32 bytes (4bpp) / 64 (8bpp) in row-major order. With the GBA's
+        // 32-byte boundary this reduces to the old `(base + within) * 32`.
+        let within = (tile_row * tiles_wide + tile_col) * units_per_tile;
+        (
+            (base + within) & 0x3FF,
+            obj_tile_base + base * obj_tile_boundary + within * 32,
+        )
+    } else {
+        // 2D: a 32-tile-wide grid at 32-byte granularity (the GBA layout).
+        let tn = (base + tile_row * 32 + tile_col * units_per_tile) & 0x3FF;
+        (tn, obj_tile_base + tn * 32)
+    };
     let (px, py) = (tx % 8, ty % 8);
     let byte_offset = if is_8bpp {
         tile_base + py * 8 + px
@@ -148,7 +159,7 @@ pub fn rasterize<S: ProvenanceSink>(
                 continue;
             };
             let (tile_number, byte_offset) =
-                texel_address(sprite, tx, ty, one_dim, layout.obj_tile_base);
+                texel_address(sprite, tx, ty, one_dim, layout.obj_tile_base, layout.obj_tile_boundary);
             let texel = sample_texel(sprite, byte_offset, tx, mem);
             if texel == 0 {
                 continue; // transparent texel contributes nothing
@@ -270,9 +281,9 @@ mod tests {
     fn tile_row_stride_differs_between_1d_and_2d() {
         let sprite = square_sprite(16, ObjMode::Normal); // 16×16 = 2×2 tiles, 4bpp
         // Texel (0, 8) is the first texel of tile row 1.
-        let (tile_1d, _) = texel_address(&sprite, 0, 8, true, 0x1_0000);
+        let (tile_1d, _) = texel_address(&sprite, 0, 8, true, 0x1_0000, 32);
         assert_eq!(tile_1d, 2); // row stride = tiles_wide(2) * 1
-        let (tile_2d, _) = texel_address(&sprite, 0, 8, false, 0x1_0000);
+        let (tile_2d, _) = texel_address(&sprite, 0, 8, false, 0x1_0000, 32);
         assert_eq!(tile_2d, 32); // row stride = 32
     }
 }

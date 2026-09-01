@@ -21,15 +21,21 @@ pub struct VramLayout {
     pub bg_screen_base: u32,
     /// Byte offset of the OBJ tile region within the VRAM slice.
     pub obj_tile_base: u32,
+    /// Bytes an OAM tile-number step spans for 1D-mapped sprites. The GBA fixes this
+    /// at 32; the DS scales it by `DISPCNT[20:21]` (32/64/128/256). Only the sprite's
+    /// base tile number is scaled by this — tiles *within* a sprite stay 32-byte
+    /// (4bpp) packed.
+    pub obj_tile_boundary: u32,
 }
 
 impl VramLayout {
-    /// The GBA layout: no global BG base, OBJ tiles at `0x1_0000`.
+    /// The GBA layout: no global BG base, OBJ tiles at `0x1_0000`, 32-byte boundary.
     pub const fn gba() -> Self {
         VramLayout {
             bg_char_base: 0,
             bg_screen_base: 0,
             obj_tile_base: 0x1_0000,
+            obj_tile_boundary: 32,
         }
     }
 }
