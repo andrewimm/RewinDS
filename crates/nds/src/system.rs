@@ -262,6 +262,8 @@ pub struct Machine {
     pub(crate) rtc: crate::rtc::Rtc,
     /// The 16-channel sound engine (`0x4000400`-`0x400051F`, ARM7).
     pub(crate) sound: crate::sound::Sound,
+    /// The ARM9 3D graphics engine (geometry command FIFO + rasterizer).
+    pub(crate) gpu3d: gpu3d::Gpu3d,
     /// The ARM9 hardware division and square-root units.
     pub(crate) math: crate::math::Math,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
@@ -315,6 +317,7 @@ impl Machine {
             spi: crate::spi::Spi::new(),
             rtc: crate::rtc::Rtc::new(),
             sound: crate::sound::Sound::new(),
+            gpu3d: gpu3d::Gpu3d::new(),
             math: crate::math::Math::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
@@ -459,6 +462,14 @@ impl Machine {
         if core == Core::Arm7 && (0x0400_0400..0x0400_0520).contains(&addr) {
             return self.sound.read(addr - 0x0400_0000, bytes);
         }
+        // 3D/geometry registers (ARM9): DISP3DCNT, the clear/fog/toon control block,
+        // GXFIFO + command ports, GXSTAT, and matrix/test results. Sound occupies the
+        // same 0x4000400 range on the ARM7, so this is ARM9-gated.
+        if core == Core::Arm9
+            && (addr == 0x0400_0060 || (0x0400_0320..0x0400_06A8).contains(&addr))
+        {
+            return self.gpu3d.read_register(addr - 0x0400_0000, bytes);
+        }
         // 2D engine register blocks (ARM9): Engine A at 0x4000008, Engine B at
         // 0x4001008. `addr & 0xFFF` is the offset within the engine's block.
         if core == Core::Arm9
@@ -562,6 +573,18 @@ impl Machine {
         // Sound registers (ARM7): 16 channels + SOUNDCNT/SOUNDBIAS.
         if core == Core::Arm7 && (0x0400_0400..0x0400_0520).contains(&addr) {
             self.sound.write(addr - 0x0400_0000, value, bytes);
+            return;
+        }
+        // 3D/geometry registers (ARM9): DISP3DCNT, clear/fog/toon control, GXFIFO +
+        // command ports, GXSTAT. ARM9-gated (sound shares 0x4000400 on the ARM7).
+        if core == Core::Arm9
+            && (addr == 0x0400_0060 || (0x0400_0320..0x0400_06A8).contains(&addr))
+        {
+            self.gpu3d.write_register(addr - 0x0400_0000, value, bytes);
+            // TODO(geometry phase): the geometry engine will drain the FIFO on a
+            // schedule. Until it exists, discard buffered commands so a full FIFO
+            // never stalls the CPU and GXSTAT reads as idle.
+            self.gpu3d.discard_fifo();
             return;
         }
         // The VRAMCNT_A..I block (with WRAMCNT sharing address 0x4000247), all

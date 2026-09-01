@@ -1,0 +1,7 @@
+[package]
+name = "gpu3d"
+version = "0.1.0"
+edition = "2021"
+description = "DS 3D graphics engine: fixed-point geometry pipeline and software scanline rasterizer"
+
+[dependencies]

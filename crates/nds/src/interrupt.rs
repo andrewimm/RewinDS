@@ -30,6 +30,8 @@ pub enum IrqSource {
     IpcRecvNotEmpty = 18,
     /// A gamecard block transfer completed (`AUXSPICNT` bit 14 enables it).
     Gamecard = 19,
+    /// The 3D geometry command FIFO reached its `GXSTAT` IRQ condition (ARM9 only).
+    GxFifo = 21,
 }
 
 impl IrqSource {

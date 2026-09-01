@@ -14,6 +14,7 @@ cyctrace = []
 arm = { path = "../arm" }
 emu-core = { path = "../emu-core" }
 video2d = { path = "../video2d" }
+gpu3d = { path = "../gpu3d" }
 
 [dev-dependencies]
 arm = { path = "../arm" }
