@@ -25,14 +25,15 @@ pub fn generate<S: ProvenanceSink>(
     if state.forced_blank() || !state.obj_enabled() {
         return;
     }
-    evaluate::evaluate_scanline(y, state, mem, &mut scratch.sprites);
+    evaluate::evaluate_scanline(y, state, mem, &layout, &mut scratch.sprites);
     rasterize::rasterize(y, state, mem, width, layout, &scratch.sprites, &mut scratch.obj, sink);
 }
 
 #[cfg(test)]
 mod tests {
     use super::evaluate::evaluate_scanline;
-    use crate::memory::TestMemory as Memory;
+    use crate::debug::provenance::ObjColorMode;
+    use crate::memory::{ModeSemantics, TestMemory as Memory, VramLayout};
     use crate::debug::provenance::SourceProvenance;
     use crate::debug::sink::NullSink;
     use crate::state::{Color15, LayerId};
@@ -182,6 +183,30 @@ mod tests {
         assert_eq!(ppu.framebuffer()[0], Color15(0x03E0));
     }
 
+    /// OBJ mode 3 is prohibited on the GBA (skipped) but selects the direct-color
+    /// bitmap OBJ on the DS, taking attr2 bits 12-15 as the OAM alpha.
+    #[test]
+    fn ds_selects_bitmap_obj_where_gba_prohibits_mode_3() {
+        let mut mem = Memory::default();
+        for i in 0..128 {
+            set_oam(&mut mem, i, 1 << 9, 0, 0); // disable every sprite (a zeroed entry is visible)
+        }
+        set_oam(&mut mem, 0, 3 << 10, 0, (5 << 12) | 1); // index 0: mode 3, alpha 5, tile 1
+        let view = mem.view();
+        let mut ppu = Ppu::new();
+        ppu.write_dispcnt(OBJ_1D);
+        ppu.latch_for_scanline();
+        let mut out = Vec::new();
+
+        evaluate_scanline(0, &ppu.latched, &view, &VramLayout::gba(), &mut out);
+        assert!(out.is_empty(), "GBA treats mode 3 as prohibited");
+
+        let ds = VramLayout { mode_semantics: ModeSemantics::Ds, ..VramLayout::gba() };
+        evaluate_scanline(0, &ppu.latched, &view, &ds, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].color_mode, ObjColorMode::Bitmap { alpha: 5 }));
+    }
+
     /// The per-scanline budget rejects sprites once exhausted.
     #[test]
     fn hardware_budget_limits_sprites_per_line() {
@@ -195,7 +220,7 @@ mod tests {
         ppu.latch_for_scanline();
         let view = mem.view();
         let mut out = Vec::new();
-        evaluate_scanline(0, &ppu.latched, &view, &mut out);
+        evaluate_scanline(0, &ppu.latched, &view, &VramLayout::gba(), &mut out);
         // floor(1210 / 64) = 18 sprites fit.
         assert_eq!(out.len(), 18);
     }

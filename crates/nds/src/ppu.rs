@@ -170,6 +170,11 @@ impl Engine {
             // Extended-palette enables: DISPCNT bit 30 (BG), bit 31 (OBJ).
             bg_ext_palette: self.dispcnt & (1 << 30) != 0,
             obj_ext_palette: self.dispcnt & (1 << 31) != 0,
+            // Bitmap-OBJ mapping (DISPCNT bit 6 = 1D/2D, bit 5 = 256-dot width, bit 22 =
+            // 256-byte 1D boundary — Engine A only; Engine B's 1D boundary is fixed at 128).
+            obj_bitmap_1d: self.dispcnt & (1 << 6) != 0,
+            obj_bitmap_boundary: if !self.is_b && self.dispcnt & (1 << 22) != 0 { 256 } else { 128 },
+            obj_bitmap_wide: self.dispcnt & (1 << 5) != 0,
             // The DS character-base field is 4 bits (BGxCNT bits 2-5).
             bg_char_base_mask: 0xF,
             mode_semantics: video2d::ModeSemantics::Ds,

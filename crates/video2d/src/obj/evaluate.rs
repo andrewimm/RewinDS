@@ -6,7 +6,7 @@
 //! without entangling them with texel sampling.
 
 use crate::debug::provenance::{ObjColorMode, ObjMode};
-use crate::memory::PpuMemoryView;
+use crate::memory::{ModeSemantics, PpuMemoryView, VramLayout};
 use crate::state::LatchedState;
 
 /// A sprite found visible on the scanline being evaluated.
@@ -89,11 +89,14 @@ pub fn evaluate_scanline(
     y: u16,
     state: &LatchedState,
     mem: &PpuMemoryView,
+    layout: &VramLayout,
     out: &mut SpriteList,
 ) {
     out.clear();
     let mut spent = 0u32;
     let limit = budget(state);
+    // OBJ mode 3 is prohibited on the GBA but selects the direct-color bitmap OBJ on the DS.
+    let is_ds = layout.mode_semantics == ModeSemantics::Ds;
 
     for index in 0..128u8 {
         let base = index as usize * 8;
@@ -107,10 +110,13 @@ pub fn evaluate_scanline(
             continue;
         }
         let shape = (attr0 >> 14) & 0x3;
+        // A DS bitmap OBJ (mode 3) composites as an ordinary OBJ carrying its own alpha
+        // (see `color_mode` below); its mode field is only the bitmap selector.
+        let bitmap = (attr0 >> 10) & 0x3 == 3 && is_ds;
         let obj_mode = match (attr0 >> 10) & 0x3 {
             1 => ObjMode::SemiTransparent,
             2 => ObjMode::ObjWindow,
-            3 => continue, // prohibited
+            3 if !is_ds => continue, // prohibited on the GBA
             _ => ObjMode::Normal,
         };
         if shape == 3 {
@@ -141,7 +147,13 @@ pub fn evaluate_scanline(
             break;
         }
 
-        let color_mode = if attr0 & (1 << 13) != 0 {
+        // Bitmap OBJs are direct-color and reuse attr2 bits 12-15 as the alpha value
+        // (not a palette bank); the color-depth bit (attr0 bit 13) is ignored for them.
+        let color_mode = if bitmap {
+            ObjColorMode::Bitmap {
+                alpha: ((attr2 >> 12) & 0xF) as u8,
+            }
+        } else if attr0 & (1 << 13) != 0 {
             ObjColorMode::Bpp8
         } else {
             ObjColorMode::Bpp4 {

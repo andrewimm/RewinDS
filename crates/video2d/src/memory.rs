@@ -32,6 +32,15 @@ pub struct VramLayout {
     /// DS: 8bpp sprites resolve through the OBJ extended palette (`DISPCNT` bit 31).
     /// Always false on the GBA.
     pub obj_ext_palette: bool,
+    /// DS direct-color bitmap OBJ mapping (`DISPCNT` bit 6): 1D (`true`) vs 2D (`false`).
+    /// 1D stores each sprite's bitmap contiguously; 2D windows into a fixed-width bitmap.
+    pub obj_bitmap_1d: bool,
+    /// DS 1D bitmap-OBJ boundary in bytes (`DISPCNT` bit 22: 128 or 256; Engine B is 128).
+    /// The base texel address is `tile_number * boundary`.
+    pub obj_bitmap_boundary: u32,
+    /// DS 2D bitmap-OBJ source width (`DISPCNT` bit 5): `false` = 128 dots, `true` = 256.
+    /// Sets the 2D tile-number X mask (0x0F / 0x1F) and the underlying bitmap row stride.
+    pub obj_bitmap_wide: bool,
     /// Mask applied to `BGxCNT >> 2` for the character-base block. The GBA uses 2 bits
     /// (`0x3`, blocks 0-3); the DS uses 4 (`0xF`) — its BGxCNT bits 4-5 are the char
     /// base MSBs, which the GBA requires to be zero, so `0xF` stays GBA-identical.
@@ -61,6 +70,9 @@ impl VramLayout {
             obj_tile_boundary: 32,
             bg_ext_palette: false,
             obj_ext_palette: false,
+            obj_bitmap_1d: false,
+            obj_bitmap_boundary: 128,
+            obj_bitmap_wide: false,
             bg_char_base_mask: 0x3,
             mode_semantics: ModeSemantics::Gba,
         }

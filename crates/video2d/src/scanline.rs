@@ -182,7 +182,7 @@ mod generalization_tests {
     #[test]
     fn bg_base_offsets_shift_the_sampled_addresses() {
         let mut ppu = TestPpu::new();
-        ppu.layout = VramLayout { bg_char_base: 0x8000, bg_screen_base: 0x4000, obj_tile_base: 0x1_0000, obj_tile_boundary: 32, bg_ext_palette: false, obj_ext_palette: false, bg_char_base_mask: 0x3, mode_semantics: crate::memory::ModeSemantics::Gba };
+        ppu.layout = VramLayout { bg_char_base: 0x8000, bg_screen_base: 0x4000, ..VramLayout::gba() };
         ppu.write_dispcnt(0x0100); // mode 0, BG0 enabled
         ppu.registers.bgcnt[0] = 0; // char base 0, screen base 0
 
@@ -206,7 +206,7 @@ mod generalization_tests {
     #[test]
     fn obj_tile_base_is_honored() {
         let mut ppu = TestPpu::new();
-        ppu.layout = VramLayout { bg_char_base: 0, bg_screen_base: 0, obj_tile_base: 0x2_0000, obj_tile_boundary: 32, bg_ext_palette: false, obj_ext_palette: false, bg_char_base_mask: 0x3, mode_semantics: crate::memory::ModeSemantics::Gba };
+        ppu.layout = VramLayout { obj_tile_base: 0x2_0000, ..VramLayout::gba() };
         ppu.write_dispcnt((1 << 12) | (1 << 6)); // OBJ enabled, 1D mapping
 
         let mut mem = TestMemory::new();

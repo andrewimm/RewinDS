@@ -11,7 +11,7 @@ use crate::debug::explain::CandidateExplanation;
 use crate::debug::provenance::{ObjColorMode, ObjMode, ObjProvenance, SourceProvenance};
 use crate::debug::sink::ProvenanceSink;
 use crate::memory::{PpuMemoryView, VramLayout, PALETTE_BASE, VRAM_BASE};
-use crate::state::{CandidatePixel, LatchedState, LayerId, ObjLine, PixelFlags};
+use crate::state::{CandidatePixel, Color15, LatchedState, LayerId, ObjLine, PixelFlags};
 
 /// Palette entries 0..=255 are backgrounds; OBJ palettes start at entry 256.
 const OBJ_PALETTE_BASE: usize = 256;
@@ -62,6 +62,21 @@ fn texel_address(
     (tile_number as u16, byte_offset)
 }
 
+/// Byte offset of a direct-color bitmap-OBJ texel `(tx, ty)` within the sprite. In 1D
+/// mapping the sprite's bitmap is stored contiguously (`base = tile_number * boundary`,
+/// row stride = sprite width); in 2D the sprite is a window into a fixed-width (128- or
+/// 256-dot) bitmap, its base split into X/Y by the tile-number mask (GBATEK).
+fn bitmap_byte_offset(sprite: &SpriteInstance, tx: u32, ty: u32, layout: VramLayout) -> u32 {
+    let tile = sprite.tile_number as u32;
+    let (base, stride) = if layout.obj_bitmap_1d {
+        (tile * layout.obj_bitmap_boundary, sprite.width as u32)
+    } else {
+        let (mask_x, src_width) = if layout.obj_bitmap_wide { (0x1F, 256) } else { (0x0F, 128) };
+        ((tile & mask_x) * 0x10 + (tile & !mask_x) * 0x80, src_width)
+    };
+    layout.obj_tile_base + base + (ty * stride + tx) * 2
+}
+
 /// Sample a sprite texel; returns the raw palette value (0 = transparent).
 fn sample_texel(sprite: &SpriteInstance, byte_offset: u32, tx: u32, mem: &PpuMemoryView) -> u8 {
     let byte = mem.vram_u8(byte_offset as usize);
@@ -74,6 +89,8 @@ fn sample_texel(sprite: &SpriteInstance, byte_offset: u32, tx: u32, mem: &PpuMem
                 byte >> 4
             }
         }
+        // Bitmap OBJs are direct-color: sampled in the rasterize loop, never here.
+        ObjColorMode::Bitmap { .. } => 0,
     }
 }
 
@@ -85,6 +102,8 @@ fn palette_entry(sprite: &SpriteInstance, texel: u8) -> usize {
         ObjColorMode::Bpp4 { palette_bank } => {
             OBJ_PALETTE_BASE + palette_bank as usize * 16 + texel as usize
         }
+        // Bitmap OBJs carry no palette; direct color is resolved in the rasterize loop.
+        ObjColorMode::Bitmap { .. } => OBJ_PALETTE_BASE,
     }
 }
 
@@ -158,12 +177,45 @@ pub fn rasterize<S: ProvenanceSink>(
             let Some((tx, ty)) = texture_coord(sprite, col_src, line_src, mem) else {
                 continue;
             };
-            let (tile_number, byte_offset) =
-                texel_address(sprite, tx, ty, one_dim, layout.obj_tile_base, layout.obj_tile_boundary);
-            let texel = sample_texel(sprite, byte_offset, tx, mem);
-            if texel == 0 {
-                continue; // transparent texel contributes nothing
-            }
+
+            // Sample the sprite pixel. A direct-color bitmap OBJ reads a 16-bit BGR555
+            // texel whose bit 15 is the opacity flag; a paletted OBJ indexes the OBJ
+            // palette. Both paths yield the final color, an intrinsic per-object alpha
+            // (bitmap only), and the source addresses kept for provenance.
+            let (color, obj_alpha, texel, entry, tile_number, byte_offset) = if let ObjColorMode::Bitmap {
+                alpha,
+            } = sprite.color_mode
+            {
+                let byte_offset = bitmap_byte_offset(sprite, tx, ty, layout);
+                let raw = mem.vram_u16(byte_offset as usize);
+                if raw & 0x8000 == 0 {
+                    continue; // bit 15 clear → transparent texel
+                }
+                (Color15(raw & 0x7FFF), Some(alpha), 0u8, 0usize, sprite.tile_number, byte_offset)
+            } else {
+                let (tile_number, byte_offset) = texel_address(
+                    sprite,
+                    tx,
+                    ty,
+                    one_dim,
+                    layout.obj_tile_base,
+                    layout.obj_tile_boundary,
+                );
+                let texel = sample_texel(sprite, byte_offset, tx, mem);
+                if texel == 0 {
+                    continue; // transparent texel contributes nothing
+                }
+                let entry = palette_entry(sprite, texel);
+                let color = if matches!(sprite.color_mode, ObjColorMode::Bpp8) && layout.obj_ext_palette {
+                    // Extended OBJ palette: attr2 bits 12-15 select the 256-color
+                    // sub-palette (an 8bpp sprite otherwise uses the whole byte as an
+                    // index into the single standard OBJ palette).
+                    mem.obj_ext15(sprite.palette_bank as usize, texel as usize)
+                } else {
+                    mem.palette15(entry)
+                };
+                (color, None, texel, entry, tile_number, byte_offset)
+            };
 
             // Object-window sprites only mark the mask.
             if is_window {
@@ -180,15 +232,6 @@ pub fn rasterize<S: ProvenanceSink>(
                 }
             }
 
-            let entry = palette_entry(sprite, texel);
-            let color = if matches!(sprite.color_mode, ObjColorMode::Bpp8) && layout.obj_ext_palette {
-                // Extended OBJ palette: attr2 bits 12-15 select the 256-color
-                // sub-palette (an 8bpp sprite otherwise uses the whole byte as an
-                // index into the single standard OBJ palette).
-                mem.obj_ext15(sprite.palette_bank as usize, texel as usize)
-            } else {
-                mem.palette15(entry)
-            };
             let candidate = CandidatePixel {
                 color,
                 layer: LayerId::Obj,
@@ -197,6 +240,7 @@ pub fn rasterize<S: ProvenanceSink>(
                     semi_transparent_obj: semi,
                     obj_window: false,
                     mosaic: sprite.mosaic,
+                    obj_alpha,
                     ..PixelFlags::default()
                 },
             };
@@ -263,6 +307,54 @@ mod tests {
             attr1: 0,
             attr2: 0,
         }
+    }
+
+    fn bitmap_sprite(size: u16, alpha: u8) -> SpriteInstance {
+        SpriteInstance {
+            color_mode: ObjColorMode::Bitmap { alpha },
+            ..square_sprite(size, ObjMode::Normal)
+        }
+    }
+
+    fn ds_bitmap_layout(one_dim: bool, wide: bool) -> VramLayout {
+        VramLayout {
+            mode_semantics: crate::memory::ModeSemantics::Ds,
+            obj_bitmap_1d: one_dim,
+            obj_bitmap_wide: wide,
+            ..VramLayout::gba()
+        }
+    }
+
+    /// A DS direct-color bitmap OBJ renders its 15-bit color; bit 15 is the opacity flag.
+    #[test]
+    fn bitmap_obj_renders_direct_color_and_honors_opacity_flag() {
+        let mut mem = Memory::default();
+        let base = 0x1_0000; // obj_tile_base, tile_number 0
+        // Texel (0,0): opaque red (bit 15 set). Texel (1,0): red but bit 15 clear.
+        mem.vram[base..base + 2].copy_from_slice(&(0x8000u16 | 0x001F).to_le_bytes());
+        mem.vram[base + 2..base + 4].copy_from_slice(&0x001Fu16.to_le_bytes());
+        let view = mem.view();
+        let regs = Registers { dispcnt: 1 << 12, ..Default::default() };
+        let state = LatchedState::from_registers(&regs);
+        let sprites = vec![bitmap_sprite(8, 15)];
+        let mut obj = ObjLine::default();
+
+        rasterize(0, &state, &view, 240, ds_bitmap_layout(true, false), &sprites, &mut obj, &mut NullSink);
+        assert_eq!(obj.pixels[0].unwrap().color, Color15(0x001F), "opaque red, bit 15 stripped");
+        assert!(obj.pixels[1].is_none(), "bit-15-clear texel is transparent");
+    }
+
+    /// 2D bitmap mapping windows into a fixed-width bitmap: the tile number splits into
+    /// X/Y (maskX 0x0F at 128-dot width) and the row stride is the source width.
+    #[test]
+    fn bitmap_2d_addressing_splits_tile_number_and_strides_by_source_width() {
+        let layout = ds_bitmap_layout(false, false); // 2D, 128-dot width → 256-byte stride
+        let s = bitmap_sprite(16, 15); // tile_number 0
+        assert_eq!(bitmap_byte_offset(&s, 3, 0, layout), layout.obj_tile_base + 6); // 3 texels right
+        assert_eq!(bitmap_byte_offset(&s, 0, 1, layout), layout.obj_tile_base + 256); // next row
+        let s2 = SpriteInstance { tile_number: 0x11, ..s }; // X=1, Y=1
+        // base = (0x11 & 0x0F)*0x10 + (0x11 & !0x0F)*0x80 = 0x10 + 0x800.
+        assert_eq!(bitmap_byte_offset(&s2, 0, 0, layout), layout.obj_tile_base + 0x810);
     }
 
     /// An object-window sprite marks the window mask but contributes no color.

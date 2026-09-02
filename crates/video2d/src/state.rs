@@ -92,6 +92,11 @@ pub struct PixelFlags {
     pub obj_window: bool,
     /// The pixel was produced through the mosaic sampler.
     pub mosaic: bool,
+    /// A DS direct-color bitmap OBJ's per-object alpha (OAM attr2 bits 12-15, 0-15). Like
+    /// [`Self::three_d_alpha`] it is intrinsic to the pixel: [`crate::effects`] blends the
+    /// OBJ over the layer behind it with `EVA = alpha+1`, `EVB = 15−alpha` (the DS's own
+    /// blend formula) instead of `BLDALPHA`. `None` for paletted OBJs and every other pixel.
+    pub obj_alpha: Option<u8>,
     /// The pixel comes from the DS 3D engine (composited as Engine A's BG0), carrying
     /// its 5-bit coverage alpha (`Some(0..=31)`, `31` = opaque). Set for **every** 3D
     /// pixel — [`crate::effects`] needs it to blend the 3D layer over the 2D behind it

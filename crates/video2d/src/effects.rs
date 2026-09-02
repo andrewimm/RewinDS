@@ -125,6 +125,27 @@ pub fn apply(
         };
     }
 
+    // A DS direct-color bitmap OBJ blends with the layer behind it using its OWN
+    // per-object alpha (OAM attr2 bits 12-15) as the coefficient — EVA = alpha+1,
+    // EVB = 15−alpha (the DS's blend formula) — not BLDALPHA. alpha 15 is opaque
+    // (EVA=16/EVB=0) and falls through to the plain top color below.
+    if let Some(a) = top.flags.obj_alpha {
+        if a < 15 && is_second_target(regs, second.layer) {
+            let oeva = a as u16 + 1;
+            let oevb = 15 - a as u16;
+            return EffectResult {
+                color: alpha_blend(top.color, second.color, oeva, oevb),
+                mode: EffectMode::Alpha,
+                applied: AppliedEffect::Alpha {
+                    first: top.layer,
+                    second: second.layer,
+                    eva: oeva as u8,
+                    evb: oevb as u8,
+                },
+            };
+        }
+    }
+
     match (regs.bldcnt >> 6) & 0x3 {
         // Alpha blend via BLDALPHA: top a first target, second a second target. The 3D
         // layer is excluded — its blend already ran above with its own coefficients (and
@@ -222,6 +243,36 @@ mod tests {
         let out = apply(top, top, &regs, false);
         assert_eq!(out.color, Color15(0x0000));
         assert!(matches!(out.mode, EffectMode::None));
+    }
+
+    #[test]
+    fn bitmap_obj_alpha_blends_over_second_target() {
+        // A DS bitmap OBJ (obj_alpha = 7) blends with its own coefficient EVA=8/EVB=8 —
+        // half OBJ, half the layer behind — regardless of BLDALPHA.
+        let regs = Registers {
+            bldcnt: 1 << 9, // second target = BG1; effect mode 0 (none)
+            ..Default::default()
+        };
+        let mut obj = pixel(0x001F, LayerId::Obj); // red
+        obj.flags.obj_alpha = Some(7);
+        let below = pixel(0x7C00, LayerId::Bg1); // blue
+        let out = apply(obj, below, &regs, true);
+        assert!(matches!(out.mode, EffectMode::Alpha));
+        assert_eq!(out.color, pack(15, 0, 15)); // 31*8/16 red + 31*8/16 blue
+    }
+
+    #[test]
+    fn bitmap_obj_alpha_15_is_opaque() {
+        // alpha = 15 → EVA=16/EVB=0: the OBJ passes through unblended.
+        let regs = Registers {
+            bldcnt: 1 << 9,
+            ..Default::default()
+        };
+        let mut obj = pixel(0x001F, LayerId::Obj);
+        obj.flags.obj_alpha = Some(15);
+        let below = pixel(0x7C00, LayerId::Bg1);
+        let out = apply(obj, below, &regs, true);
+        assert_eq!(out.color, Color15(0x001F));
     }
 
     #[test]

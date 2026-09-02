@@ -64,6 +64,10 @@ pub enum ObjMode {
 pub enum ObjColorMode {
     Bpp4 { palette_bank: u8 },
     Bpp8,
+    /// NDS direct-color bitmap OBJ (`OBJ` mode 3): each texel is a 16-bit BGR555 value
+    /// with bit 15 as the per-pixel opacity flag (0 = transparent). `alpha` is the
+    /// per-object OAM alpha (attr2 bits 12-15, 0-15), the blend coefficient.
+    Bitmap { alpha: u8 },
 }
 
 /// The backdrop: palette entry 0, shown where nothing else is opaque.
