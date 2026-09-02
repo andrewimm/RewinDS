@@ -876,8 +876,8 @@ impl System {
     }
 
     /// `DISP3DCNT` plus each sealed polygon's `(texture format, polygon alpha, blend
-    /// mode)` — for debugging the translucency/texture path.
-    pub fn gpu3d_poly_summary(&self) -> (u16, Vec<(u8, u8, u8)>) {
+    /// mode, texcoord-transform mode)` — for debugging the translucency/texture path.
+    pub fn gpu3d_poly_summary(&self) -> (u16, Vec<(u8, u8, u8, u8)>) {
         let rl = self.machine.gpu3d.render_list();
         let polys = rl
             .polygons()
@@ -886,7 +886,8 @@ impl System {
                 let fmt = ((p.tex_param >> 26) & 7) as u8;
                 let alpha = ((p.attr >> 16) & 0x1F) as u8;
                 let mode = ((p.attr >> 4) & 3) as u8;
-                (fmt, alpha, mode)
+                let tex_mode = ((p.tex_param >> 30) & 3) as u8;
+                (fmt, alpha, mode, tex_mode)
             })
             .collect();
         (self.machine.gpu3d.disp3dcnt(), polys)
@@ -932,6 +933,28 @@ impl System {
                 (tp.format, tp.offset, p.pltt_base & 0x1FFF, t.color, t.alpha)
             })
             .collect()
+    }
+
+    /// Decode a render-list polygon's full texture to `(width, height, BGR555 pixels)`,
+    /// for debug visualization — reveals whether the texel sampler (e.g. the 4×4-
+    /// compressed decode) is producing the right image or a glitch pattern.
+    pub fn gpu3d_dump_poly_texture(&self, poly: usize) -> Option<(u32, u32, Vec<u16>)> {
+        let mut image = vec![0u8; 0x8_0000];
+        let mut palette = vec![0u8; 0x1_8000];
+        self.machine.vram.assemble_texture_image(&mut image);
+        self.machine.vram.assemble_texture_palette(&mut palette);
+        let tex = gpu3d::texture::TextureSet { image: &image, palette: &palette };
+        let p = self.machine.gpu3d.render_list().polygons().get(poly)?;
+        let tp = gpu3d::texture::TexParams::decode(p.tex_param, p.pltt_base);
+        let (w, h) = (tp.size_s.max(1) as u32, tp.size_t.max(1) as u32);
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for t in 0..h as i32 {
+            for s in 0..w as i32 {
+                let c = tp.sample(&tex, s, t).color; // 6-bit channels
+                out.push((c[0] as u16 >> 1) | ((c[1] as u16 >> 1) << 5) | ((c[2] as u16 >> 1) << 10));
+            }
+        }
+        Some((w, h, out))
     }
 
     /// Rasterize the 3D engine's sealed render list to a 256×192 RGB8 buffer (covered
@@ -1407,13 +1430,36 @@ impl System {
         // 3=shadow) and opacity they use, to diagnose miscoloured/washed-out 3D.
         let (_, summary) = self.gpu3d_poly_summary();
         let (mut modes, mut textured, mut opaque, mut translucent, mut wire) = ([0u32; 4], 0u32, 0u32, 0u32, 0u32);
-        for &(fmt, alpha, mode) in &summary {
+        let (mut fmts, mut texmodes) = ([0u32; 8], [0u32; 4]);
+        for &(fmt, alpha, mode, tex_mode) in &summary {
             modes[mode as usize & 3] += 1;
+            fmts[fmt as usize & 7] += 1;
+            texmodes[tex_mode as usize & 3] += 1;
             if fmt != 0 { textured += 1; }
             match alpha { 0 => wire += 1, 31 => opaque += 1, _ => translucent += 1 }
         }
         let _ = writeln!(s, "render-list shading: textured={textured}/{} untextured={} | blend[modulate={} decal={} toon={} shadow={}] | opaque={opaque} translucent={translucent} wire/opaque0={wire}",
             summary.len(), summary.len() as u32 - textured, modes[0], modes[1], modes[2], modes[3]);
+        // Texture format (0=none 1=A3I5 2=pal4 3=pal16 4=pal256 5=4x4comp 6=A5I3 7=direct)
+        // and texcoord-transform mode (0=none 1=texcoord/matrix 2=normal/envmap 3=vertex).
+        let _ = writeln!(s, "  tex formats: none={} A3I5={} pal4={} pal16={} pal256={} 4x4={} A5I3={} direct={} | texcoord modes: none={} matrix={} normal/env={} vertex={}",
+            fmts[0], fmts[1], fmts[2], fmts[3], fmts[4], fmts[5], fmts[6], fmts[7],
+            texmodes[0], texmodes[1], texmodes[2], texmodes[3]);
+        // Clip health: after clipping every surviving vertex must satisfy |x|,|y|,|z| <= w
+        // and w > 0. Any that don't are a clipping/overflow failure — they project to
+        // huge off-screen coordinates (the black wedges over the sky).
+        let (_, clips) = self.gpu3d_render_geometry();
+        let (mut min_w, mut max_w, mut wbad, mut outside, mut maxabs) = (i64::MAX, i64::MIN, 0u32, 0u32, 0i64);
+        for c in &clips {
+            let (x, y, z, w) = (c[0] as i64, c[1] as i64, c[2] as i64, c[3] as i64);
+            min_w = min_w.min(w);
+            max_w = max_w.max(w);
+            if w <= 0 { wbad += 1; }
+            if x.abs() > w || y.abs() > w || z.abs() > w { outside += 1; }
+            maxabs = maxabs.max(x.abs()).max(y.abs()).max(z.abs()).max(w.abs());
+        }
+        let _ = writeln!(s, "  clip health: verts={} w=[{min_w}..{max_w}] w<=0={wbad} outside_frustum={outside} max_abs_coord={maxabs} (i32::MAX={})",
+            clips.len(), i32::MAX);
         let total = self.machine.gpu3d.total_commands();
         let (gxw, portw) = self.machine.gpu3d.channel_writes();
         let _ = writeln!(s, "recent per-swap poly counts: {:?} | total GX commands executed={total}",

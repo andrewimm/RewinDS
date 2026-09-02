@@ -364,6 +364,15 @@ impl Emulator {
         }
     }
 
+    /// Decode a 3D render-list polygon's full texture to `(width, height, BGR555)`, to
+    /// inspect the texel sampler directly. Debug (NDS only).
+    pub fn nds_dump_poly_texture(&self, poly: usize) -> Option<(u32, u32, Vec<u16>)> {
+        match self {
+            Emulator::Nds(n) => n.system.gpu3d_dump_poly_texture(poly),
+            Emulator::Gba(_) => None,
+        }
+    }
+
     /// The isolated 256×192 BGR555 framebuffer for one BG (`0..4`) or OBJ (`4`) of a DS
     /// engine — force-enabled, so a *disabled* layer's content is still visible. Debug.
     pub fn nds_debug_layer(&mut self, engine: usize, layer: usize) -> Option<Vec<u16>> {

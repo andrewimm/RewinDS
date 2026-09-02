@@ -184,6 +184,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     let _ = std::fs::write(format!("/tmp/rewinds_screen{i}.ppm"), ppm);
                 }
+                // Dump a spread of 3D polygons' decoded textures, to inspect the texel
+                // sampler (e.g. the 4×4 decode) directly for glitch patterns.
+                for &poly in &[0usize, 60, 120, 180, 240] {
+                    if let Some((tw, th, px)) = emulator.nds_dump_poly_texture(poly) {
+                        let mut ppm = format!("P6\n{tw} {th}\n255\n").into_bytes();
+                        for p in &px {
+                            let (r, g, b) = ((p & 0x1F) as u8, ((p >> 5) & 0x1F) as u8, ((p >> 10) & 0x1F) as u8);
+                            ppm.extend_from_slice(&[(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)]);
+                        }
+                        let _ = std::fs::write(format!("/tmp/rewinds_tex_poly{poly}.ppm"), ppm);
+                    }
+                }
                 // Also dump each Engine-A BG in isolation (force-enabled), so the
                 // content of a *disabled* layer is still captured.
                 for layer in 0..4 {

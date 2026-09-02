@@ -181,16 +181,21 @@ struct RVertex {
 /// the DS 3D coordinate origin is the **lower-left** (viewport Y1 = bottom-most, Y2 =
 /// top-most), so NDC y runs upward and is flipped into the top-origin framebuffer row
 /// (`row = 191 - y_bottom`). `w` is positive by near-plane clipping. Depth is W
-/// (W-buffer) or `(z/w+1)` scaled to 24 bits.
+/// (W-buffer) or `z/w` mapped to the 24-bit range.
 fn project(v: &Vertex, vp: &Viewport, w_buffer: bool) -> RVertex {
     let w = (v.clip[3] as i64).max(1);
     let (x, y, z) = (v.clip[0] as i64, v.clip[1] as i64, v.clip[2] as i64);
     let vp_w = (vp.x2 - vp.x1 + 1) as i64;
     let vp_h = (vp.y2 - vp.y1 + 1) as i64;
     let depth = if w_buffer {
-        w as i32
+        (w as i32).clamp(0, 0x00FF_FFFF)
     } else {
-        (z * 0x0080_0000 / w + 0x0080_0000) as i32
+        // Z-buffer: map z/w ∈ [-1,1] to [0, 0xFFFE00] per the DS scaling
+        // (`((z/w)·0x4000 + 0x3FFF) << 9`). The far plane (z/w = 1) lands at 0xFFFE00,
+        // *below* CLEAR_DEPTH's 0xFFFFFF, so far polygons draw over the rear plane. The
+        // old `z·0x800000/w + 0x800000` overshot to 0x1000000, pushing the sky past the
+        // rear plane so the depth test rejected it (flickering holes).
+        ((((z << 14) / w) + 0x3FFF) << 9).clamp(0, 0x00FF_FFFF) as i32
     };
     // Bottom-origin viewport y (Y1 at the screen bottom), then flip to the top-origin
     // framebuffer row shared with the 2D layers.
@@ -380,14 +385,17 @@ fn fill_span(
     r: &Crossing,
     pass: Pass,
 ) {
+    // Half-open span [l.x, r.x): the right edge belongs to the polygon on its other
+    // side, so a shared edge is covered by exactly one polygon — no gaps (seams) and no
+    // overlap (which double-blends a translucent shadow's face edges into dark lines).
     let xl = l.x.max(0);
-    let xr = r.x.min(WIDTH as i32 - 1);
-    if xl > xr {
+    let xr = r.x.min(WIDTH as i32);
+    if xl >= xr {
         return;
     }
     let span = (r.x - l.x).max(1) as i64;
     let row = y as usize * WIDTH;
-    for x in xl..=xr {
+    for x in xl..xr {
         let sn = (x - l.x) as i64;
         let lerp = |va: i64, vb: i64| va + (vb - va) * sn / span;
         let idx = row + x as usize;
@@ -582,6 +590,27 @@ mod tests {
     }
 
     #[test]
+    fn far_plane_polygon_draws_over_the_rear_plane() {
+        // A polygon at the far plane (z/w = 1, like a skybox) must draw over the rear
+        // plane. The old Z formula mapped it to 0x1000000, past CLEAR_DEPTH's 0xFFFFFF,
+        // so the depth test rejected it — far polygons flickered as black holes.
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]); // position mode, identity clip
+        e.execute(op::COLOR, &[0x7FFF]); // white
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        for (x, y) in [(-4, 4), (4, 4), (0, -4)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, ONE as u32 & 0xFFFF]); // z = 1.0 → the far plane
+        }
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        let cfg = RenderConfig { clear_depth: 0x00FF_FFFF, ..RenderConfig::default() };
+        let fb = rasterize_cfg(&e, &cfg);
+        assert!(fb.at(128, 96).covered, "far-plane polygon rejected by the depth test");
+        assert_eq!(fb.at(128, 96).color, [63, 63, 63]);
+    }
+
+    #[test]
     fn perspective_correct_interpolation_biases_toward_the_near_vertex() {
         // A quad receding in depth: its left edge is near (w = 2, bright red) and its
         // right edge far (w = 6, black). A projection with clip.w = z makes the divisor
@@ -650,6 +679,33 @@ mod tests {
         assert_eq!(fb.at(64, 96).color[0], 63, "left half masked → stays white");
         let right = fb.at(192, 96);
         assert!(right.covered && right.color[0] < 55, "right half shadowed → darkened ({})", right.color[0]);
+    }
+
+    #[test]
+    fn adjacent_translucent_polys_do_not_double_blend_at_the_shared_edge() {
+        // Two translucent quads meeting at an edge must blend the seam once, not twice —
+        // otherwise the shared edge darkens into a visible line (the shadow-face-edge
+        // artifact). The half-open fill rule covers the shared column with one polygon.
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]); // position mode, identity clip
+        let mut quad = |corners: [(i32, i32); 4], z: i32, color: u32, attr: u32| {
+            e.execute(op::COLOR, &[color]);
+            e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | attr]);
+            e.execute(op::BEGIN_VTXS, &[1]);
+            for (x, y) in corners {
+                let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+                e.execute(op::VTX_16, &[lo, e8(z) as u32 & 0xFFFF]);
+            }
+        };
+        quad([(-7, 7), (-7, -7), (7, -7), (7, 7)], 4, 0x7FFF, 0); // opaque white, far
+        let alpha = 16 << 16; // translucent
+        quad([(-7, 7), (-7, -7), (0, -7), (0, 7)], -4, 0x0000, alpha); // left, near
+        quad([(0, 7), (0, -7), (7, -7), (7, 7)], -4, 0x0000, alpha); // right, near
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        let fb = rasterize(&e);
+        let interior = fb.at(64, 96).color[0]; // one black-over-white blend
+        let seam = fb.at(128, 96).color[0]; // the shared edge, world x = 0
+        assert_eq!(seam, interior, "seam double-blended ({seam}) vs interior ({interior})");
     }
 
     #[test]

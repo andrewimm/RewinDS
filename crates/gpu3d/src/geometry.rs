@@ -652,37 +652,43 @@ impl GeometryEngine {
         !(0..6).any(|plane| corners.iter().all(|c| plane_value(c, plane) < 0))
     }
 
-    /// Transform a texture coordinate `(s, t)` by the texture matrix per GBATEK's
-    /// texcoord-source formula `(S' T') = (S T 1/16 1/16) · TexMtx`, keeping the result
-    /// in 1.11.4 (`>> 12`). The texture matrix is column-major 4.12 (`m[col*4+row]`);
-    /// `S'` reads column 0, `T'` column 1. `1/16` is `1` in 1.11.4 (a texel is 16).
+    /// Texcoord-transform mode 1 ("TexCoord source"): the texture matrix scales/rotates/
+    /// scrolls the coordinate at the TEXCOORD command. GBATEK:
+    /// `(S' T') = (S T 1/16 1/16) · left-two-columns(TexMtx)`. That row-vector×matrix
+    /// product reads `S'` from `m[0],m[4],m[8],m[12]` and `T'` from `m[1],m[5],m[9],m[13]`
+    /// — the same `M·v` convention as the position transform, NOT the transpose. `1/16`
+    /// is `1` in 1.11.4 (a texel is 16); the 12-bit-fraction matrix shifts the result back.
     fn transform_texcoord(&self, s: i32, t: i32) -> [i32; 2] {
         let m = &self.matrix.texture().m;
-        let (s, t, c) = (s as i64, t as i64, 1i64);
-        let sp = (s * m[0] as i64 + t * m[1] as i64 + c * m[2] as i64 + c * m[3] as i64) >> 12;
-        let tp = (s * m[4] as i64 + t * m[5] as i64 + c * m[6] as i64 + c * m[7] as i64) >> 12;
+        let (s, t) = (s as i64, t as i64);
+        let sp = (s * m[0] as i64 + t * m[4] as i64 + m[8] as i64 + m[12] as i64) >> 12;
+        let tp = (s * m[1] as i64 + t * m[5] as i64 + m[9] as i64 + m[13] as i64) >> 12;
         [sp as i32, tp as i32]
     }
 
-    /// Texcoord-transform mode 3 ("Vertex source"): the coordinate comes from the
-    /// vertex position × texture matrix, computed at each VTX. GBATEK
-    /// `(S' T') = (Vx Vy Vz 1.0) · TexMtx` (columns 0/1 of our column-major 4.12 matrix).
+    /// Texcoord-transform mode 3 ("Vertex source"): the coordinate comes from the vertex
+    /// position × texture matrix at each VTX. GBATEK replaces the matrix's bottom row with
+    /// the current TexCoord: `(S' T') = (Vx Vy Vz 1.0) · [m rows 0-2 ; (S T)]`. The vertex
+    /// is 1.3.12 and the matrix 1.19.12, so the product carries 24 fraction bits → shift
+    /// to the 4-bit texcoord fraction, then add the current TexCoord.
     fn transform_texcoord_vertex(&self, v: [i32; 3]) -> [i32; 2] {
         let m = &self.matrix.texture().m;
-        let (vx, vy, vz, one) = (v[0] as i64, v[1] as i64, v[2] as i64, ONE as i64);
-        let sp = (vx * m[0] as i64 + vy * m[1] as i64 + vz * m[2] as i64 + one * m[3] as i64) >> 12;
-        let tp = (vx * m[4] as i64 + vy * m[5] as i64 + vz * m[6] as i64 + one * m[7] as i64) >> 12;
+        let (vx, vy, vz) = (v[0] as i64, v[1] as i64, v[2] as i64);
+        let sp = ((vx * m[0] as i64 + vy * m[4] as i64 + vz * m[8] as i64) >> 20) + self.state.texcoord[0] as i64;
+        let tp = ((vx * m[1] as i64 + vy * m[5] as i64 + vz * m[9] as i64) >> 20) + self.state.texcoord[1] as i64;
         [sp as i32, tp as i32]
     }
 
-    /// Texcoord-transform mode 2 ("Normal source"): spherical reflection mapping. GBATEK
-    /// `(S' T') = (Nx Ny Nz)·TexMtx + current texcoord`, computed at NORMAL with the raw
-    /// normal (1.9); the game bakes the directional matrix into the texture matrix.
+    /// Texcoord-transform mode 2 ("Normal source"): spherical reflection mapping (skyboxes,
+    /// shiny surfaces). GBATEK, with the bottom row replaced by the current TexCoord:
+    /// `(S' T') = (Nx Ny Nz 1.0) · [m rows 0-2 ; (S T)]`. The normal is 1.0.9 and the matrix
+    /// 1.19.12, so the product carries 21 fraction bits → shift to the 4-bit texcoord
+    /// fraction, then add the current TexCoord. Same column indexing as mode 1/3.
     fn transform_texcoord_normal(&self, n: [i32; 3]) -> [i32; 2] {
         let m = &self.matrix.texture().m;
         let (nx, ny, nz) = (n[0] as i64, n[1] as i64, n[2] as i64);
-        let sp = ((nx * m[0] as i64 + ny * m[1] as i64 + nz * m[2] as i64) >> 12) + self.state.texcoord[0] as i64;
-        let tp = ((nx * m[4] as i64 + ny * m[5] as i64 + nz * m[6] as i64) >> 12) + self.state.texcoord[1] as i64;
+        let sp = ((nx * m[0] as i64 + ny * m[4] as i64 + nz * m[8] as i64) >> 17) + self.state.texcoord[0] as i64;
+        let tp = ((nx * m[1] as i64 + ny * m[5] as i64 + nz * m[9] as i64) >> 17) + self.state.texcoord[1] as i64;
         [sp as i32, tp as i32]
     }
 
@@ -1006,6 +1012,28 @@ mod tests {
             e.execute(op::VTX_16, &[lo, 0]);
         }
         assert_eq!(e.vertices()[3].texcoord, [16, 16]);
+    }
+
+    #[test]
+    fn texcoord_transform_uses_the_correct_matrix_columns() {
+        // An off-diagonal texture matrix distinguishes M·v from its transpose. With m[4]
+        // (column 1, row 0) set, T must feed into S'; the transposed indexing fed it into
+        // T' instead, swapping the axes — which warped env-mapped skies (mode 2).
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[3]); // texture matrix
+        let o = ONE as u32;
+        e.execute(op::MTX_LOAD_4X4, &[o, 0, 0, 0, 2 * o, o, 0, 0, 0, 0, o, 0, 0, 0, 0, o]);
+        e.execute(op::MTX_MODE, &[1]);
+        e.execute(op::TEXIMAGE_PARAM, &[1 << 30]); // texcoord-transform mode 1
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::TEXCOORD, &[16 | (16 << 16)]); // S = T = 16
+        for (x, y) in [(0i32, 0), (2, 0), (0, 2)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, 0]);
+        }
+        // S' = S·m[0] + T·m[4] = 16·1 + 16·2 = 48; T' = S·m[1] + T·m[5] = 0 + 16 = 16.
+        assert_eq!(e.vertices()[0].texcoord, [48, 16]);
     }
 
     #[test]
