@@ -32,7 +32,7 @@ pub mod vram;
 pub use boot::{BootError, Header};
 pub use cart::Cart;
 pub use cp15::Cp15;
-pub use dma::{Dma, DmaTiming};
+pub use dma::Dma;
 pub use interrupt::{Interrupts, IrqSource};
 pub use ipc::Ipc;
 pub use memory::{Core, Memory};

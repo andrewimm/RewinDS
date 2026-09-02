@@ -10,16 +10,6 @@
 //! the PPU (M2.3); the NDS9 21-bit counts and extra 3-bit mode field are later
 //! refinements — counts here follow the GBA's 16-bit form.
 
-/// When a channel's transfer starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaTiming {
-    Immediate,
-    VBlank,
-    HBlank,
-    /// NDS-specific timings (cart, geometry FIFO, …) — not yet modelled.
-    Special,
-}
-
 /// One DMA channel's registers and internal transfer pointers.
 #[derive(Clone, Copy, Debug)]
 pub struct DmaChannel {
@@ -47,15 +37,6 @@ impl DmaChannel {
         }
     }
 
-    pub fn timing(&self) -> DmaTiming {
-        match (self.control >> 12) & 3 {
-            0 => DmaTiming::Immediate,
-            1 => DmaTiming::VBlank,
-            2 => DmaTiming::HBlank,
-            _ => DmaTiming::Special,
-        }
-    }
-
     pub fn is_32bit(&self) -> bool {
         self.control & (1 << 10) != 0
     }
@@ -72,26 +53,51 @@ impl DmaChannel {
         self.control & (1 << 9) != 0
     }
 
-    /// Whether this channel is enabled and set to gamecard (cart-slot) DMA timing,
-    /// which the cartridge controller triggers on a ROMCTRL block start. The start
-    /// mode is a 3-bit field on the ARM9 (mode 5) and 2-bit on the ARM7 (mode 2)
-    /// — distinct from the GBA-shaped [`DmaChannel::timing`] used by the other
-    /// modes (GBATEK "DS DMA Transfers").
-    pub fn is_cart_dma(&self, arm9: bool) -> bool {
-        let enabled = self.control & (1 << 15) != 0;
-        let cart = if arm9 {
-            (self.control >> 11) & 7 == 5
+    /// The DMA start-mode field, whose width differs by core: 3 bits on the ARM9
+    /// (bits 11-13), 2 bits on the ARM7 (bits 12-13). Per GBATEK "DS DMA Transfers".
+    /// The GBA-shaped [`DmaChannel::timing`] reads the wrong bits for the ARM9, so
+    /// every trigger check goes through this instead.
+    fn start_mode(&self, arm9: bool) -> u16 {
+        if arm9 {
+            (self.control >> 11) & 7
         } else {
-            (self.control >> 12) & 3 == 2
-        };
-        enabled && cart
+            (self.control >> 12) & 3
+        }
+    }
+
+    fn enabled_bit(&self) -> bool {
+        self.control & (1 << 15) != 0
+    }
+
+    /// Immediate timing (start mode 0), on either core — runs the whole transfer the
+    /// instant it is armed.
+    fn is_immediate(&self, arm9: bool) -> bool {
+        self.start_mode(arm9) == 0
+    }
+
+    /// Enabled and waiting on V-blank (start mode 1, both cores). Games update OAM,
+    /// palette, and scroll registers here every frame.
+    pub fn is_vblank_dma(&self, arm9: bool) -> bool {
+        self.enabled_bit() && self.start_mode(arm9) == 1
+    }
+
+    /// Enabled and waiting on H-blank — ARM9-only (start mode 2). Drives per-scanline
+    /// raster effects.
+    pub fn is_hblank_dma(&self, arm9: bool) -> bool {
+        arm9 && self.enabled_bit() && self.start_mode(arm9) == 2
+    }
+
+    /// Whether this channel is enabled and set to gamecard (cart-slot) DMA timing,
+    /// which the cartridge controller triggers on a ROMCTRL block start (mode 5 on the
+    /// ARM9, mode 2 on the ARM7).
+    pub fn is_cart_dma(&self, arm9: bool) -> bool {
+        self.enabled_bit() && self.start_mode(arm9) == if arm9 { 5 } else { 2 }
     }
 
     /// Whether this is an ARM9 **GXFIFO DMA** (start mode 7): it streams packed
-    /// geometry commands to the GXFIFO. Games submit heavy 3D scenes this way, so it
-    /// must be handled distinctly from the GBA-shaped [`DmaChannel::timing`] modes.
+    /// geometry commands to the GXFIFO. Games submit heavy 3D scenes this way.
     pub fn is_gxfifo(&self, arm9: bool) -> bool {
-        arm9 && (self.control >> 11) & 7 == 7
+        arm9 && self.start_mode(arm9) == 7
     }
 
     pub fn irq_on_end(&self) -> bool {
@@ -169,17 +175,20 @@ impl DmaChannel {
             self.internal_count = self.latched_count();
             // Immediate and (ARM9) GXFIFO DMAs run now — our FIFO drains synchronously,
             // so a GXFIFO DMA never back-pressures and can transfer in full at once.
-            armed = self.timing() == DmaTiming::Immediate || self.is_gxfifo(arm9);
+            // (Blank-timed DMAs are instead fired by the PPU when their period begins.)
+            armed = self.is_immediate(arm9) || self.is_gxfifo(arm9);
         }
         self.enabled = now_enabled;
         armed
     }
 
-    /// Advance the internal pointers after a completed transfer and either re-arm
-    /// (repeat, non-immediate) or disable the channel.
-    pub fn complete(&mut self, source: u32, dest: u32) {
+    /// Advance the internal pointers after a completed transfer and either re-arm (a
+    /// repeating, non-immediate channel waits for its next blank period) or disable the
+    /// channel. A re-armed channel reloads its count and, if the dest mode is
+    /// increment-reload, its destination — the source continues (the HDMA-table pattern).
+    pub fn complete(&mut self, source: u32, dest: u32, arm9: bool) {
         self.internal_source = source;
-        if self.repeat() && self.timing() != DmaTiming::Immediate {
+        if self.repeat() && !self.is_immediate(arm9) {
             self.internal_count = self.latched_count();
             self.internal_dest = if self.dest_reloads() {
                 self.masked_dest()

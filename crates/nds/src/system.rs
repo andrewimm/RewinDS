@@ -393,9 +393,29 @@ impl Machine {
             source = source.wrapping_add(source_step);
             dest = dest.wrapping_add(dest_step);
         }
-        self.dma[c].channels[channel].complete(source, dest);
+        self.dma[c].channels[channel].complete(source, dest, core == Core::Arm9);
         if ch.irq_on_end() {
             self.interrupts[c].request(crate::dma::irq_source(channel));
+        }
+    }
+
+    /// Fire the DMA channels waiting on a blank period, in channel order: V-blank DMAs
+    /// on both cores (`hblank == false`), or H-blank DMAs on the ARM9 only. Each channel
+    /// with the repeat bit set is re-armed by `complete` to fire again next period; the
+    /// rest disable themselves after one transfer.
+    fn run_blank_dmas(&mut self, hblank: bool) {
+        for core in [Core::Arm9, Core::Arm7] {
+            let arm9 = core == Core::Arm9;
+            if hblank && !arm9 {
+                continue; // H-blank DMA is an ARM9-only start mode
+            }
+            for channel in 0..4 {
+                let ch = &self.dma[core.index()].channels[channel];
+                let fire = if hblank { ch.is_hblank_dma(arm9) } else { ch.is_vblank_dma(arm9) };
+                if fire {
+                    self.run_dma_channel(core, channel);
+                }
+            }
         }
     }
 
@@ -415,7 +435,7 @@ impl Machine {
             source = source.wrapping_add(source_step);
         }
         self.gxfifo_dma_words += ch.internal_count() as u64;
-        self.dma[c].channels[channel].complete(source, ch.internal_dest());
+        self.dma[c].channels[channel].complete(source, ch.internal_dest(), core == Core::Arm9);
         if ch.irq_on_end() {
             self.interrupts[c].request(crate::dma::irq_source(channel));
         }
@@ -761,6 +781,18 @@ impl EventHandler<NdsEvent> for Machine {
                     Some(self.gpu3d.framebuffer_3d()),
                     ctx,
                 );
+                // Blank-timed DMAs fire off the PPU's new position: V-blank DMAs when the
+                // frame just entered V-blank, H-blank DMAs (ARM9 only) during each visible
+                // line's H-blank. (Immediate/GXFIFO DMAs run when armed; cart on block start.)
+                match event {
+                    PpuEvent::LineStart if self.ppu.vcount() == crate::ppu::HEIGHT as u16 => {
+                        self.run_blank_dmas(false);
+                    }
+                    PpuEvent::HBlank if (self.ppu.vcount() as usize) < crate::ppu::HEIGHT => {
+                        self.run_blank_dmas(true);
+                    }
+                    _ => {}
+                }
             }
             NdsEvent::SoundSample => {
                 // `sound`, `memory`, and `cp15` are disjoint fields; the channels
@@ -1718,6 +1750,54 @@ mod tests {
             assert_eq!(system.interrupts(core).iflags(), IrqSource::Dma0.mask());
             assert_eq!(system.io_read(core, 0x0400_00BA, 2) & (1 << 15), 0);
         }
+    }
+
+    #[test]
+    fn vblank_dma_fires_only_when_the_frame_enters_vblank() {
+        // Games refresh OAM/palette/scroll every frame via a V-blank DMA (start mode 1).
+        // It must NOT run when armed (only immediate does), and then run at V-blank.
+        let mut system = System::new();
+        let seed = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        for (i, w) in seed.iter().enumerate() {
+            system.memory().main[i * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        system.io_write(Core::Arm9, 0x0400_00B0, 0x0200_0000, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0200_1000, 4); // DAD
+        system.io_write(Core::Arm9, 0x0400_00B8, 4, 2); // count = 4 words
+        // enable | 32-bit | start mode 1 (V-blank, ARM9 bits 11-13 = 001).
+        system.io_write(Core::Arm9, 0x0400_00BA, (1 << 15) | (1 << 10) | (1 << 11), 2);
+
+        // Not yet: V-blank timing does not run at arm time.
+        assert_eq!(system.memory().main[0x1000..0x1004], [0; 4]);
+        // A full frame reaches V-blank and fires it.
+        system.run_frame();
+        for (i, w) in seed.iter().enumerate() {
+            let got = u32::from_le_bytes(system.memory().main[0x1000 + i * 4..][..4].try_into().unwrap());
+            assert_eq!(got, *w, "word {i}");
+        }
+    }
+
+    #[test]
+    fn hblank_dma_fires_during_a_visible_scanline() {
+        // Per-scanline raster effects use an ARM9 H-blank DMA (start mode 2); it fires at
+        // the first visible line's H-blank, well before the frame completes.
+        let mut system = System::new();
+        let seed = [0xAAAA_AAAAu32, 0xBBBB_BBBB];
+        for (i, w) in seed.iter().enumerate() {
+            system.memory().main[i * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        system.io_write(Core::Arm9, 0x0400_00B0, 0x0200_0000, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0200_1000, 4); // DAD
+        system.io_write(Core::Arm9, 0x0400_00B8, 2, 2); // count = 2 words
+        // enable | 32-bit | start mode 2 (H-blank, ARM9 bits 11-13 = 010).
+        system.io_write(Core::Arm9, 0x0400_00BA, (1 << 15) | (1 << 10) | (1 << 12), 2);
+
+        assert_eq!(system.memory().main[0x1000..0x1008], [0; 8], "ran before any H-blank");
+        // One scanline's worth of time covers the first H-blank.
+        system.start_video();
+        system.run_until(system.now() + crate::ppu::CYCLES_PER_LINE + 4);
+        let got = u32::from_le_bytes(system.memory().main[0x1000..0x1004].try_into().unwrap());
+        assert_eq!(got, 0xAAAA_AAAA, "H-blank DMA did not fire on a visible line");
     }
 
     #[test]
