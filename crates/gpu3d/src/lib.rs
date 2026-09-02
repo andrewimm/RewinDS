@@ -135,6 +135,17 @@ impl Gpu3d {
         self.geometry.box_test_stats()
     }
 
+    /// Debug: per-frustum-plane fully-clipped primitive counts (L, R, B, T, near, far).
+    pub fn clip_plane_stats(&self) -> [u64; 6] {
+        self.geometry.clip_plane_stats()
+    }
+
+    /// Debug: toggle winding culling off, to test whether black regions are back-face
+    /// culled geometry. Takes effect on subsequently-built frames.
+    pub fn set_disable_cull(&mut self, on: bool) {
+        self.geometry.set_disable_cull(on);
+    }
+
     /// Debug: `((last_swap_build_polys, verts), emit_dropped)` — what the last swap
     /// saw in the build buffer, and lifetime polygons dropped by the RAM-full guard.
     pub fn swap_debug(&self) -> ((usize, usize), u64) {
@@ -219,7 +230,26 @@ impl Gpu3d {
             clear_color: [expand6(cc), expand6(cc >> 5), expand6(cc >> 10)],
             clear_alpha: ((cc >> 16) & 0x1F) as u8,
             clear_depth: expand_depth(self.clear_depth & 0x7FFF),
+            ignore_depth: false,
         }
+    }
+
+    /// Debug: rasterize the sealed render list to a fresh 256×192 BGR555 image with the
+    /// depth test disabled (submission order). Compared against the normal frame, this
+    /// tells whether black regions are depth-rejected or genuinely uncovered by geometry.
+    pub fn debug_render_no_depth(&self) -> Vec<u16> {
+        let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
+        let mut cfg = self.render_config();
+        cfg.ignore_depth = true;
+        let mut fb = raster::Framebuffer3d::new();
+        raster::render(self.geometry.render_list(), &tex, &cfg, &mut fb);
+        fb.pixels
+            .iter()
+            .map(|p| {
+                let c = |v: u8| (v >> 1) as u16;
+                if p.covered { c(p.color[0]) | (c(p.color[1]) << 5) | (c(p.color[2]) << 10) } else { 0 }
+            })
+            .collect()
     }
 
     /// Rasterize the sealed render list into the internal framebuffer (once per swap;

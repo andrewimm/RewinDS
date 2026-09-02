@@ -301,11 +301,13 @@ fn clip_plane(poly: &[ClipVertex], plane: usize, out: &mut Vec<ClipVertex>) {
 }
 
 /// The homogeneous signed area of the first three clip-space vertices — its sign is the
-/// winding, used for back/front-face culling.
-fn signed_area(a: &[i32; 4], b: &[i32; 4], c: &[i32; 4]) -> i64 {
-    let (ax, ay, aw) = (a[0] as i64, a[1] as i64, a[3] as i64);
-    let (bx, by, bw) = (b[0] as i64, b[1] as i64, b[3] as i64);
-    let (cx, cy, cw) = (c[0] as i64, c[1] as i64, c[3] as i64);
+/// winding, used for back/front-face culling. Computed in `i128`: this triple product of
+/// clip coordinates reaches ~2⁷⁰ for far geometry (a skybox, `w ≈ 2²³`), which overflows
+/// `i64` and wraps to a garbage sign — randomly culling far polygons (flickering holes).
+fn signed_area(a: &[i32; 4], b: &[i32; 4], c: &[i32; 4]) -> i128 {
+    let (ax, ay, aw) = (a[0] as i128, a[1] as i128, a[3] as i128);
+    let (bx, by, bw) = (b[0] as i128, b[1] as i128, b[3] as i128);
+    let (cx, cy, cw) = (c[0] as i128, c[1] as i128, c[3] as i128);
     ax * (by * cw - cy * bw) - ay * (bx * cw - cx * bw) + aw * (bx * cy - cx * by)
 }
 
@@ -434,6 +436,12 @@ pub struct GeometryEngine {
     dbg_last_swap_build: (usize, usize),
     /// Debug: lifetime count of `emit_polygon` calls dropped by the RAM-full guard.
     dbg_emit_dropped: u64,
+    /// Debug: which frustum plane fully clipped a dropped primitive (0=left 1=right
+    /// 2=bottom 3=top 4=near 5=far) — reveals if far-plane clipping is eating the sky.
+    dbg_clip_plane: [u64; 6],
+    /// Debug: when set, skip winding culling entirely (emit both faces). Tests whether
+    /// black regions are back-face-culled geometry.
+    dbg_disable_cull: bool,
 }
 
 impl GeometryEngine {
@@ -478,6 +486,17 @@ impl GeometryEngine {
     /// count of polygons dropped by the vertex/polygon-RAM-full guard.
     pub fn swap_debug(&self) -> ((usize, usize), u64) {
         (self.dbg_last_swap_build, self.dbg_emit_dropped)
+    }
+
+    /// Debug: per-frustum-plane count of primitives fully clipped away (left, right,
+    /// bottom, top, near, far).
+    pub fn clip_plane_stats(&self) -> [u64; 6] {
+        self.dbg_clip_plane
+    }
+
+    /// Debug: toggle winding culling off (emit every primitive regardless of facing).
+    pub fn set_disable_cull(&mut self, on: bool) {
+        self.dbg_disable_cull = on;
     }
 
     /// Debug: the current (not-yet-sealed) build buffer `(polys, verts)`.
@@ -781,17 +800,20 @@ impl GeometryEngine {
         let mut dst = std::mem::take(&mut self.clip_b);
         src.clear();
         src.extend_from_slice(prim);
+        let mut culprit = 6;
         for plane in 0..6 {
             clip_plane(&src, plane, &mut dst);
             std::mem::swap(&mut src, &mut dst);
             if src.len() < 3 {
+                culprit = plane;
                 break;
             }
         }
         self.dbg_submitted += 1;
         if src.len() < 3 {
             self.dbg_clipped += 1;
-        } else if culled(self.state.cur_attr, &src) {
+            self.dbg_clip_plane[culprit.min(5)] += 1;
+        } else if !self.dbg_disable_cull && culled(self.state.cur_attr, &src) {
             self.dbg_culled += 1;
         } else {
             self.dbg_emitted += 1;
@@ -1012,6 +1034,19 @@ mod tests {
             e.execute(op::VTX_16, &[lo, 0]);
         }
         assert_eq!(e.vertices()[3].texcoord, [16, 16]);
+    }
+
+    #[test]
+    fn winding_sign_survives_far_skybox_coordinates() {
+        // The winding triple-product reaches ~2⁷⁰ at skybox scale (clip coords ~2²³),
+        // which overflowed i64 and wrapped to a garbage sign — randomly culling the far
+        // sky. In i128 the sign is stable across scales.
+        let area = |k: i32| {
+            let (a, b, c) = ([0, 0, 0, k], [k, 0, 0, k], [0, k, 0, k]);
+            signed_area(&a, &b, &c)
+        };
+        assert!(area(1) > 0, "unit triangle is front-facing");
+        assert!(area(1 << 23) > 0, "the same winding at skybox scale must keep its sign");
     }
 
     #[test]

@@ -935,6 +935,17 @@ impl System {
             .collect()
     }
 
+    /// Debug: the 3D render list rasterized with the depth test disabled (256×192 BGR555),
+    /// to tell depth-rejected black from genuinely-uncovered black.
+    pub fn gpu3d_debug_no_depth(&self) -> Vec<u16> {
+        self.machine.gpu3d.debug_render_no_depth()
+    }
+
+    /// Debug: toggle 3D winding culling off/on.
+    pub fn gpu3d_set_disable_cull(&mut self, on: bool) {
+        self.machine.gpu3d.set_disable_cull(on);
+    }
+
     /// Decode a render-list polygon's full texture to `(width, height, BGR555 pixels)`,
     /// for debug visualization — reveals whether the texel sampler (e.g. the 4×4-
     /// compressed decode) is producing the right image or a glitch pattern.
@@ -1467,6 +1478,9 @@ impl System {
         let _ = writeln!(s, "GX submission channels (lifetime): gxfifo_port_writes={gxw} command_port_writes={portw}");
         let (sub, clip, cull, emit) = self.machine.gpu3d.pipeline_stats();
         let _ = writeln!(s, "geometry pipeline (lifetime): submitted={sub} clipped_out={clip} culled={cull} emitted={emit}");
+        let cp = self.machine.gpu3d.clip_plane_stats();
+        let _ = writeln!(s, "  clipped-out by plane: left={} right={} bottom={} top={} near={} far={}",
+            cp[0], cp[1], cp[2], cp[3], cp[4], cp[5]);
         let (bt_run, bt_pass) = self.machine.gpu3d.box_test_stats();
         let _ = writeln!(s, "box tests (lifetime): run={bt_run} passed_inside={bt_pass} gxstat=0x{:08X}",
             self.machine.gpu3d.gxstat());

@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Flush the save at most a few times a second, only after the game writes it.
     const FLUSH_EVERY_FRAMES: u32 = 180;
     let mut frames_since_flush = 0u32;
+    let mut cull_disabled = false;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Mirror the host keyboard into a single input snapshot each frame.
         let mut input = Input::default();
@@ -171,6 +172,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // F6: toggle 3D winding culling (DS debug) — to test whether black regions are
+        // back-face-culled geometry.
+        if window.is_key_pressed(Key::F6, minifb::KeyRepeat::No) {
+            cull_disabled = !cull_disabled;
+            emulator.nds_set_disable_cull(cull_disabled);
+            log::info!("3D culling {}", if cull_disabled { "DISABLED" } else { "enabled" });
+        }
+
         // F5: dump a graphics-state diagnostic + both screens (PPM) to /tmp, for
         // debugging the current on-screen state (DS only).
         if window.is_key_pressed(Key::F5, minifb::KeyRepeat::No) {
@@ -183,6 +192,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ppm.extend_from_slice(&px[..3]);
                     }
                     let _ = std::fs::write(format!("/tmp/rewinds_screen{i}.ppm"), ppm);
+                }
+                // Dump the 3D render with the depth test disabled: black here is geometry
+                // that genuinely doesn't cover the pixel, vs black from depth rejection.
+                if let Some(fb) = emulator.nds_debug_no_depth() {
+                    let mut ppm = b"P6\n256 192\n255\n".to_vec();
+                    for p in &fb {
+                        let (r, g, b) = ((p & 0x1F) as u8, ((p >> 5) & 0x1F) as u8, ((p >> 10) & 0x1F) as u8);
+                        ppm.extend_from_slice(&[(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)]);
+                    }
+                    let _ = std::fs::write("/tmp/rewinds_nodepth.ppm", ppm);
                 }
                 // Dump a spread of 3D polygons' decoded textures, to inspect the texel
                 // sampler (e.g. the 4×4 decode) directly for glitch patterns.

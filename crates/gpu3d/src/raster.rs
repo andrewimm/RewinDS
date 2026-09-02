@@ -102,6 +102,9 @@ pub struct RenderConfig {
     /// The rear-plane depth (`CLEAR_DEPTH` expanded to 24 bits); the depth buffer is
     /// initialised to this, so polygons must be nearer to draw.
     pub clear_depth: i32,
+    /// Debug: skip the depth test entirely (paint in submission order). Distinguishes
+    /// "black because the pixel is depth-rejected" from "black because no polygon covers it".
+    pub ignore_depth: bool,
 }
 
 impl Default for RenderConfig {
@@ -116,6 +119,7 @@ impl Default for RenderConfig {
             clear_color: [0, 0, 0],
             clear_alpha: 0,
             clear_depth: i32::MAX,
+            ignore_depth: false,
         }
     }
 }
@@ -159,9 +163,14 @@ impl Viewport {
 /// vertex carries `iw = IW_ONE / w`, and its color/texcoord premultiplied by `iw`.
 /// Interpolating those linearly in screen space and dividing by the interpolated `iw`
 /// per pixel recovers the perspective-correct attribute (textures no longer swim on
-/// polygons seen at an angle). `1<<28` keeps precision without overflowing `i64` when
-/// premultiplied by texcoords and accumulated across a span.
-const IW_ONE: i64 = 1 << 28;
+/// polygons seen at an angle).
+///
+/// The scale must be large enough that `iw` keeps precision even when `w` is huge —
+/// far geometry like a skybox reaches `w ≈ 2²³`, where `1<<28` left `iw` only ~5 bits
+/// (≈8 texels of error, collapsing far textures into flat/repeating garbage). `1<<38`
+/// gives ~15 bits there, while staying within `i64` once premultiplied by a 16-bit
+/// texcoord (≤2¹⁵) and accumulated across a span (`2¹⁵·2³⁸·2⁸ = 2⁶¹`, comfortably < 2⁶³).
+const IW_ONE: i64 = 1 << 38;
 
 /// A vertex projected to integer screen coordinates, carrying the perspective-correct
 /// interpolants: `depth` (smaller = nearer, interpolated linearly per the DS depth
@@ -187,15 +196,16 @@ fn project(v: &Vertex, vp: &Viewport, w_buffer: bool) -> RVertex {
     let (x, y, z) = (v.clip[0] as i64, v.clip[1] as i64, v.clip[2] as i64);
     let vp_w = (vp.x2 - vp.x1 + 1) as i64;
     let vp_h = (vp.y2 - vp.y1 + 1) as i64;
+    // Depth maps to [0, 0xFFFFFE], one below CLEAR_DEPTH's 0xFFFFFF — so the rear plane is
+    // strictly the backmost and far geometry (the sky) always draws over it instead of
+    // tying the depth test (which rejected it as flickering black holes). Full precision:
+    // an earlier form zeroed the low 9 bits, coarse enough to z-fight co-planar surfaces
+    // (the ground popping through a pipe).
     let depth = if w_buffer {
-        (w as i32).clamp(0, 0x00FF_FFFF)
+        (w as i32).clamp(0, 0x00FF_FFFE)
     } else {
-        // Z-buffer: map z/w ∈ [-1,1] to [0, 0xFFFE00] per the DS scaling
-        // (`((z/w)·0x4000 + 0x3FFF) << 9`). The far plane (z/w = 1) lands at 0xFFFE00,
-        // *below* CLEAR_DEPTH's 0xFFFFFF, so far polygons draw over the rear plane. The
-        // old `z·0x800000/w + 0x800000` overshot to 0x1000000, pushing the sky past the
-        // rear plane so the depth test rejected it (flickering holes).
-        ((((z << 14) / w) + 0x3FFF) << 9).clamp(0, 0x00FF_FFFF) as i32
+        // Z-buffer: (z/w + 1)·0x7FFFFF, multiplying before dividing to keep the low bits.
+        ((z + w) * 0x7F_FFFF / w).clamp(0, 0x00FF_FFFE) as i32
     };
     // Bottom-origin viewport y (Y1 at the screen bottom), then flip to the top-origin
     // framebuffer row shared with the 2D layers.
@@ -400,7 +410,7 @@ fn fill_span(
         let lerp = |va: i64, vb: i64| va + (vb - va) * sn / span;
         let idx = row + x as usize;
         let depth = lerp(l.depth as i64, r.depth as i64) as i32;
-        if depth >= fb.depth[idx] {
+        if !cfg.ignore_depth && depth >= fb.depth[idx] {
             continue; // occluded by a nearer (or equal) pixel already drawn
         }
         // Shadow mask (step 1): the back-face volume is nearer than the scene here, so

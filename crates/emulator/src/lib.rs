@@ -364,6 +364,23 @@ impl Emulator {
         }
     }
 
+    /// The 3D render list rasterized with the depth test disabled (256×192 BGR555). Debug
+    /// (NDS only) — black here means genuinely uncovered by geometry, not depth-rejected.
+    pub fn nds_debug_no_depth(&self) -> Option<Vec<u16>> {
+        match self {
+            Emulator::Nds(n) => Some(n.system.gpu3d_debug_no_depth()),
+            Emulator::Gba(_) => None,
+        }
+    }
+
+    /// Debug (NDS only): toggle 3D winding culling off/on, to test whether black regions
+    /// are back-face-culled geometry.
+    pub fn nds_set_disable_cull(&mut self, on: bool) {
+        if let Emulator::Nds(n) = self {
+            n.system.gpu3d_set_disable_cull(on);
+        }
+    }
+
     /// Decode a 3D render-list polygon's full texture to `(width, height, BGR555)`, to
     /// inspect the texel sampler directly. Debug (NDS only).
     pub fn nds_dump_poly_texture(&self, poly: usize) -> Option<(u32, u32, Vec<u16>)> {
