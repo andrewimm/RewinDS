@@ -585,12 +585,12 @@ mod tests {
         vram.set_control(3, 0x81); // bank D -> Engine A BG at 0x06000000
 
         // 16-tile-wide map (size 0 = 128×128): row 0 -> tile 1, row 1 -> tile 2.
-        vram.write(0x0600_0000, 1, 2); // tile row 0, col 0
-        vram.write(0x0600_0000 + 16 * 2, 2, 2); // tile row 1, col 0
+        vram.write(crate::memory::Core::Arm9, 0x0600_0000, 1, 2); // tile row 0, col 0
+        vram.write(crate::memory::Core::Arm9, 0x0600_0000 + 16 * 2, 2, 2); // tile row 1, col 0
         // 8bpp tiles at char base block 1 (0x4000): tile 1 = texel 1, tile 2 = texel 2.
         for i in 0..32 {
-            vram.write(0x0600_4040 + i * 2, 0x0101, 2); // tile 1
-            vram.write(0x0600_4080 + i * 2, 0x0202, 2); // tile 2
+            vram.write(crate::memory::Core::Arm9, 0x0600_4040 + i * 2, 0x0101, 2); // tile 1
+            vram.write(crate::memory::Core::Arm9, 0x0600_4080 + i * 2, 0x0202, 2); // tile 2
         }
 
         let mut palette = vec![0u8; 0x800];

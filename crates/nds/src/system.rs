@@ -339,7 +339,7 @@ impl Machine {
     /// engine; instruction-fetch TCM rules do not apply.
     pub(crate) fn data_read(&self, core: Core, addr: u32, bytes: u32) -> u32 {
         if is_vram(addr) {
-            return self.vram.read(addr, bytes);
+            return self.vram.read(core, addr, bytes);
         }
         match bytes {
             1 => self.memory.read8(core, addr, false, &self.cp15) as u32,
@@ -351,7 +351,7 @@ impl Machine {
     /// The write counterpart to [`Self::data_read`].
     pub(crate) fn data_write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
         if is_vram(addr) {
-            self.vram.write(addr, value, bytes);
+            self.vram.write(core, addr, value, bytes);
             return;
         }
         // A DMA into the ARM9 3D/geometry register block (GXFIFO + command ports)
@@ -577,6 +577,21 @@ impl Machine {
             }
             0x0400_0240 if core == Core::Arm7 => self.vram.vramstat() as u32,
             0x0400_0241 if core == Core::Arm7 => self.memory.wramcnt as u32,
+            // VRAMCNT_A..I readback (ARM9): the nine bank-control bytes, with WRAMCNT
+            // sharing 0x247. Byte registers — assemble by access width.
+            _ if core == Core::Arm9 && (0x0400_0240..0x0400_024A).contains(&addr) => {
+                let mut v = 0u32;
+                for i in 0..bytes {
+                    let a = addr + i;
+                    let byte = if a == 0x0400_0247 {
+                        self.memory.wramcnt as u32
+                    } else {
+                        vramcnt_bank(a).map(|b| self.vram.control(b) as u32).unwrap_or(0)
+                    };
+                    v |= byte << (i * 8);
+                }
+                v
+            }
             _ => 0,
         }
     }

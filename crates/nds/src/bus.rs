@@ -179,7 +179,7 @@ impl NdsCpuBus<'_> {
             return self.machine.io_read(self.core, address, bytes);
         }
         if is_vram(address) {
-            return self.machine.vram.read(address, bytes);
+            return self.machine.vram.read(self.core, address, bytes);
         }
         let (mem, cp15) = (&self.machine.memory, &self.machine.cp15);
         let value = match bytes {
@@ -221,7 +221,7 @@ impl NdsCpuBus<'_> {
             return;
         }
         if is_vram(address) {
-            self.machine.vram.write(address, value, bytes);
+            self.machine.vram.write(self.core, address, value, bytes);
             return;
         }
         // `memory` and `cp15` are disjoint fields, so the mutable memory borrow

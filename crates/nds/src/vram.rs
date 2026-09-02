@@ -6,10 +6,12 @@
 //! CPU access to the `0x0600_0000` region resolves to whichever enabled block is
 //! mapped at that address.
 //!
-//! M2.2 models the CPU-visible mappings the 2D bring-up needs: plain "LCDC"
-//! access (`MST` 0), and 2D Engine A background (`MST` 1) and object (`MST` 2)
-//! VRAM. Texture, extended-palette, Engine B, and ARM7 mappings are later work.
-//! Per hardware, 8-bit writes to VRAM are ignored.
+//! The mapping is **core-aware**: the ARM9 sees the LCDC windows and the 2D-engine
+//! background/object banks; the ARM7 sees only banks C/D allocated to it as work RAM
+//! (`MST` 2), mapped into its own `0x0600_0000` space — never the engine banks. Per
+//! hardware, 8-bit writes to VRAM are ignored.
+
+use crate::memory::Core;
 
 /// Block sizes, indexed A=0 … I=8.
 const SIZES: [usize; 9] = [
@@ -190,7 +192,8 @@ impl Vram {
     fn assemble_region(&self, out: &mut [u8], lo: u32, hi: u32) {
         out.fill(0);
         for bank in 0..9 {
-            if let Some((base, size)) = self.mapped_range(bank) {
+            // Engine assembly is the ARM9's view of VRAM.
+            if let Some((base, size)) = self.mapped_range(Core::Arm9, bank) {
                 if (lo..hi).contains(&base) {
                     let off = (base - lo) as usize;
                     let n = (size as usize)
@@ -202,8 +205,8 @@ impl Vram {
         }
     }
 
-    pub fn read(&self, addr: u32, bytes: u32) -> u32 {
-        match self.resolve(addr) {
+    pub fn read(&self, core: Core, addr: u32, bytes: u32) -> u32 {
+        match self.resolve(core, addr) {
             Some((bank, off)) => {
                 let s = &self.banks[bank];
                 let mask = s.len() - 1;
@@ -222,12 +225,12 @@ impl Vram {
         }
     }
 
-    pub fn write(&mut self, addr: u32, value: u32, bytes: u32) {
+    pub fn write(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
         // 8-bit writes to VRAM are ignored on the DS.
         if bytes == 1 {
             return;
         }
-        if let Some((bank, off)) = self.resolve(addr) {
+        if let Some((bank, off)) = self.resolve(core, addr) {
             let s = &mut self.banks[bank];
             let mask = s.len() - 1;
             let b = value.to_le_bytes();
@@ -237,11 +240,11 @@ impl Vram {
         }
     }
 
-    /// Resolve a CPU VRAM address to `(bank, offset)`, or `None` if no enabled
-    /// block is mapped there.
-    fn resolve(&self, addr: u32) -> Option<(usize, usize)> {
+    /// Resolve a CPU VRAM address to `(bank, offset)` for `core`, or `None` if no
+    /// enabled block is mapped there in that core's view.
+    fn resolve(&self, core: Core, addr: u32) -> Option<(usize, usize)> {
         for bank in 0..9 {
-            if let Some((base, size)) = self.mapped_range(bank) {
+            if let Some((base, size)) = self.mapped_range(core, bank) {
                 if addr >= base && addr < base + size {
                     return Some((bank, (addr - base) as usize));
                 }
@@ -250,9 +253,9 @@ impl Vram {
         None
     }
 
-    /// The CPU address range a block occupies under its current `VRAMCNT`, for the
-    /// mappings M2.2 models. `None` if disabled or in an unmodelled mode.
-    fn mapped_range(&self, bank: usize) -> Option<(u32, u32)> {
+    /// The CPU address range a block occupies under its current `VRAMCNT`, in `core`'s
+    /// view. `None` if disabled or in a mode not visible to that core.
+    fn mapped_range(&self, core: Core, bank: usize) -> Option<(u32, u32)> {
         let cnt = self.vramcnt[bank];
         if cnt & 0x80 == 0 {
             return None; // disabled
@@ -260,6 +263,17 @@ impl Vram {
         let mst = cnt & 7;
         let ofs = ((cnt >> 3) & 3) as u32;
         let size = SIZES[bank] as u32;
+        // The ARM7 sees only banks C/D allocated to it as work RAM (MST 2), mapped into
+        // its own 0x0600_0000..0x0640_0000 space (OFS picks the low/high 128 KB half). It
+        // never sees the engine-mapped banks or the LCDC windows — those are the ARM9's.
+        if core == Core::Arm7 {
+            return match (bank, mst) {
+                (2 | 3, 2) => Some((0x0600_0000 + 0x2_0000 * (ofs & 1), size)),
+                _ => None,
+            };
+        }
+        // ARM9 view. Banks C/D at MST 2 are the ARM7's work RAM, so they resolve to
+        // `None` here (the `2 =>` arm below covers only the Engine-OBJ banks).
         let range = match mst {
             // Plain LCDC access.
             0 => LCDC_BASE[bank],
@@ -309,10 +323,10 @@ mod tests {
     fn lcdc_maps_each_block_to_its_fixed_address() {
         let mut vram = Vram::new();
         vram.set_control(2, ENABLE); // block C, MST 0 (LCDC) -> 0x0684_0000
-        vram.write(0x0684_0000, 0xABCD, 2);
-        assert_eq!(vram.read(0x0684_0000, 2), 0xABCD);
+        vram.write(Core::Arm9, 0x0684_0000, 0xABCD, 2);
+        assert_eq!(vram.read(Core::Arm9, 0x0684_0000, 2), 0xABCD);
         // Nothing is mapped at block A's LCDC address (A disabled).
-        assert_eq!(vram.read(0x0680_0000, 2), 0);
+        assert_eq!(vram.read(Core::Arm9, 0x0680_0000, 2), 0);
     }
 
     #[test]
@@ -322,25 +336,43 @@ mod tests {
         // (0x0602_0000). They are disjoint 128 KB windows.
         vram.set_control(0, ENABLE | 1); // MST 1, OFS 0
         vram.set_control(1, ENABLE | 1 | (1 << 3)); // MST 1, OFS 1
-        vram.write(0x0600_0000, 0x1111_1111, 4);
-        vram.write(0x0602_0000, 0x2222_2222, 4);
-        assert_eq!(vram.read(0x0600_0000, 4), 0x1111_1111);
-        assert_eq!(vram.read(0x0602_0000, 4), 0x2222_2222);
+        vram.write(Core::Arm9, 0x0600_0000, 0x1111_1111, 4);
+        vram.write(Core::Arm9, 0x0602_0000, 0x2222_2222, 4);
+        assert_eq!(vram.read(Core::Arm9, 0x0600_0000, 4), 0x1111_1111);
+        assert_eq!(vram.read(Core::Arm9, 0x0602_0000, 4), 0x2222_2222);
     }
 
     #[test]
     fn engine_a_obj_maps_to_the_obj_window() {
         let mut vram = Vram::new();
         vram.set_control(0, ENABLE | 2); // block A, MST 2 (OBJ), OFS 0 -> 0x0640_0000
-        vram.write(0x0640_0100, 0xDEAD_BEEF, 4);
-        assert_eq!(vram.read(0x0640_0100, 4), 0xDEAD_BEEF);
+        vram.write(Core::Arm9, 0x0640_0100, 0xDEAD_BEEF, 4);
+        assert_eq!(vram.read(Core::Arm9, 0x0640_0100, 4), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn arm7_sees_only_its_wram_banks_not_the_engine_banks() {
+        let mut vram = Vram::new();
+        // Bank A -> Engine-A BG (ARM9's); bank C -> ARM7 work RAM (MST 2), OFS 0.
+        vram.set_control(0, ENABLE | 1); // A: MST 1 (Engine A BG) @ 0x0600_0000
+        vram.set_control(2, ENABLE | 2); // C: MST 2 (ARM7 WRAM) @ 0x0600_0000
+        // The ARM9 writes into bank A at 0x0600_0000; the ARM7 writes into bank C at the
+        // same address in its own view. The two must not alias.
+        vram.write(Core::Arm9, 0x0600_0000, 0xAAAA_AAAA, 4);
+        vram.write(Core::Arm7, 0x0600_0000, 0x7777_7777, 4);
+        assert_eq!(vram.read(Core::Arm9, 0x0600_0000, 4), 0xAAAA_AAAA, "ARM9 sees bank A");
+        assert_eq!(vram.read(Core::Arm7, 0x0600_0000, 4), 0x7777_7777, "ARM7 sees bank C");
+        // The ARM7 cannot see the Engine-A OBJ window at all (no ARM7 mapping there).
+        vram.set_control(1, ENABLE | 2); // B: MST 2 (Engine A OBJ) @ 0x0640_0000
+        vram.write(Core::Arm9, 0x0640_0000, 0x1234_5678, 4);
+        assert_eq!(vram.read(Core::Arm7, 0x0640_0000, 4), 0, "ARM7 has no OBJ-window view");
     }
 
     #[test]
     fn eight_bit_writes_are_ignored() {
         let mut vram = Vram::new();
         vram.set_control(0, ENABLE); // A -> LCDC 0x0680_0000
-        vram.write(0x0680_0000, 0xFF, 1);
-        assert_eq!(vram.read(0x0680_0000, 1), 0);
+        vram.write(Core::Arm9, 0x0680_0000, 0xFF, 1);
+        assert_eq!(vram.read(Core::Arm9, 0x0680_0000, 1), 0);
     }
 }
