@@ -5,7 +5,10 @@ edition = "2021"
 description = "Structured debug interface over emulator state"
 
 [dependencies]
+emulator = { path = "../emulator" }
 gba = { path = "../gba" }
+nds = { path = "../nds" }
+video2d = { path = "../video2d" }
 emu-core = { path = "../emu-core" }
 arm = { path = "../arm" }
 serde = { version = "1", features = ["derive"] }

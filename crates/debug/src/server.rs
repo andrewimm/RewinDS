@@ -1,25 +1,35 @@
-//! A TCP debug server speaking newline-delimited JSON.
+//! A TCP debug server speaking newline-delimited JSON, over the console-agnostic
+//! [`Emulator`] facade.
 //!
-//! The emulator runs single-threaded on the main thread (it owns [`System`]); a
-//! listener thread accepts a client and forwards each request line to the main
-//! loop over a channel, so every request is serviced against a consistent state.
+//! The emulator runs single-threaded on the main thread (it owns the [`Emulator`]); a
+//! listener thread accepts a client and forwards each request line to the main loop
+//! over a channel, so every request is serviced against a consistent state.
 //!
 //! Requests are `{"id":N,"method":"ns.method","params":{...}}`; responses are
 //! `{"id":N,"ok":true,"result":...}` or `{"id":N,"ok":false,"error":"..."}`.
+//!
+//! Inspection methods (`run`, `cpu`, `memory`, `video`, `scheduler`, `interrupts`,
+//! `input`) work on both the GBA and the DS. On the DS a `params.engine` (0 = A/main,
+//! 1 = B/sub) selects the 2D engine and `params.core` (0 = ARM9, 1 = ARM7) the CPU/bus;
+//! the GBA ignores them. A handful of advanced GBA-only methods (memory/execution
+//! watches, single-step breakpoints, disassembly, audio) return an error on the DS.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 
-use gba::{Access, Key, System};
+use emulator::Emulator;
+use gba::{Access, System};
 use serde_json::{json, Value};
 
-/// Run the debug server on `port`, owning `system`. Blocks forever (the caller's
-/// thread becomes the emulator/request loop).
-pub fn serve(mut system: System, port: u16) -> std::io::Result<()> {
+use crate::Debugger;
+
+/// Run the debug server on `port`, owning `emu`. Blocks forever (the caller's thread
+/// becomes the emulator/request loop).
+pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("[debug] listening on 127.0.0.1:{port}");
+    eprintln!("[debug] listening on 127.0.0.1:{port} ({:?})", emu.console());
 
     let (tx, rx) = mpsc::channel::<(String, mpsc::Sender<String>)>();
     thread::spawn(move || {
@@ -51,12 +61,12 @@ pub fn serve(mut system: System, port: u16) -> std::io::Result<()> {
     });
 
     while let Ok((line, rtx)) = rx.recv() {
-        let _ = rtx.send(handle(&mut system, &line));
+        let _ = rtx.send(handle(&mut emu, &line));
     }
     Ok(())
 }
 
-fn handle(system: &mut System, line: &str) -> String {
+fn handle(emu: &mut Emulator, line: &str) -> String {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "error": format!("bad json: {e}")}).to_string(),
@@ -64,13 +74,13 @@ fn handle(system: &mut System, line: &str) -> String {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(system, method, &params) {
+    match dispatch(emu, method, &params) {
         Ok(result) => json!({"id": id, "ok": true, "result": result}).to_string(),
         Err(e) => json!({"id": id, "ok": false, "error": e}).to_string(),
     }
 }
 
-// --- helpers ---
+// --- param helpers ---
 
 fn u32p(params: &Value, key: &str) -> u32 {
     params.get(key).and_then(Value::as_u64).unwrap_or(0) as u32
@@ -81,30 +91,28 @@ fn u64p(params: &Value, key: &str, default: u64) -> u64 {
 fn u32p_or(params: &Value, key: &str, default: u32) -> u32 {
     params.get(key).and_then(Value::as_u64).map(|v| v as u32).unwrap_or(default)
 }
-
-fn read8(system: &mut System, addr: u32) -> u8 {
-    system
-        .gba
-        .bus
-        .read8(addr, Access::cpu_data(), &mut system.scheduler)
-        .value
+/// The DS 2D-engine selector (0 = A/main, 1 = B/sub); 0 on the GBA.
+fn enginep(params: &Value) -> usize {
+    params.get("engine").and_then(Value::as_u64).unwrap_or(0) as usize
 }
+/// The DS core selector (0 = ARM9, 1 = ARM7); 0 on the GBA.
+fn corep(params: &Value) -> usize {
+    params.get("core").and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
+/// Borrow the GBA system for a GBA-only method, or produce a uniform error on the DS.
+fn gba_only(emu: &mut Emulator) -> Result<&mut System, String> {
+    emu.as_gba_mut().ok_or_else(|| "method is GBA-only (not available for the DS)".to_string())
+}
+
 fn read16(system: &mut System, addr: u32) -> u16 {
-    system
-        .gba
-        .bus
-        .read16(addr, Access::cpu_data(), &mut system.scheduler)
-        .value
+    system.gba.bus.read16(addr, Access::cpu_data(), &mut system.scheduler).value
 }
 fn read32(system: &mut System, addr: u32) -> u32 {
-    system
-        .gba
-        .bus
-        .read32(addr, Access::cpu_data(), &mut system.scheduler)
-        .value
+    system.gba.bus.read32(addr, Access::cpu_data(), &mut system.scheduler).value
 }
 
-/// The memory region name for an address, for readouts.
+/// The memory region name for a GBA address, for readouts.
 fn region(addr: u32) -> &'static str {
     match addr >> 24 {
         0x00 => "bios",
@@ -120,8 +128,7 @@ fn region(addr: u32) -> &'static str {
     }
 }
 
-/// Base64-encode bytes (standard alphabet), so binary payloads (the framebuffer)
-/// ride in JSON without a dependency.
+/// Base64-encode bytes (standard alphabet), so binary payloads ride in JSON.
 fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -148,33 +155,46 @@ fn addr_entries(watch: &std::collections::HashMap<u32, u64>, top: usize) -> Valu
         .collect::<Vec<_>>())
 }
 
-fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, String> {
+/// A compact "where are we" summary returned by run commands (console-agnostic).
+fn state_summary(emu: &mut Emulator) -> Value {
+    let core = 0;
+    let mut dbg = Debugger::new(emu);
+    let pc = dbg.cpu().pc(core);
+    let mode = dbg.video().current_mode(0);
+    let frame = dbg.emulator().frame();
+    json!({ "console": format!("{:?}", dbg.emulator().console()), "frame": frame, "pc": pc, "videoMode": mode })
+}
+
+fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, String> {
     Ok(match method {
-        // --- run control ---
+        // --- run control (console-agnostic) ---
         "run.frames" => {
             for _ in 0..u64p(params, "n", 1) {
-                system.run_frame();
+                emu.run_frame();
             }
-            state_summary(system)
+            state_summary(emu)
         }
         "run.toFrame" => {
             let target = u64p(params, "frame", 0);
             let mut guard = 0;
-            while system.gba.bus.io.video.frame() < target && guard < 100_000 {
-                system.run_frame();
+            while emu.frame() < target && guard < 100_000 {
+                emu.run_frame();
                 guard += 1;
             }
-            state_summary(system)
+            state_summary(emu)
         }
+
+        // --- run control (GBA-only: single-step machinery) ---
         "run.steps" => {
+            let system = gba_only(emu)?;
             for _ in 0..u64p(params, "n", 1) {
                 system.step();
             }
-            state_summary(system)
+            state_summary(emu)
         }
         "run.untilPc" => {
-            let pc = u32p(params, "pc");
-            let max = u64p(params, "maxSteps", 20_000_000);
+            let (pc, max) = (u32p(params, "pc"), u64p(params, "maxSteps", 20_000_000));
+            let system = gba_only(emu)?;
             let mut steps = 0;
             let mut hit = false;
             while steps < max {
@@ -188,8 +208,8 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             json!({"hit": hit, "steps": steps, "pc": system.cpu.register(15)})
         }
         "run.untilWrite" => {
-            let addr = u32p(params, "addr");
-            let max = u64p(params, "maxSteps", 20_000_000);
+            let (addr, max) = (u32p(params, "addr"), u64p(params, "maxSteps", 20_000_000));
+            let system = gba_only(emu)?;
             system.gba.bus.break_write_addr = Some(addr);
             system.gba.bus.write_hit = false;
             let mut steps = 0;
@@ -208,71 +228,62 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             json!({"hit": writer_pc.is_some(), "writerPc": writer_pc, "steps": steps, "value": read32(system, addr)})
         }
 
-        // --- cpu ---
+        // --- cpu (console-agnostic; `core` selects the DS CPU) ---
         "cpu.registers" => {
-            let cpsr = system.cpu.cpsr();
-            let r: Vec<u32> = (0..16).map(|i| system.cpu.register(i)).collect();
-            json!({
-                "r": r,
-                "pc": system.cpu.register(15),
-                "cpsr": {
-                    "thumb": cpsr.thumb(),
-                    "irqDisabled": cpsr.irq_disabled(),
-                    "fiqDisabled": cpsr.fiq_disabled(),
-                    "mode": format!("{:?}", system.cpu.mode()),
-                }
-            })
+            let core = corep(params);
+            let mut dbg = Debugger::new(emu);
+            let (r, cpsr) = dbg.cpu().registers(core);
+            let mode = format!("{:?}", dbg.cpu().mode(core));
+            json!({ "core": core, "r": r.to_vec(), "pc": r[15], "cpsr": cpsr, "mode": mode })
         }
         "cpu.setReg" => {
-            let index = u32p(params, "index") as usize;
-            system.cpu.set_register(index, u32p(params, "value"));
+            let (index, value) = (u32p(params, "index") as usize, u32p(params, "value"));
+            gba_only(emu)?.cpu.set_register(index, value);
             json!({"ok": true})
         }
 
-        // --- memory ---
+        // --- memory (reads console-agnostic; writes/watches GBA-only) ---
         "memory.read" => {
-            let addr = u32p(params, "addr");
-            let len = u64p(params, "len", 16) as u32;
-            let bytes: Vec<u8> = (0..len).map(|i| read8(system, addr + i)).collect();
+            let (addr, len, core) = (u32p(params, "addr"), u64p(params, "len", 16) as u32, corep(params));
+            let mut dbg = Debugger::new(emu);
+            let bytes: Vec<u8> = (0..len).map(|i| dbg.memory().read8(core, addr + i)).collect();
             json!({"addr": addr, "len": len, "base64": base64(&bytes)})
         }
-        "memory.readU32" => json!({"value": read32(system, u32p(params, "addr"))}),
-        "memory.readU16" => json!({"value": read16(system, u32p(params, "addr"))}),
+        "memory.readU32" => json!({"value": Debugger::new(emu).memory().read32(corep(params), u32p(params, "addr"))}),
+        "memory.readU16" => json!({"value": Debugger::new(emu).memory().read16(corep(params), u32p(params, "addr"))}),
         "memory.writeU32" => {
             let (addr, value) = (u32p(params, "addr"), u32p(params, "value"));
+            let system = gba_only(emu)?;
             system.gba.bus.write32(addr, value, Access::cpu_data(), &mut system.scheduler);
             json!({"ok": true})
         }
         "memory.writeU8" => {
             let (addr, value) = (u32p(params, "addr"), u32p(params, "value") as u8);
+            let system = gba_only(emu)?;
             system.gba.bus.write8(addr, value, Access::cpu_data(), &mut system.scheduler);
             json!({"ok": true})
         }
         "memory.watch" => {
             let enable = params.get("enable").and_then(Value::as_bool).unwrap_or(true);
+            let system = gba_only(emu)?;
             match params.get("kind").and_then(Value::as_str).unwrap_or("writes") {
-                "reads" => {
-                    system.gba.bus.read_watch = enable.then(Default::default);
-                }
-                _ => {
-                    system.gba.bus.write_watch = enable.then(Default::default);
-                }
+                "reads" => system.gba.bus.read_watch = enable.then(Default::default),
+                _ => system.gba.bus.write_watch = enable.then(Default::default),
             }
             json!({"ok": true})
         }
         "memory.watchReport" => {
             let top = u64p(params, "top", 24) as usize;
-            let watch = match params.get("kind").and_then(Value::as_str).unwrap_or("writes") {
-                "reads" => &system.gba.bus.read_watch,
-                _ => &system.gba.bus.write_watch,
-            };
+            let kind = params.get("kind").and_then(Value::as_str).unwrap_or("writes").to_string();
+            let system = gba_only(emu)?;
+            let watch = if kind == "reads" { &system.gba.bus.read_watch } else { &system.gba.bus.write_watch };
             watch.as_ref().map(|w| addr_entries(w, top)).unwrap_or(Value::Null)
         }
 
-        // --- execution profiling / disassembly ---
+        // --- execution profiling / disassembly (GBA-only) ---
         "execution.hottestPc" => {
-            let steps = u64p(params, "steps", 20_000);
-            let top = u64p(params, "top", 12) as usize;
+            let (steps, top) = (u64p(params, "steps", 20_000), u64p(params, "top", 12) as usize);
+            let system = gba_only(emu)?;
             let mut hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
             for _ in 0..steps {
                 system.step();
@@ -281,12 +292,10 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             addr_entries(&hist, top)
         }
         "execution.disassemble" => {
-            let addr = u32p(params, "addr");
-            let count = u64p(params, "count", 16) as u32;
-            let thumb = params
-                .get("thumb")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(|| system.cpu.cpsr().thumb());
+            let (addr, count) = (u32p(params, "addr"), u64p(params, "count", 16) as u32);
+            let thumb_param = params.get("thumb").and_then(Value::as_bool);
+            let system = gba_only(emu)?;
+            let thumb = thumb_param.unwrap_or_else(|| system.cpu.cpsr().thumb());
             let step = if thumb { 2 } else { 4 };
             let lines: Vec<Value> = (0..count)
                 .map(|i| {
@@ -301,12 +310,10 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
                 .collect();
             json!({"thumb": thumb, "lines": lines})
         }
-
         "execution.callStack" => {
-            // Heuristic: scan the stack for Thumb return addresses (ROM code, bit0
-            // set). Not exact, but reveals the call chain up to a high-level frame.
-            let sp = system.cpu.register(13) & !3;
             let top = u32p_or(params, "top", 0x0300_7f00);
+            let system = gba_only(emu)?;
+            let sp = system.cpu.register(13) & !3;
             let mut frames = Vec::new();
             let mut a = sp;
             while a < top && frames.len() < 48 {
@@ -319,111 +326,102 @@ fn dispatch(system: &mut System, method: &str, params: &Value) -> Result<Value, 
             json!({"pc": system.cpu.register(15), "sp": sp, "frames": frames})
         }
 
-        // --- video ---
+        // --- video (console-agnostic; `engine` selects the DS 2D engine) ---
         "video.state" => {
-            let v = &system.gba.bus.io.video;
-            let bgs: Vec<Value> = v
-                .backgrounds()
-                .iter()
-                .enumerate()
-                .map(|(i, b)| json!({"index": i, "enabled": b.enabled, "priority": b.priority, "kind": format!("{:?}", b.kind)}))
-                .collect();
-            let r = &v.registers;
-            json!({"mode": v.current_mode(), "dispcnt": v.read_dispcnt(), "frame": v.frame(), "backgrounds": bgs,
-                   "win_h": r.win_h, "win_v": r.win_v, "winin": r.winin, "winout": r.winout,
-                   "bldcnt": r.bldcnt, "mosaic": r.mosaic})
-        }
-        "video.framebuffer" => {
-            let mut rgba = Vec::with_capacity(240 * 160 * 4);
-            for color in system.framebuffer() {
-                rgba.extend_from_slice(&color.to_rgba8());
+            let engine = enginep(params);
+            let mode = Debugger::new(emu).video().current_mode(engine);
+            let mut out = json!({ "engine": engine, "mode": mode });
+            // GBA carries the richer register/background summary; the DS's per-BG state
+            // is available through video.scanline / video.explainPixel instead.
+            if let Some(system) = emu.as_gba() {
+                let v = &system.gba.bus.io.video;
+                let bgs: Vec<Value> = v
+                    .backgrounds()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| json!({"index": i, "enabled": b.enabled, "priority": b.priority, "kind": format!("{:?}", b.kind)}))
+                    .collect();
+                let r = &v.registers;
+                out = json!({"engine": engine, "mode": v.current_mode(), "dispcnt": v.read_dispcnt(), "frame": v.frame(),
+                             "backgrounds": bgs, "win_h": r.win_h, "win_v": r.win_v, "winin": r.winin,
+                             "winout": r.winout, "bldcnt": r.bldcnt, "mosaic": r.mosaic});
             }
-            json!({"width": 240, "height": 160, "rgba": base64(&rgba)})
+            out
         }
         "video.explainPixel" => {
-            let (x, y) = (u32p(params, "x") as u16, u32p(params, "y") as u16);
-            match system.explain_pixel(x, y) {
-                Ok(ex) => {
-                    let candidates: Vec<Value> = ex
-                        .candidates
-                        .iter()
-                        .map(|c| json!({
-                            "layer": format!("{:?}", c.candidate.layer),
-                            "color": c.candidate.color.0,
-                            "visible": c.visible_after_window,
-                            "addresses": c.provenance.source_addresses(),
-                        }))
-                        .collect();
-                    json!({
-                        "x": ex.x, "y": ex.y,
-                        "finalColor": ex.final_color.0,
-                        "videoMode": ex.video_mode,
-                        "topLayer": format!("{:?}", ex.resolved.top.layer),
-                        "candidates": candidates,
-                    })
-                }
-                Err(e) => return Err(format!("{e:?}")),
-            }
+            let (engine, x, y) = (enginep(params), u32p(params, "x") as u16, u32p(params, "y") as u16);
+            let ex = Debugger::new(emu)
+                .video()
+                .explain_pixel(engine, x, y)
+                .map_err(|e| format!("{e:?}"))?;
+            let candidates: Vec<Value> = ex
+                .candidates
+                .iter()
+                .map(|c| json!({
+                    "layer": format!("{:?}", c.candidate.layer),
+                    "color": c.candidate.color.0,
+                    "visible": c.visible_after_window,
+                    "rejection": c.rejection_reason.as_ref().map(|r| format!("{r:?}")),
+                    "addresses": c.provenance.source_addresses(),
+                }))
+                .collect();
+            json!({
+                "engine": engine, "x": ex.x, "y": ex.y,
+                "finalColor": ex.final_color.0,
+                "videoMode": ex.video_mode,
+                "topLayer": format!("{:?}", ex.resolved.top.layer),
+                "candidates": candidates,
+            })
         }
-        "video.spriteAt" => {
-            let (x, y) = (u32p(params, "x") as u16, u32p(params, "y") as u16);
-            match system.gba.bus.with_video_view(|v, mem| v.sprite_at(x, y, mem)) {
-                Some(p) => json!({
-                    "oamIndex": p.oam_index,
-                    "oamAddress": p.oam_address,
-                    "tileNumber": p.tile_number,
-                    "tileAddress": p.tile_address,
-                    "priority": p.priority,
-                }),
-                None => Value::Null,
+        "video.scanline" => {
+            let (engine, y) = (enginep(params), u32p(params, "y") as u16);
+            let sc = Debugger::new(emu).video().scanline(engine, y);
+            let sprites: Vec<Value> = sc
+                .sprites
+                .iter()
+                .map(|s| json!({"oamIndex": s.oam_index, "x": s.x, "y": s.y, "tile": s.tile_number, "priority": s.priority}))
+                .collect();
+            json!({"engine": engine, "y": y, "sprites": sprites})
+        }
+
+        // --- scheduler / interrupts / input (console-agnostic) ---
+        "scheduler.pendingEvents" => {
+            let mut dbg = Debugger::new(emu);
+            let sched = dbg.scheduler();
+            let events: Vec<Value> = sched
+                .pending_events()
+                .into_iter()
+                .map(|(at, kind)| json!({"at": at, "kind": kind}))
+                .collect();
+            json!({"now": sched.now(), "count": sched.pending_count(), "events": events})
+        }
+        "interrupts.state" => {
+            let core = corep(params);
+            let mut dbg = Debugger::new(emu);
+            let i = dbg.interrupts();
+            json!({"core": core, "ie": i.enabled(core), "if": i.flags(core), "ime": i.master_enable(core),
+                   "pending": i.pending(core), "lineAsserted": i.line_asserted(core)})
+        }
+        "input.set" => {
+            let name = params.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+            let pressed = params.get("pressed").and_then(Value::as_bool).unwrap_or(true);
+            if Debugger::new(emu).input().set_name(&name, pressed) {
+                json!({"ok": true})
+            } else {
+                return Err(format!("unknown key: {name}"));
             }
         }
 
-        // --- scheduler / interrupts / input ---
-        "scheduler.pendingEvents" => {
-            let events: Vec<Value> = system
-                .scheduler
-                .pending_events()
-                .iter()
-                .map(|e| json!({"at": e.at, "kind": format!("{:?}", e.kind)}))
-                .collect();
-            json!({"now": system.scheduler.now(), "events": events})
-        }
-        "interrupts.state" => {
-            let irq = &system.gba.bus.io.irq;
-            json!({"ie": irq.ie(), "if": irq.iflags(), "ime": irq.ime(), "pending": irq.pending()})
-        }
+        // --- GBA-only extras ---
         "audio.take" => {
+            let system = gba_only(emu)?;
             let (clipped, raw_peak) = system.audio_clip_stats();
             let samples = system.take_audio();
             let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
             let nonzero = samples.iter().filter(|&&s| s != 0).count();
-            json!({"count": samples.len(), "peak": peak, "nonzero": nonzero,
-                   "clipped": clipped, "rawPeak": raw_peak})
-        }
-        "input.set" => {
-            let name = params.get("key").and_then(Value::as_str).unwrap_or("");
-            let pressed = params.get("pressed").and_then(Value::as_bool).unwrap_or(true);
-            match Key::from_name(name) {
-                Some(key) => {
-                    system.set_key(key, pressed);
-                    json!({"ok": true})
-                }
-                None => return Err(format!("unknown key: {name}")),
-            }
+            json!({"count": samples.len(), "peak": peak, "nonzero": nonzero, "clipped": clipped, "rawPeak": raw_peak})
         }
 
         other => return Err(format!("unknown method: {other}")),
-    })
-}
-
-/// A compact "where are we" summary returned by run commands.
-fn state_summary(system: &mut System) -> Value {
-    let pc = system.cpu.register(15);
-    json!({
-        "frame": system.gba.bus.io.video.frame(),
-        "pc": pc,
-        "region": region(pc),
-        "dispcnt": system.gba.bus.io.video.read_dispcnt(),
     })
 }

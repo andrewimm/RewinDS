@@ -206,9 +206,12 @@ version = "0.1.0"
 dependencies = [
  "arm",
  "emu-core",
+ "emulator",
  "gba",
+ "nds",
  "serde",
  "serde_json",
+ "video2d",
 ]
 
 [[package]]

@@ -207,6 +207,14 @@ impl Emulator {
         }
     }
 
+    /// The number of video frames presented so far (for frame-targeted run control).
+    pub fn frame(&self) -> u64 {
+        match self {
+            Emulator::Gba(g) => g.system.gba.bus.io.video.frame(),
+            Emulator::Nds(n) => n.system.frame(),
+        }
+    }
+
     /// Advance the machine by one video frame, presenting the result to
     /// [`Self::screen`] and (unless muted) feeding produced samples to the audio
     /// sink from [`Self::enable_audio`].
@@ -352,6 +360,34 @@ impl Emulator {
         match self {
             Emulator::Gba(g) => Some(&mut g.system),
             Emulator::Nds(_) => None,
+        }
+    }
+
+    /// Wrap an already-constructed GBA system as an emulator (for tooling and tests
+    /// that build a system directly rather than through [`Self::load`]).
+    pub fn from_gba_system(system: gba::System) -> Emulator {
+        Emulator::Gba(GbaEmulator::new(system))
+    }
+
+    /// Wrap an already-constructed NDS system as an emulator.
+    pub fn from_nds_system(system: nds::System) -> Emulator {
+        Emulator::Nds(NdsEmulator::new(system))
+    }
+
+    /// The underlying NDS system, if this is an NDS. Counterpart to [`Self::as_gba`],
+    /// for the `debug` inspector's NDS path.
+    pub fn as_nds(&self) -> Option<&nds::System> {
+        match self {
+            Emulator::Nds(n) => Some(&n.system),
+            Emulator::Gba(_) => None,
+        }
+    }
+
+    /// Mutable counterpart to [`Self::as_nds`].
+    pub fn as_nds_mut(&mut self) -> Option<&mut nds::System> {
+        match self {
+            Emulator::Nds(n) => Some(&mut n.system),
+            Emulator::Gba(_) => None,
         }
     }
 

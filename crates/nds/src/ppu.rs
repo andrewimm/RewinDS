@@ -128,16 +128,10 @@ impl Engine {
         }
     }
 
-    /// Composite the BG/OBJ layers through the shared `video2d` renderer: assemble a
-    /// flat view of this engine's banked BG and OBJ VRAM, derive its base offsets, and
-    /// draw every visible line.
-    fn render_graphics(
-        &mut self,
-        vram: &Vram,
-        palette: &[u8],
-        oam: &[u8],
-        three_d: Option<&gpu3d::raster::Framebuffer3d>,
-    ) {
+    /// Assemble this engine's banked BG and OBJ VRAM (plus extended palettes) into the
+    /// flat views the `video2d` renderer samples. Shared by the frame renderer and the
+    /// debug explain path.
+    fn assemble_views(&mut self, vram: &Vram) {
         let (bg_view, obj_view) = self.vram_view.split_at_mut(OBJ_VIEW_BASE as usize);
         if self.is_b {
             vram.assemble_engine_b_bg(bg_view);
@@ -150,10 +144,13 @@ impl Engine {
             vram.assemble_bg_ext_a(&mut self.bg_ext);
             vram.assemble_obj_ext_a(&mut self.obj_ext);
         }
+    }
 
+    /// Derive this engine's `video2d` VRAM layout from its `DISPCNT` (global char/screen
+    /// base, OBJ tile boundary, extended-palette and bitmap-OBJ mapping bits).
+    fn build_layout(&self) -> video2d::VramLayout {
         // Engine A adds a global 64 KB-step char/screen base from DISPCNT (bits 24-26
-        // char, 27-29 screen); Engine B has none. OBJ tiles live in the OBJ half of
-        // the flat view, with the DS tile-OBJ 1D boundary from DISPCNT bits 20-21.
+        // char, 27-29 screen); Engine B has none.
         let (char_base, screen_base) = if self.is_b {
             (0, 0)
         } else {
@@ -162,7 +159,7 @@ impl Engine {
                 ((self.dispcnt >> 27) & 7) * 0x1_0000,
             )
         };
-        let layout = video2d::VramLayout {
+        video2d::VramLayout {
             bg_char_base: char_base,
             bg_screen_base: screen_base,
             obj_tile_base: OBJ_VIEW_BASE,
@@ -178,7 +175,77 @@ impl Engine {
             // The DS character-base field is 4 bits (BGxCNT bits 2-5).
             bg_char_base_mask: 0xF,
             mode_semantics: video2d::ModeSemantics::Ds,
-        };
+        }
+    }
+
+    /// The `video2d` external-BG0 line injected from the 3D engine for scanline `y`, or
+    /// `None` when 3D-BG0 is inactive. `bg0_3d` is the frame's 3D framebuffer already
+    /// gated on `DISPCNT` bit 3.
+    fn bg0_3d_line(
+        bg0_3d: Option<&gpu3d::raster::Framebuffer3d>,
+        y: u16,
+    ) -> Option<[Option<video2d::ExternalBg0Pixel>; WIDTH]> {
+        bg0_3d.map(|fb| {
+            let mut l = [None; WIDTH];
+            for (x, cell) in l.iter_mut().enumerate() {
+                let p = fb.pixels[y as usize * gpu3d::raster::WIDTH + x];
+                if p.covered {
+                    *cell = Some(video2d::ExternalBg0Pixel {
+                        color: video2d::Color15(pack_bgr555(p.color)),
+                        alpha: p.alpha,
+                    });
+                }
+            }
+            l
+        })
+    }
+
+    /// Render scanline `y` for `engine` through a provenance `sink`, reproducing the
+    /// frame renderer's setup for that one line. The engine's real composited framebuffer
+    /// is left untouched (this draws into `render_fb`/`scratch` only). Used by the debug
+    /// explain path to capture per-pixel or per-scanline provenance.
+    fn render_line<S: video2d::debug::sink::ProvenanceSink>(
+        &mut self,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+        y: u16,
+        sink: &mut S,
+    ) {
+        self.assemble_views(vram);
+        let layout = self.build_layout();
+        let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam)
+            .with_ext_palettes(&self.bg_ext, &self.obj_ext);
+        let bg0_3d = three_d.filter(|_| self.dispcnt & (1 << 3) != 0);
+        self.affine.bg2 = video2d::latch::affine_reference_for_line(&self.registers, 0, y);
+        self.affine.bg3 = video2d::latch::affine_reference_for_line(&self.registers, 1, y);
+        video2d::latch::latch_for_scanline(&self.registers, &self.affine, &mut self.latched, &mut self.segments);
+        let line = Self::bg0_3d_line(bg0_3d, y);
+        video2d::render_scanline(
+            &mut self.render_fb,
+            &self.segments,
+            &mut self.scratch,
+            y,
+            &mem,
+            layout,
+            line.as_ref().map(|l| &l[..]),
+            sink,
+        );
+    }
+
+    /// Composite the BG/OBJ layers through the shared `video2d` renderer: assemble a
+    /// flat view of this engine's banked BG and OBJ VRAM, derive its base offsets, and
+    /// draw every visible line.
+    fn render_graphics(
+        &mut self,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+    ) {
+        self.assemble_views(vram);
+        let layout = self.build_layout();
         let mem = video2d::PpuMemoryView::new(&self.vram_view, palette, oam)
             .with_ext_palettes(&self.bg_ext, &self.obj_ext);
         // BG0 sources the 3D engine when DISPCNT bit 3 is set (Engine A only).
@@ -197,19 +264,7 @@ impl Engine {
                 &mut self.latched,
                 &mut self.segments,
             );
-            let line = bg0_3d.map(|fb| {
-                let mut l = [None; WIDTH];
-                for (x, cell) in l.iter_mut().enumerate() {
-                    let p = fb.pixels[y as usize * gpu3d::raster::WIDTH + x];
-                    if p.covered {
-                        *cell = Some(video2d::ExternalBg0Pixel {
-                            color: video2d::Color15(pack_bgr555(p.color)),
-                            alpha: p.alpha,
-                        });
-                    }
-                }
-                l
-            });
+            let line = Self::bg0_3d_line(bg0_3d, y);
             video2d::render_scanline(
                 &mut self.render_fb,
                 &self.segments,
@@ -350,6 +405,63 @@ impl Ppu {
         e.registers.dispcnt = saved;
         e.framebuffer = saved_fb; // restore the real composite (see debug_layer_coverage)
         out
+    }
+
+    /// Debug: full provenance for pixel `(x, y)` on `engine` — which layer won, which
+    /// were rejected and why, and each candidate's tile/map/palette source. Renders one
+    /// line through a capturing sink; the real composited framebuffer is left untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn explain_pixel(
+        &mut self,
+        engine: usize,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+        x: u16,
+        y: u16,
+    ) -> Result<video2d::debug::PixelExplanation, video2d::debug::ExplainError> {
+        if x as usize >= WIDTH || y as usize >= HEIGHT {
+            return Err(video2d::debug::ExplainError::PixelOutsideFramebuffer { x, y });
+        }
+        let pal = &palette[engine * 0x400..engine * 0x400 + 0x400];
+        let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
+        let frame = self.frame;
+        let mut rec = video2d::debug::sink::PixelRecorder::new(x);
+        self.engines[engine].render_line(vram, pal, oam, three_d, y, &mut rec);
+        Ok(rec.finish(frame, y))
+    }
+
+    /// Debug: a whole-scanline summary for `engine` (latched state, visible sprites, the
+    /// isolated final line). Leaves the real composited framebuffer untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_scanline(
+        &mut self,
+        engine: usize,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+        y: u16,
+    ) -> video2d::debug::ScanlineExplanation {
+        let y = y.min(HEIGHT as u16 - 1);
+        let pal = &palette[engine * 0x400..engine * 0x400 + 0x400];
+        let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
+        let mut rec = video2d::debug::sink::ScanlineRecorder::new();
+        let e = &mut self.engines[engine];
+        e.render_line(vram, pal, oam, three_d, y, &mut rec);
+        let state = rec
+            .take_state()
+            .unwrap_or_else(|| video2d::scanline_state_explanation(&e.latched, y));
+        let sprites = e.scratch.sprites.clone();
+        let row = y as usize * WIDTH;
+        let final_line = e.render_fb.pixels[row..row + WIDTH].to_vec().into_boxed_slice();
+        video2d::debug::ScanlineExplanation { state, sprites, final_line }
+    }
+
+    /// The active BG mode (`DISPCNT` bits 0-2) for `engine`.
+    pub fn video_mode(&self, engine: usize) -> u8 {
+        (self.engines[engine].dispcnt & 7) as u8
     }
 
     pub fn write_dispcnt(&mut self, engine: usize, value: u32, bytes: u32) {

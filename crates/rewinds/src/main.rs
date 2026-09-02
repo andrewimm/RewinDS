@@ -98,11 +98,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Headless debug-server mode: the client drives execution and inspects state.
-    // The debug server is a GBA-specific inspector for now, so it takes the
-    // concrete machine out of the facade.
+    // The debug server now drives the console-agnostic facade, so it works for GBA
+    // and DS alike (DS methods take an engine/core selector).
     if let Some(port) = debug_port {
-        let system = emulator.into_gba().expect("debug server supports GBA only");
-        debug::server::serve(system, port)?;
+        debug::server::serve(emulator, port)?;
         return Ok(());
     }
 

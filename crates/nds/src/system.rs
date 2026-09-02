@@ -1032,6 +1032,22 @@ impl System {
         self.scheduler.now()
     }
 
+    /// The earliest pending event's time, if any.
+    pub fn next_deadline(&self) -> Option<Timestamp> {
+        self.scheduler.next_deadline()
+    }
+
+    /// A chronologically sorted snapshot of the pending scheduler events (stale entries
+    /// included; staleness resolves only when an event would fire).
+    pub fn pending_events(&self) -> Vec<emu_core::ScheduledEvent<NdsEvent>> {
+        self.scheduler.pending_events()
+    }
+
+    /// The number of pending scheduler events, stale ones included.
+    pub fn pending_count(&self) -> usize {
+        self.scheduler.pending_count()
+    }
+
     /// Run the machine until the master clock reaches `target`, interleaving the
     /// two cores instruction-by-instruction between event deadlines.
     pub fn run_until(&mut self, target: Timestamp) {
@@ -1285,6 +1301,19 @@ impl System {
         self.machine.extkeyin = ext;
     }
 
+    /// The currently-pressed keypad mask in [`Self::set_keypad`] bit order (A..L, plus X
+    /// = bit 10, Y = bit 11), for read-modify-write of individual buttons.
+    pub fn keypad_pressed(&self) -> u32 {
+        let mut m = (!self.machine.keyinput & 0x03FF) as u32;
+        if self.machine.extkeyin & 0x01 == 0 {
+            m |= 1 << 10; // X
+        }
+        if self.machine.extkeyin & 0x02 == 0 {
+            m |= 1 << 11; // Y
+        }
+        m
+    }
+
     /// Set (or lift) the touchscreen pen. `Some((x, y))` presses at screen pixel
     /// `(x, y)` on the lower screen — routed to the touchscreen ADC (converted from
     /// pixels via the firmware calibration) and reflected in `EXTKEYIN`'s pen-down
@@ -1382,6 +1411,42 @@ impl System {
     pub fn debug_render_layer(&mut self, engine: usize, layer: usize) -> Vec<u16> {
         let m = &mut self.machine;
         m.ppu.debug_render_layer(engine, layer, &m.vram, &m.memory.palette, &m.memory.oam)
+    }
+
+    /// Debug: full per-pixel provenance for `(x, y)` on a 2D engine (0 = A, 1 = B) — the
+    /// winning layer, every rejected candidate with its reason, and each one's source
+    /// tile/map/palette addresses.
+    pub fn explain_pixel(
+        &mut self,
+        engine: usize,
+        x: u16,
+        y: u16,
+    ) -> Result<video2d::debug::PixelExplanation, video2d::debug::ExplainError> {
+        let m = &mut self.machine;
+        let three_d = (engine == 0).then(|| m.gpu3d.framebuffer_3d());
+        m.ppu.explain_pixel(engine, &m.vram, &m.memory.palette, &m.memory.oam, three_d, x, y)
+    }
+
+    /// Debug: a whole-scanline summary for a 2D engine (latched state, visible sprites,
+    /// the isolated final line).
+    pub fn inspect_scanline(&mut self, engine: usize, y: u16) -> video2d::debug::ScanlineExplanation {
+        let m = &mut self.machine;
+        let three_d = (engine == 0).then(|| m.gpu3d.framebuffer_3d());
+        m.ppu.inspect_scanline(engine, &m.vram, &m.memory.palette, &m.memory.oam, three_d, y)
+    }
+
+    /// The active BG mode (`DISPCNT` bits 0-2) for a 2D engine.
+    pub fn video_mode(&self, engine: usize) -> u8 {
+        self.machine.ppu.video_mode(engine)
+    }
+
+    /// Direct read-only views of a 2D engine's palette / OAM (each engine owns a 1 KB
+    /// half of the shared regions).
+    pub fn engine_palette(&self, engine: usize) -> &[u8] {
+        &self.machine.memory.palette[engine * 0x400..engine * 0x400 + 0x400]
+    }
+    pub fn engine_oam(&self, engine: usize) -> &[u8] {
+        &self.machine.memory.oam[engine * 0x400..engine * 0x400 + 0x400]
     }
 
     /// A core's interrupt controller, for inspection and test setup.
