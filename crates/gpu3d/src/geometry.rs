@@ -473,7 +473,17 @@ impl GeometryEngine {
 
             COLOR => self.state.color = color6(unpack_rgb6(params[0])),
             TEXCOORD => {
-                self.state.texcoord = [se16(params[0]), se16(params[0] >> 16)];
+                let raw = [se16(params[0]), se16(params[0] >> 16)];
+                // Texcoord-transform mode 1 ("TexCoord source", TEXIMAGE_PARAM bits
+                // 30-31 = 1) multiplies the coordinate by the texture matrix here, at
+                // the TEXCOORD command — this is how games scale/scroll/rotate texture
+                // coordinates. Modes 0/2/3 are not transformed here (2/3 = env/vertex
+                // mapping, computed at NORMAL/VTX time — not yet modelled).
+                self.state.texcoord = if (self.state.tex_param >> 30) & 3 == 1 {
+                    self.transform_texcoord(raw[0], raw[1])
+                } else {
+                    raw
+                };
             }
 
             DIF_AMB => {
@@ -563,6 +573,18 @@ impl GeometryEngine {
             // BOX/POS/VEC_TEST and unknown opcodes — later phases.
             _ => {}
         }
+    }
+
+    /// Transform a texture coordinate `(s, t)` by the texture matrix per GBATEK's
+    /// texcoord-source formula `(S' T') = (S T 1/16 1/16) · TexMtx`, keeping the result
+    /// in 1.11.4 (`>> 12`). The texture matrix is column-major 4.12 (`m[col*4+row]`);
+    /// `S'` reads column 0, `T'` column 1. `1/16` is `1` in 1.11.4 (a texel is 16).
+    fn transform_texcoord(&self, s: i32, t: i32) -> [i32; 2] {
+        let m = &self.matrix.texture().m;
+        let (s, t, c) = (s as i64, t as i64, 1i64);
+        let sp = (s * m[0] as i64 + t * m[1] as i64 + c * m[2] as i64 + c * m[3] as i64) >> 12;
+        let tp = (s * m[4] as i64 + t * m[5] as i64 + c * m[6] as i64 + c * m[7] as i64) >> 12;
+        [sp as i32, tp as i32]
     }
 
     /// Transform a direction (normal or light vector) by the 3×3 of the directional
@@ -826,6 +848,37 @@ mod tests {
         assert_eq!(poly_xs(&e, 0), vec![e8(0), e8(1), e8(2)]);
         assert_eq!(poly_xs(&e, 1), vec![e8(2), e8(1), e8(3)]);
         assert_eq!(poly_xs(&e, 2), vec![e8(2), e8(3), e8(4)]);
+    }
+
+    #[test]
+    fn texcoord_transform_mode1_scales_by_the_texture_matrix() {
+        // A game scales its texcoords via the texture matrix (mode 1). Without applying
+        // it, small texcoords sample the wrong texels (SM64's stars rendered black).
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[3]); // texture matrix
+        e.execute(op::MTX_IDENTITY, &[]);
+        e.execute(op::MTX_SCALE, &[8 * ONE as u32, 8 * ONE as u32, ONE as u32]); // ×8
+        e.execute(op::MTX_MODE, &[1]); // back to position mode for the geometry
+        e.execute(op::TEXIMAGE_PARAM, &[1 << 30]); // texcoord-transform mode 1
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7)]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::TEXCOORD, &[16 | (16 << 16)]); // s=t=16 (1.11.4 = 1 texel)
+        for (x, y) in [(0i32, 0i32), (2, 0), (0, 2)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, 0]);
+        }
+        // The texture matrix scaled the coordinate ×8: 16 → 128 (8 texels).
+        assert_eq!(e.vertices()[0].texcoord, [128, 128]);
+
+        // Mode 0 (no transform) leaves the raw coordinate.
+        e.execute(op::TEXIMAGE_PARAM, &[0]);
+        e.execute(op::BEGIN_VTXS, &[0]);
+        e.execute(op::TEXCOORD, &[16 | (16 << 16)]);
+        for (x, y) in [(0i32, 0i32), (2, 0), (0, 2)] {
+            let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, 0]);
+        }
+        assert_eq!(e.vertices()[3].texcoord, [16, 16]);
     }
 
     #[test]

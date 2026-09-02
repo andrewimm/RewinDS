@@ -198,12 +198,42 @@ fn dump_frame() {
     // Optionally pulse a keypad mask (CYC_KEYS, KEYINPUT bit order) to advance past
     // input-gated screens: pressed for four frames, released for four.
     let keys = env_hex("CYC_KEYS", 0);
+    let touch: Option<(i32, i32)> = std::env::var("CYC_TOUCH").ok().map(|s| {
+        let mut it = s.split(',').map(|v| v.trim().parse::<i32>().unwrap());
+        (it.next().unwrap(), it.next().unwrap())
+    });
     for f in 0..frames() {
-        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        let down = f % 8 < 4;
+        sys.set_keypad(if keys != 0 && down { keys } else { 0 });
+        if let Some(pt) = touch {
+            sys.set_touch(if down { Some(pt) } else { None });
+        }
         sys.run_frame();
     }
+    // Capture both screens FIRST — the debug_* re-render helpers below clobber the
+    // engine framebuffers (they re-render with three_d=None), so the image must be
+    // taken before any of them run. Both physical screens stacked: 256×384.
+    let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
+    let mut rgb = Vec::with_capacity(256 * 384 * 3);
+    for screen in 0..2 {
+        for &p in sys.screen(screen) {
+            let r = (p & 0x1F) as u8;
+            let g = ((p >> 5) & 0x1F) as u8;
+            let b = ((p >> 10) & 0x1F) as u8;
+            rgb.push((r << 3) | (r >> 2));
+            rgb.push((g << 3) | (g >> 2));
+            rgb.push((b << 3) | (b >> 2));
+        }
+    }
+    let mut ppm = b"P6\n256 384\n255\n".to_vec();
+    ppm.extend_from_slice(&rgb);
+    std::fs::write(&out, ppm).unwrap();
     let dispcnt_a = sys.read(Core::Arm9, 0x0400_0000, 4);
     let dispcnt_b = sys.read(Core::Arm9, 0x0400_1000, 4);
+    let powcnt1 = sys.read(Core::Arm9, 0x0400_0304, 2);
+    let dispcapcnt = sys.read(Core::Arm9, 0x0400_0064, 4);
+    eprintln!("POWCNT1={powcnt1:#06x} A_on_top={} DISPCAPCNT={dispcapcnt:#010x} (enable={})",
+        (powcnt1 >> 15) & 1, (dispcapcnt >> 31) & 1);
     // Engine config summary (Engine B DISPCNT, its BGxCNT, and the 9 VRAMCNT bytes).
     let bgcnt_b: Vec<u16> = (0..4).map(|i| sys.read(Core::Arm9, 0x0400_1008 + i * 2, 2) as u16).collect();
     let vramcnt: Vec<u8> = (0..9).map(|b| sys.vram_control(b)).collect();
@@ -227,22 +257,6 @@ fn dump_frame() {
         let cov = sys.debug_layer_coverage(eng);
         eprintln!("    layer coverage [BG0,BG1,BG2,BG3,OBJ] = {cov:?}");
     }
-    // Both physical screens stacked vertically (top over bottom): 256 x 384.
-    let mut rgb = Vec::with_capacity(256 * 384 * 3);
-    for screen in 0..2 {
-        for &p in sys.screen(screen) {
-            let r = (p & 0x1F) as u8;
-            let g = ((p >> 5) & 0x1F) as u8;
-            let b = ((p >> 10) & 0x1F) as u8;
-            rgb.push((r << 3) | (r >> 2));
-            rgb.push((g << 3) | (g >> 2));
-            rgb.push((b << 3) | (b >> 2));
-        }
-    }
-    let out = expand(&std::env::var("CYC_OUT").expect("CYC_OUT"));
-    let mut ppm = b"P6\n256 384\n255\n".to_vec();
-    ppm.extend_from_slice(&rgb);
-    std::fs::write(&out, ppm).unwrap();
     let (polys, verts) = sys.gpu3d_peak_geometry();
     let (rl_polys, rl_verts) = sys.gpu3d_render_list();
     eprintln!("frame {} DISPCNT_A={dispcnt_a:#010x} DISPCNT_B={dispcnt_b:#010x} 3D-peak polys={polys} verts={verts} render-list polys={rl_polys} verts={rl_verts} -> {out}", frames());
@@ -302,9 +316,30 @@ fn backup_dump() {
 fn rasterize_3d() {
     let mut sys = booted();
     let keys = env_hex("CYC_KEYS", 0);
+    // CYC_TOUCH="x,y" taps the touch panel (pulsed) to advance touch-gated screens.
+    let touch: Option<(i32, i32)> = std::env::var("CYC_TOUCH").ok().map(|s| {
+        let mut it = s.split(',').map(|v| v.trim().parse::<i32>().unwrap());
+        (it.next().unwrap(), it.next().unwrap())
+    });
     for f in 0..frames() {
-        sys.set_keypad(if keys != 0 && f % 8 < 4 { keys } else { 0 });
+        let down = f % 40 < 6;
+        sys.set_keypad(if keys != 0 && down { keys } else { 0 });
+        if let Some(pt) = touch {
+            sys.set_touch(if down { Some(pt) } else { None });
+        }
         sys.run_frame();
+    }
+    // Which engine drives which physical screen, and each engine's display mode.
+    let powcnt1 = sys.read(Core::Arm9, 0x0400_0304, 2);
+    let dca = sys.read(Core::Arm9, 0x0400_0000, 4);
+    let dcb = sys.read(Core::Arm9, 0x0400_1000, 4);
+    eprintln!("POWCNT1={powcnt1:#06x} (A_on_top={}) EngineA: dispmode={} bg0_3d={} EngineB: dispmode={}",
+        (powcnt1 >> 15) & 1, (dca >> 16) & 3, (dca >> 3) & 1, (dcb >> 16) & 3);
+    eprintln!("EngineA coverage={:?}  EngineB coverage={:?}", sys.debug_layer_coverage(0), sys.debug_layer_coverage(1));
+    // Per-poly texture debug: (format, palette base, centre-texel color) — reveals a
+    // textured poly rendering black (e.g. a bad texcoord transform).
+    for (i, (fmt, _off, pb, color, alpha)) in sys.gpu3d_poly_texture_debug().iter().enumerate().take(8) {
+        eprintln!("  poly{i}: fmt={fmt} pltt_base={pb:#x} -> texel={color:?} alpha={alpha}");
     }
     let (polys, verts) = sys.gpu3d_render_list();
     let (vp, clips) = sys.gpu3d_render_geometry();

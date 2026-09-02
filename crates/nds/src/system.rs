@@ -820,8 +820,36 @@ impl System {
         self.machine.gpu3d.clear_color()
     }
 
+    /// Per-polygon texture debug: `(format, image_offset, pltt_base, centre-texel color,
+    /// centre-texel alpha)` sampled from the assembled texture VRAM.
+    pub fn gpu3d_poly_texture_debug(&self) -> Vec<(u8, u32, u32, [u8; 3], u8)> {
+        let mut image = vec![0u8; 0x8_0000];
+        let mut palette = vec![0u8; 0x1_8000];
+        self.machine.vram.assemble_texture_image(&mut image);
+        self.machine.vram.assemble_texture_palette(&mut palette);
+        let tex = gpu3d::texture::TextureSet { image: &image, palette: &palette };
+        self.machine
+            .gpu3d
+            .render_list()
+            .polygons()
+            .iter()
+            .map(|p| {
+                let tp = gpu3d::texture::TexParams::decode(p.tex_param, p.pltt_base);
+                let t = tp.sample(&tex, tp.size_s / 2, tp.size_t / 2);
+                (tp.format, tp.offset, p.pltt_base & 0x1FFF, t.color, t.alpha)
+            })
+            .collect()
+    }
+
     /// Rasterize the 3D engine's sealed render list to a 256×192 RGB8 buffer (covered
     /// pixels as their color, uncovered as black), for debug visualization.
+    /// Debug: render an engine's full composite WITH the current 3D framebuffer.
+    pub fn debug_engine_composite_3d(&mut self, engine: usize) -> Vec<u16> {
+        let m = &mut self.machine;
+        let three_d = m.gpu3d.framebuffer_3d();
+        m.ppu.debug_render_engine(engine, &m.vram, &m.memory.palette, &m.memory.oam, Some(three_d))
+    }
+
     pub fn gpu3d_rasterize_rgb(&self) -> Vec<u8> {
         let mut fb = gpu3d::raster::Framebuffer3d::new();
         let mut image = vec![0u8; 0x8_0000];

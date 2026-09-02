@@ -290,6 +290,9 @@ impl Ppu {
         let backdrop = u16::from_le_bytes([pal[0], pal[1]]) & 0x7FFF;
         let e = &mut self.engines[engine];
         let saved = e.registers.dispcnt;
+        // Preserve the real composited framebuffer — these isolated re-renders must not
+        // leave a no-3D image behind for a later `framebuffer()`/`screen()` read.
+        let saved_fb = e.framebuffer.clone();
         let mut cov = [0usize; 5];
         for (layer, c) in cov.iter_mut().enumerate() {
             let enable = if layer < 4 { 1u16 << (8 + layer) } else { 1 << 12 };
@@ -300,8 +303,24 @@ impl Ppu {
             *c = e.framebuffer.iter().filter(|&&p| (p & 0x7FFF) != backdrop).count();
         }
         e.registers.dispcnt = saved;
-        e.render(vram, pal, oam, None);
+        e.framebuffer = saved_fb;
         cov
+    }
+
+    /// Debug: render `engine`'s full composite with the given 3D framebuffer and return
+    /// a copy of the BGR555 output — to test 3D-BG0 compositing directly.
+    pub fn debug_render_engine(
+        &mut self,
+        engine: usize,
+        vram: &Vram,
+        palette: &[u8],
+        oam: &[u8],
+        three_d: Option<&gpu3d::raster::Framebuffer3d>,
+    ) -> Vec<u16> {
+        let pal = &palette[engine * 0x400..engine * 0x400 + 0x400];
+        let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
+        self.engines[engine].render(vram, pal, oam, three_d);
+        self.engines[engine].framebuffer.clone()
     }
 
     /// Debug: render just BG `layer` (or OBJ = 4) of `engine` in isolation and return
@@ -318,12 +337,13 @@ impl Ppu {
         let oam = &oam[engine * 0x400..engine * 0x400 + 0x400];
         let e = &mut self.engines[engine];
         let saved = e.registers.dispcnt;
+        let saved_fb = e.framebuffer.clone();
         let enable = if layer < 4 { 1u16 << (8 + layer) } else { 1 << 12 };
         e.registers.dispcnt = (saved & !0xFF08) | enable;
         e.render(vram, pal, oam, None);
         let out = e.framebuffer.clone();
         e.registers.dispcnt = saved;
-        e.render(vram, pal, oam, None);
+        e.framebuffer = saved_fb; // restore the real composite (see debug_layer_coverage)
         out
     }
 
