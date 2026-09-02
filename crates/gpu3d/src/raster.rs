@@ -270,6 +270,14 @@ impl RPoly {
             has_translucency,
         }
     }
+
+    /// Representative depth for back-to-front translucent ordering: the centroid depth
+    /// (mean of the projected vertices, `larger = farther`). Averaging normalizes across
+    /// the 3- and 4-vertex polygons so a nearer polygon always sorts after a farther one.
+    fn sort_depth(&self) -> i64 {
+        let sum: i64 = self.pts.iter().map(|v| v.depth as i64).sum();
+        sum / self.pts.len() as i64
+    }
 }
 
 /// Where one edge crosses a scanline, with the interpolated attributes there. Color and
@@ -513,19 +521,32 @@ pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut 
             }
         }
     }
-    // Pass 2: translucent pixels blend over the resolved opaque layer, in submission
-    // order (a first cut ahead of true translucent depth sorting). Shadow polygons
-    // (blend mode 3) run their two-pass stencil algorithm here in the same order: an
-    // ID-0 mask flags the stencil, then an ID≠0 render darkens where it stayed clear.
-    // All of this needs alpha-blending; skipped when it is disabled.
+    // Pass 2: translucent pixels blend over the resolved opaque layer. Per GBATEK the
+    // opaque polygons are always drawn first (Pass 1) and the translucent ones last;
+    // SWAP_BUFFERS bit 0 then selects the order *among* the translucent polygons.
+    //
+    // Manual-sort (bit 0 = 1) keeps submission order — which shadow volumes require, since
+    // their ID-0 mask must be drawn before the ID≠0 render volume. Auto-sort (bit 0 = 0)
+    // draws them back-to-front by depth so a nearer translucent surface blends over a
+    // farther one instead of leaving whichever was submitted last on top. GBATEK documents
+    // that a sort happens but not its key; back-to-front is the order that composites
+    // correctly. Shadow polygons (blend mode 3) run their two-pass stencil algorithm in
+    // this order. All of Pass 2 needs alpha-blending; it is skipped when disabled.
     if cfg.alpha_blend {
+        let mut order: Vec<usize> = (0..polys.len())
+            .filter(|&i| polys[i].blend_mode == 3 || polys[i].has_translucency)
+            .collect();
+        if !list.manual_sort() {
+            // Stable so equal-depth polygons keep submission order; Reverse → farthest first.
+            order.sort_by_key(|&i| std::cmp::Reverse(polys[i].sort_depth()));
+        }
         for y in 0..HEIGHT as i32 {
-            for rp in &polys {
-                match (rp.blend_mode == 3, rp.poly_id, rp.has_translucency) {
-                    (true, 0, _) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowMask),
-                    (true, _, _) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowRender),
-                    (false, _, true) => scan_poly(fb, rp, tex, cfg, y, Pass::Translucent),
-                    _ => {}
+            for &i in &order {
+                let rp = &polys[i];
+                match (rp.blend_mode == 3, rp.poly_id) {
+                    (true, 0) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowMask),
+                    (true, _) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowRender),
+                    (false, _) => scan_poly(fb, rp, tex, cfg, y, Pass::Translucent),
                 }
             }
         }
@@ -716,6 +737,37 @@ mod tests {
         let interior = fb.at(64, 96).color[0]; // one black-over-white blend
         let seam = fb.at(128, 96).color[0]; // the shared edge, world x = 0
         assert_eq!(seam, interior, "seam double-blended ({seam}) vs interior ({interior})");
+    }
+
+    #[test]
+    fn translucent_polys_blend_back_to_front_under_auto_sort() {
+        // Two translucent quads fully overlap over an opaque white background, submitted
+        // near-first. Submission-order blending leaves the FAR quad on top; auto-sort
+        // (SWAP_BUFFERS bit 0 = 0) draws them back-to-front so the NEAR quad blends last
+        // and dominates. Manual-sort (bit 0 = 1) keeps submission order — the opposite.
+        let scene = |swap: u32| -> Framebuffer3d {
+            let mut e = GeometryEngine::new();
+            e.execute(op::MTX_MODE, &[1]); // position mode, identity clip
+            let mut quad = |z: i32, color: u32, attr: u32| {
+                e.execute(op::COLOR, &[color]);
+                e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | attr]);
+                e.execute(op::BEGIN_VTXS, &[1]);
+                for (x, y) in [(-7, 7), (-7, -7), (7, -7), (7, 7)] {
+                    let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+                    e.execute(op::VTX_16, &[lo, e8(z) as u32 & 0xFFFF]);
+                }
+            };
+            let alpha = 16 << 16; // translucent
+            quad(7, 0x7FFF, 0); // opaque white background, far
+            quad(-4, 0x001F, alpha); // near, red, submitted first
+            quad(2, 0x7C00, alpha); // farther translucent, blue, submitted second
+            e.execute(op::SWAP_BUFFERS, &[swap]);
+            rasterize(&e)
+        };
+        let auto = scene(0).at(128, 96).color;
+        let manual = scene(1).at(128, 96).color;
+        assert!(auto[0] > auto[2], "auto-sort: near red on top (R {} > B {})", auto[0], auto[2]);
+        assert!(manual[2] > manual[0], "manual-sort: far blue on top (B {} > R {})", manual[2], manual[0]);
     }
 
     #[test]
