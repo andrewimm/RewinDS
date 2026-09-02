@@ -338,8 +338,9 @@ fn rasterize_3d() {
     eprintln!("EngineA coverage={:?}  EngineB coverage={:?}", sys.debug_layer_coverage(0), sys.debug_layer_coverage(1));
     // Per-poly texture debug: (format, palette base, centre-texel color) — reveals a
     // textured poly rendering black (e.g. a bad texcoord transform).
-    for (i, (fmt, _off, pb, color, alpha)) in sys.gpu3d_poly_texture_debug().iter().enumerate().take(8) {
-        eprintln!("  poly{i}: fmt={fmt} pltt_base={pb:#x} -> texel={color:?} alpha={alpha}");
+    let modes = sys.gpu3d_poly_texcoord_modes();
+    for (i, (fmt, _off, pb, color, alpha)) in sys.gpu3d_poly_texture_debug().iter().enumerate().take(12) {
+        eprintln!("  poly{i}: fmt={fmt} tcmode={} pltt_base={pb:#x} -> texel={color:?} alpha={alpha}", modes.get(i).copied().unwrap_or(0));
     }
     let (polys, verts) = sys.gpu3d_render_list();
     let (vp, clips) = sys.gpu3d_render_geometry();

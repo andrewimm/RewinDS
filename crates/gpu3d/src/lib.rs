@@ -66,6 +66,17 @@ pub struct Gpu3d {
     /// owns the storage but stays ignorant of the VRAM banking that fills it.
     tex_image: Box<[u8]>,
     tex_palette: Box<[u8]>,
+    /// Debug: a ring of the sealed render-list polygon count per swapped frame.
+    poly_log: [u16; 16],
+    poly_log_pos: usize,
+    /// Debug: total GX commands executed (rising = the game is submitting geometry).
+    total_commands: u64,
+    /// Debug: per-opcode execution histogram, indexed by GX command id (0x00..=0x72).
+    cmd_hist: Box<[u64; 128]>,
+    /// Debug: raw 32-bit writes to the packed GXFIFO port (0x4000400) and to the
+    /// direct command ports (0x4000440+) — which channel a game submits commands on.
+    dbg_gxfifo_writes: u64,
+    dbg_port_writes: u64,
 }
 
 impl Default for Gpu3d {
@@ -88,7 +99,56 @@ impl Gpu3d {
             rendered_frame: 0,
             tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
             tex_palette: vec![0u8; 0x1_8000].into_boxed_slice(),
+            poly_log: [0; 16],
+            poly_log_pos: 0,
+            total_commands: 0,
+            cmd_hist: Box::new([0; 128]),
+            dbg_gxfifo_writes: 0,
+            dbg_port_writes: 0,
         }
+    }
+
+    /// Debug: raw `(gxfifo_port_writes, command_port_writes)` — the two submission
+    /// channels. A geometry-less screen with zero of both means the game isn't
+    /// submitting to the GX engine at all through these registers.
+    pub fn channel_writes(&self) -> (u64, u64) {
+        (self.dbg_gxfifo_writes, self.dbg_port_writes)
+    }
+
+    /// Debug: the per-opcode execution histogram (index = GX command id).
+    pub fn cmd_hist(&self) -> &[u64; 128] {
+        &self.cmd_hist
+    }
+
+    /// Debug: total GX commands executed since power-on.
+    pub fn total_commands(&self) -> u64 {
+        self.total_commands
+    }
+
+    /// Debug: geometry `(submitted, clipped_out, culled, emitted)` primitive counts.
+    pub fn pipeline_stats(&self) -> (u64, u64, u64, u64) {
+        self.geometry.pipeline_stats()
+    }
+
+    /// Debug: `(box_tests_run, box_tests_passed)` occlusion-query counts.
+    pub fn box_test_stats(&self) -> (u64, u64) {
+        self.geometry.box_test_stats()
+    }
+
+    /// Debug: `((last_swap_build_polys, verts), emit_dropped)` — what the last swap
+    /// saw in the build buffer, and lifetime polygons dropped by the RAM-full guard.
+    pub fn swap_debug(&self) -> ((usize, usize), u64) {
+        self.geometry.swap_debug()
+    }
+
+    /// Debug: the current (not-yet-sealed) build buffer `(polys, verts)`.
+    pub fn build_len(&self) -> (usize, usize) {
+        self.geometry.build_len()
+    }
+
+    /// Debug: the recent per-swap polygon counts, oldest first.
+    pub fn poly_log(&self) -> Vec<u16> {
+        (0..16).map(|i| self.poly_log[(self.poly_log_pos + i) % 16]).collect()
     }
 
     /// The texture-image VRAM buffer, for the `nds` glue to refresh from banked VRAM
@@ -168,6 +228,8 @@ impl Gpu3d {
     pub fn render_frame(&mut self) {
         let frame = self.geometry.render_list().frame;
         if frame != self.rendered_frame {
+            self.poly_log[self.poly_log_pos % 16] = self.geometry.render_list().polygons().len() as u16;
+            self.poly_log_pos += 1;
             let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
             let cfg = self.render_config();
             raster::render(self.geometry.render_list(), &tex, &cfg, &mut self.framebuffer);
@@ -209,6 +271,10 @@ impl Gpu3d {
                 *p = self.fifo.pop().expect("checked len").param;
             }
             self.geometry.execute(cmd, &params[..n]);
+            self.total_commands += 1;
+            if let Some(slot) = self.cmd_hist.get_mut(cmd as usize) {
+                *slot += 1;
+            }
         }
     }
 
@@ -236,9 +302,11 @@ impl Gpu3d {
     pub fn write_register(&mut self, offset: u32, value: u32, bytes: u32) {
         match offset {
             reg::GXFIFO_LO..reg::GXFIFO_HI => {
+                self.dbg_gxfifo_writes += 1;
                 self.write_gxfifo(value);
             }
             reg::GXFIFO_HI..reg::PORT_HI => {
+                self.dbg_port_writes += 1;
                 let command = ((offset - reg::GXFIFO_LO) >> 2) as u8;
                 self.write_port(command, value);
             }
@@ -296,7 +364,7 @@ impl Gpu3d {
 
     /// `GXSTAT` (`0x4000600`): the FIFO's fill bits merged with the matrix-stack level
     /// and error bits. (Geometry-busy is added when command timing lands.)
-    fn gxstat(&self) -> u32 {
+    pub fn gxstat(&self) -> u32 {
         self.fifo.gxstat_bits() | self.geometry.gxstat_bits()
     }
 }

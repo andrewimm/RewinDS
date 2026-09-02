@@ -87,6 +87,13 @@ impl DmaChannel {
         enabled && cart
     }
 
+    /// Whether this is an ARM9 **GXFIFO DMA** (start mode 7): it streams packed
+    /// geometry commands to the GXFIFO. Games submit heavy 3D scenes this way, so it
+    /// must be handled distinctly from the GBA-shaped [`DmaChannel::timing`] modes.
+    pub fn is_gxfifo(&self, arm9: bool) -> bool {
+        arm9 && (self.control >> 11) & 7 == 7
+    }
+
     pub fn irq_on_end(&self) -> bool {
         self.control & (1 << 14) != 0
     }
@@ -135,6 +142,10 @@ impl DmaChannel {
     }
 
     // Live accessors used by the transfer loop.
+    /// Debug: `(control, source, dest, count)` register snapshot for reporting.
+    pub fn debug_regs(&self) -> (u16, u32, u32, u16) {
+        (self.control, self.source, self.dest, self.count_reg)
+    }
     pub fn internal_source(&self) -> u32 {
         self.internal_source
     }
@@ -147,7 +158,7 @@ impl DmaChannel {
 
     /// Apply a write to `DMAxCNT_H`. An enable edge latches the internal pointers;
     /// returns `true` if this armed an immediate-timing transfer.
-    fn write_control(&mut self, new_control: u16) -> bool {
+    fn write_control(&mut self, new_control: u16, arm9: bool) -> bool {
         let was_enabled = self.enabled;
         self.control = new_control;
         let now_enabled = new_control & (1 << 15) != 0;
@@ -156,7 +167,9 @@ impl DmaChannel {
             self.internal_source = self.masked_source();
             self.internal_dest = self.masked_dest();
             self.internal_count = self.latched_count();
-            armed = self.timing() == DmaTiming::Immediate;
+            // Immediate and (ARM9) GXFIFO DMAs run now — our FIFO drains synchronously,
+            // so a GXFIFO DMA never back-pressures and can transfer in full at once.
+            armed = self.timing() == DmaTiming::Immediate || self.is_gxfifo(arm9);
         }
         self.enabled = now_enabled;
         armed
@@ -227,7 +240,7 @@ impl Dma {
 
     /// Apply a halfword write to a DMA register. Returns `Some(channel)` if the
     /// write armed an immediate transfer on that channel.
-    pub fn write_register(&mut self, offset: u32, value: u16) -> Option<usize> {
+    pub fn write_register(&mut self, offset: u32, value: u16, arm9: bool) -> Option<usize> {
         let (channel, sub) = decode(offset);
         if channel >= 4 {
             return None;
@@ -239,7 +252,7 @@ impl Dma {
             4 => ch.dest = (ch.dest & 0xFFFF_0000) | value as u32,
             6 => ch.dest = (ch.dest & 0x0000_FFFF) | (value as u32) << 16,
             8 => ch.count_reg = value,
-            10 if ch.write_control(value) => return Some(channel),
+            10 if ch.write_control(value, arm9) => return Some(channel),
             _ => {}
         }
         None

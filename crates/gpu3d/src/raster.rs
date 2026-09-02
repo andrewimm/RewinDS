@@ -34,11 +34,17 @@ pub struct Pixel3d {
     pub covered: bool,
 }
 
-/// The 3D engine's 256×192 output buffer plus its depth buffer.
+/// The 3D engine's 256×192 output buffer plus its depth, polygon-ID, and stencil buffers.
 pub struct Framebuffer3d {
     pub pixels: Vec<Pixel3d>,
     /// Per-pixel depth; smaller is nearer. Cleared to the far value each frame.
     depth: Vec<i32>,
+    /// Per-pixel polygon ID of the winning opaque pixel (`POLYGON_ATTR` bits 24-29), so
+    /// shadow polygons can require a *different* ID before darkening a pixel.
+    poly_id: Vec<u8>,
+    /// Per-pixel stencil bit for the two-pass shadow-volume algorithm (set by the shadow
+    /// mask, tested and cleared by the shadow render).
+    stencil: Vec<bool>,
 }
 
 impl Default for Framebuffer3d {
@@ -52,11 +58,12 @@ impl Framebuffer3d {
         Framebuffer3d {
             pixels: vec![Pixel3d::default(); WIDTH * HEIGHT],
             depth: vec![i32::MAX; WIDTH * HEIGHT],
+            poly_id: vec![0xFF; WIDTH * HEIGHT],
+            stencil: vec![false; WIDTH * HEIGHT],
         }
     }
     pub fn clear(&mut self) {
-        self.pixels.iter_mut().for_each(|p| *p = Pixel3d::default());
-        self.depth.iter_mut().for_each(|d| *d = i32::MAX);
+        self.clear_rear([0, 0, 0], 0, i32::MAX);
     }
     /// Initialise every pixel to the rear-plane fill (the 3D "clear color") and the
     /// depth buffer to the clear depth. A rear-plane alpha of 0 is transparent (the
@@ -65,6 +72,8 @@ impl Framebuffer3d {
         let fill = Pixel3d { color, alpha, covered: alpha > 0 };
         self.pixels.iter_mut().for_each(|p| *p = fill);
         self.depth.iter_mut().for_each(|d| *d = depth);
+        self.poly_id.iter_mut().for_each(|p| *p = 0xFF);
+        self.stencil.iter_mut().for_each(|s| *s = false);
     }
     /// The pixel at `(x, y)` (both in range).
     pub fn at(&self, x: usize, y: usize) -> Pixel3d {
@@ -146,16 +155,26 @@ impl Viewport {
     }
 }
 
-/// A vertex projected to integer screen coordinates, carrying the attributes the
-/// rasterizer interpolates: `depth` (smaller = nearer), 6-bit RGB `color`, and the
-/// 1.11.4 texture coordinate `st`.
+/// The reciprocal-`w` fixed-point scale for perspective-correct interpolation: each
+/// vertex carries `iw = IW_ONE / w`, and its color/texcoord premultiplied by `iw`.
+/// Interpolating those linearly in screen space and dividing by the interpolated `iw`
+/// per pixel recovers the perspective-correct attribute (textures no longer swim on
+/// polygons seen at an angle). `1<<28` keeps precision without overflowing `i64` when
+/// premultiplied by texcoords and accumulated across a span.
+const IW_ONE: i64 = 1 << 28;
+
+/// A vertex projected to integer screen coordinates, carrying the perspective-correct
+/// interpolants: `depth` (smaller = nearer, interpolated linearly per the DS depth
+/// buffer), the reciprocal `iw`, and 6-bit RGB `color` / 1.11.4 texcoord `st` each
+/// premultiplied by `iw`.
 #[derive(Clone, Copy)]
 struct RVertex {
     x: i32,
     y: i32,
     depth: i32,
-    color: [i32; 3],
-    st: [i32; 2],
+    iw: i64,
+    cw: [i64; 3],
+    stw: [i64; 2],
 }
 
 /// Perspective divide + viewport transform: clip `(x, y, w)` → screen pixel. Per GBATEK
@@ -176,12 +195,15 @@ fn project(v: &Vertex, vp: &Viewport, w_buffer: bool) -> RVertex {
     // Bottom-origin viewport y (Y1 at the screen bottom), then flip to the top-origin
     // framebuffer row shared with the 2D layers.
     let y_bottom = vp.y1 as i64 + (y + w) * vp_h / (2 * w);
+    // Premultiply color/texcoord by 1/w for perspective-correct interpolation.
+    let iw = IW_ONE / w;
     RVertex {
         x: (vp.x1 as i64 + (x + w) * vp_w / (2 * w)) as i32,
         y: (HEIGHT as i64 - 1 - y_bottom) as i32,
         depth,
-        color: [v.color[0] as i32, v.color[1] as i32, v.color[2] as i32],
-        st: v.texcoord,
+        iw,
+        cw: [v.color[0] as i64 * iw, v.color[1] as i64 * iw, v.color[2] as i64 * iw],
+        stw: [v.texcoord[0] as i64 * iw, v.texcoord[1] as i64 * iw],
     }
 }
 
@@ -194,8 +216,11 @@ struct RPoly {
     tex: TexParams,
     /// Polygon alpha 1–31 (wireframe `0` is treated as solid for now).
     poly_alpha: u8,
-    /// Texture-blend mode (`POLYGON_ATTR` bits 4-5): 0 = modulation, 1 = decal.
+    /// Texture-blend mode (`POLYGON_ATTR` bits 4-5): 0 = modulation, 1 = decal,
+    /// 2 = toon/highlight, 3 = shadow.
     blend_mode: u8,
+    /// Polygon ID (`POLYGON_ATTR` bits 24-29) — the shadow algorithm's identity check.
+    poly_id: u8,
     /// Whether translucent pixels of this polygon update the depth buffer (bit 11).
     trans_depth_write: bool,
     /// Whether any pixel of this polygon can be translucent (skips it in the opaque
@@ -225,39 +250,72 @@ impl RPoly {
             tex,
             poly_alpha,
             blend_mode: ((p.attr >> 4) & 3) as u8,
+            poly_id: ((p.attr >> 24) & 0x3F) as u8,
             trans_depth_write: p.attr & (1 << 11) != 0,
             has_translucency,
         }
     }
 }
 
-/// Where one edge crosses a scanline, with the interpolated attributes there.
+/// Where one edge crosses a scanline, with the interpolated attributes there. Color and
+/// texcoord are carried in their `·iw` (perspective) form; `iw` recovers them per pixel.
 #[derive(Clone, Copy)]
 struct Crossing {
     x: i32,
     depth: i32,
-    color: [i32; 3],
-    st: [i32; 2],
+    iw: i64,
+    cw: [i64; 3],
+    stw: [i64; 2],
 }
 
 /// Interpolate the crossing of edge `a→b` at scanline `y` (caller guarantees `a.y != b.y`).
 fn edge_crossing(a: &RVertex, b: &RVertex, y: i32) -> Crossing {
+    // Evaluate every edge from its upper (smaller-y) vertex, so an edge shared by two
+    // adjacent polygons yields the *identical* crossing for both. Interpolating in the
+    // winding's direction instead lets integer truncation disagree by a pixel between the
+    // two tris — leaving a 1-pixel seam where the rear plane shows through.
+    let (a, b) = if a.y <= b.y { (a, b) } else { (b, a) };
     let tn = (y - a.y) as i64;
     let td = (b.y - a.y) as i64;
-    let lerp = |va: i32, vb: i32| (va as i64 + (vb as i64 - va as i64) * tn / td) as i32;
+    let lerp = |va: i64, vb: i64| va + (vb - va) * tn / td;
     Crossing {
-        x: lerp(a.x, b.x),
-        depth: lerp(a.depth, b.depth),
-        color: [lerp(a.color[0], b.color[0]), lerp(a.color[1], b.color[1]), lerp(a.color[2], b.color[2])],
-        st: [lerp(a.st[0], b.st[0]), lerp(a.st[1], b.st[1])],
+        x: lerp(a.x as i64, b.x as i64) as i32,
+        depth: lerp(a.depth as i64, b.depth as i64) as i32,
+        iw: lerp(a.iw, b.iw),
+        cw: [lerp(a.cw[0], b.cw[0]), lerp(a.cw[1], b.cw[1]), lerp(a.cw[2], b.cw[2])],
+        stw: [lerp(a.stw[0], b.stw[0]), lerp(a.stw[1], b.stw[1])],
     }
 }
 
-/// Which pixels a fill pass writes: opaque pixels first, then translucent blended over.
+/// Which pixels a fill pass writes: opaque first, then translucent blended over, then the
+/// two shadow-volume passes (mask sets the stencil, render darkens where it is clear).
 #[derive(Clone, Copy, PartialEq)]
 enum Pass {
     Opaque,
     Translucent,
+    ShadowMask,
+    ShadowRender,
+}
+
+/// Blend a translucent source (color + 5-bit alpha) over the resolved destination pixel,
+/// per GBATEK: `out = (src·(A+1) + dst·(31−A)) / 32`, keeping the larger alpha as the
+/// composite coverage. When the destination is transparent the source is written as-is,
+/// so its alpha carries the coverage into the 2D composite instead of blending to black.
+fn blend_over(dst: Pixel3d, rgb: [u8; 3], alpha: u8) -> Pixel3d {
+    if !dst.covered {
+        return Pixel3d { color: rgb, alpha, covered: true };
+    }
+    let a = alpha as i32;
+    let b = |s: i32, d: i32| ((s * (a + 1) + d * (31 - a)) / 32) as u8;
+    Pixel3d {
+        color: [
+            b(rgb[0] as i32, dst.color[0] as i32),
+            b(rgb[1] as i32, dst.color[1] as i32),
+            b(rgb[2] as i32, dst.color[2] as i32),
+        ],
+        alpha: a.max(dst.alpha as i32) as u8,
+        covered: true,
+    }
 }
 
 /// Combine a (possibly textured) polygon's interpolated vertex color with a sampled
@@ -331,14 +389,24 @@ fn fill_span(
     let row = y as usize * WIDTH;
     for x in xl..=xr {
         let sn = (x - l.x) as i64;
-        let lerp = |va: i32, vb: i32| (va as i64 + (vb as i64 - va as i64) * sn / span) as i32;
+        let lerp = |va: i64, vb: i64| va + (vb - va) * sn / span;
         let idx = row + x as usize;
-        let depth = lerp(l.depth, r.depth);
+        let depth = lerp(l.depth as i64, r.depth as i64) as i32;
         if depth >= fb.depth[idx] {
             continue; // occluded by a nearer (or equal) pixel already drawn
         }
-        let color = [lerp(l.color[0], r.color[0]), lerp(l.color[1], r.color[1]), lerp(l.color[2], r.color[2])];
-        let st = [lerp(l.st[0], r.st[0]), lerp(l.st[1], r.st[1])];
+        // Shadow mask (step 1): the back-face volume is nearer than the scene here, so
+        // flag the stencil. Writes no color and no depth — needs no shading.
+        if pass == Pass::ShadowMask {
+            fb.stencil[idx] = true;
+            continue;
+        }
+        // Recover perspective-correct attributes: divide each ·iw interpolant by the
+        // interpolated iw at this pixel.
+        let iw = lerp(l.iw, r.iw).max(1);
+        let recover = |a: i64, b: i64| (lerp(a, b) / iw) as i32;
+        let color = [recover(l.cw[0], r.cw[0]), recover(l.cw[1], r.cw[1]), recover(l.cw[2], r.cw[2])];
+        let st = [recover(l.stw[0], r.stw[0]), recover(l.stw[1], r.stw[1])];
         let (rgb, alpha) = shade(rp, tex, cfg, color, st);
         if !cfg.alpha_passes(alpha) {
             continue; // failed the alpha test (or fully transparent)
@@ -350,31 +418,23 @@ fn fill_span(
                 // blend-disabled translucent pixel keeps its own alpha in the buffer).
                 fb.pixels[idx] = Pixel3d { color: rgb, alpha, covered: true };
                 fb.depth[idx] = depth;
+                fb.poly_id[idx] = rp.poly_id;
             }
             Pass::Translucent if !opaque_pixel => {
-                let dst = fb.pixels[idx];
-                let a = alpha as i32;
-                // GBATEK: FrameBuf = (Poly·(A+1) + FrameBuf·(31−A)) / 32, FrameBuf[A] =
-                // max(A, FrameBuf[A]). Bypassed when the destination is transparent
-                // (FrameBuf[A] = 0) — then the source is written as-is, so its alpha
-                // carries the coverage into the 2D composite instead of blending to black.
-                let (out_color, out_alpha) = if dst.covered {
-                    let blend = |s: i32, d: i32| ((s * (a + 1) + d * (31 - a)) / 32) as u8;
-                    (
-                        [
-                            blend(rgb[0] as i32, dst.color[0] as i32),
-                            blend(rgb[1] as i32, dst.color[1] as i32),
-                            blend(rgb[2] as i32, dst.color[2] as i32),
-                        ],
-                        a.max(dst.alpha as i32) as u8,
-                    )
-                } else {
-                    (rgb, alpha)
-                };
-                fb.pixels[idx] = Pixel3d { color: out_color, alpha: out_alpha, covered: true };
+                fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
                 if rp.trans_depth_write {
                     fb.depth[idx] = depth;
                 }
+            }
+            // Shadow render (step 2): the front-face volume is nearer than the scene here;
+            // darken the pixel only where the mask left the stencil clear and the covered
+            // polygon has a different ID (never shadow a surface onto itself). The stencil
+            // is reset after this test, per GBATEK.
+            Pass::ShadowRender => {
+                if !fb.stencil[idx] && fb.poly_id[idx] != rp.poly_id {
+                    fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
+                }
+                fb.stencil[idx] = false;
             }
             _ => {}
         }
@@ -388,7 +448,7 @@ fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, cfg: &RenderC
     }
     // A convex polygon crosses the scanline at exactly two edges (each vertex counted
     // once via the half-open y test); the span runs between them.
-    let mut crossings = [Crossing { x: 0, depth: 0, color: [0; 3], st: [0; 2] }; 2];
+    let mut crossings = [Crossing { x: 0, depth: 0, iw: 1, cw: [0; 3], stw: [0; 2] }; 2];
     let mut count = 0;
     let n = rp.pts.len();
     for i in 0..n {
@@ -426,21 +486,28 @@ pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut 
         .map(|p| RPoly::build(p, verts, &vp, w_buffer))
         .collect();
 
-    // Pass 1: opaque pixels of every polygon (depth-tested, write depth). When
-    // alpha-blending is disabled, every passing pixel is drawn here as opaque.
+    // Pass 1: opaque pixels of every non-shadow polygon (depth-tested, write depth and
+    // polygon ID). When alpha-blending is disabled, every passing pixel is drawn opaque.
     for y in 0..HEIGHT as i32 {
         for rp in &polys {
-            scan_poly(fb, rp, tex, cfg, y, Pass::Opaque);
+            if rp.blend_mode != 3 {
+                scan_poly(fb, rp, tex, cfg, y, Pass::Opaque);
+            }
         }
     }
     // Pass 2: translucent pixels blend over the resolved opaque layer, in submission
-    // order (a first cut ahead of true translucent depth sorting). Skipped entirely
-    // when alpha-blending is disabled.
+    // order (a first cut ahead of true translucent depth sorting). Shadow polygons
+    // (blend mode 3) run their two-pass stencil algorithm here in the same order: an
+    // ID-0 mask flags the stencil, then an ID≠0 render darkens where it stayed clear.
+    // All of this needs alpha-blending; skipped when it is disabled.
     if cfg.alpha_blend {
         for y in 0..HEIGHT as i32 {
             for rp in &polys {
-                if rp.has_translucency {
-                    scan_poly(fb, rp, tex, cfg, y, Pass::Translucent);
+                match (rp.blend_mode == 3, rp.poly_id, rp.has_translucency) {
+                    (true, 0, _) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowMask),
+                    (true, _, _) => scan_poly(fb, rp, tex, cfg, y, Pass::ShadowRender),
+                    (false, _, true) => scan_poly(fb, rp, tex, cfg, y, Pass::Translucent),
+                    _ => {}
                 }
             }
         }
@@ -512,6 +579,89 @@ mod tests {
         assert!(!fb.at(0, 0).covered, "top-left corner is outside");
         assert!(!fb.at(0, 96).covered, "left edge is outside the span");
         assert!(!fb.at(128, 10).covered, "above the triangle's top edge");
+    }
+
+    #[test]
+    fn perspective_correct_interpolation_biases_toward_the_near_vertex() {
+        // A quad receding in depth: its left edge is near (w = 2, bright red) and its
+        // right edge far (w = 6, black). A projection with clip.w = z makes the divisor
+        // vary across the span, so perspective-correct interpolation keeps the near-bright
+        // side dominant well past the geometric midpoint — where a linear (w-agnostic)
+        // average would read ~half red. This test fails under the old linear interpolation.
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[0]); // projection
+        let o = ONE as u32;
+        // Column-major map (x, y, z, 1) -> (x, y, z, z): w = z.
+        e.execute(op::MTX_LOAD_4X4, &[o, 0, 0, 0, 0, o, 0, 0, 0, 0, o, o, 0, 0, 0, 0]);
+        e.execute(op::MTX_MODE, &[1]); // position (identity)
+        e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7)]); // both faces
+        e.execute(op::BEGIN_VTXS, &[1]); // quad
+        let mut vtx = |x: i32, y: i32, z: i32, r: u32| {
+            e.execute(op::COLOR, &[r]);
+            let lo = (x as u32 & 0xFFFF) | ((y as u32 & 0xFFFF) << 16);
+            e.execute(op::VTX_16, &[lo, z as u32 & 0xFFFF]);
+        };
+        vtx(-ONE, ONE, 2 * ONE, 0x1F); // left edge: near (w=2), red
+        vtx(-ONE, -ONE, 2 * ONE, 0x1F);
+        vtx(ONE, -ONE, 6 * ONE, 0x00); // right edge: far (w=6), black
+        vtx(ONE, ONE, 6 * ONE, 0x00);
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        let fb = rasterize(&e);
+        // Widest covered row, then its middle covered pixel.
+        let mut best: Option<(usize, usize, usize)> = None;
+        for y in 0..HEIGHT {
+            let xs: Vec<usize> = (0..WIDTH).filter(|&x| fb.at(x, y).covered).collect();
+            if let (Some(&xl), Some(&xr)) = (xs.first(), xs.last()) {
+                if best.is_none_or(|(_, bl, br)| xr - xl > br - bl) {
+                    best = Some((y, xl, xr));
+                }
+            }
+        }
+        let (y, xl, xr) = best.expect("the quad covered some pixels");
+        let mid = fb.at((xl + xr) / 2, y);
+        assert!(mid.color[0] > 40, "screen-midpoint red {} should be near-biased (linear≈31)", mid.color[0]);
+    }
+
+    #[test]
+    fn shadow_volume_darkens_only_where_the_mask_left_the_stencil_clear() {
+        // Opaque white ground (ID 1) fills the view. A shadow MASK (mode 3, ID 0) covers
+        // the left half and, being nearer, flags the stencil there. A shadow RENDER
+        // (mode 3, ID 2, translucent black) covers the whole view but darkens only where
+        // the stencil stayed clear (the right half) and the ID differs. So the left half
+        // stays white and the right half is darkened — not a solid black volume.
+        let mut e = GeometryEngine::new();
+        e.execute(op::MTX_MODE, &[1]); // position mode, identity clip
+        let mut quad = |corners: [(i32, i32); 4], z: i32, color: u32, attr: u32| {
+            e.execute(op::COLOR, &[color]);
+            e.execute(op::POLYGON_ATTR, &[(1 << 6) | (1 << 7) | attr]); // both faces
+            e.execute(op::BEGIN_VTXS, &[1]); // quad
+            for (x, y) in corners {
+                let lo = (e8(x) as u32 & 0xFFFF) | ((e8(y) as u32 & 0xFFFF) << 16);
+                e.execute(op::VTX_16, &[lo, e8(z) as u32 & 0xFFFF]);
+            }
+        };
+        let full = [(-7, 7), (-7, -7), (7, -7), (7, 7)];
+        let left = [(-7, 7), (-7, -7), (0, -7), (0, 7)];
+        quad(full, 4, 0x7FFF, 1 << 24); // ground: white, far, poly ID 1
+        quad(left, -4, 0x0000, (3 << 4) | (10 << 16)); // mask: mode 3, ID 0, near
+        quad(full, -4, 0x0000, (3 << 4) | (10 << 16) | (2 << 24)); // render: mode 3, ID 2
+        e.execute(op::SWAP_BUFFERS, &[0]);
+        let fb = rasterize(&e);
+        assert_eq!(fb.at(64, 96).color[0], 63, "left half masked → stays white");
+        let right = fb.at(192, 96);
+        assert!(right.covered && right.color[0] < 55, "right half shadowed → darkened ({})", right.color[0]);
+    }
+
+    #[test]
+    fn shared_edges_rasterize_without_seams() {
+        // A shared edge must yield the identical crossing regardless of winding direction,
+        // or adjacent triangles leave a 1-pixel seam. (0,0)→(10,3) is a slope where naive
+        // truncation disagrees by a pixel depending on which end you interpolate from.
+        let mk = |x: i32, y: i32| RVertex { x, y, depth: 0, iw: 1 << 20, cw: [0; 3], stw: [0; 2] };
+        let (a, b) = (mk(0, 0), mk(10, 3));
+        for y in 1..=2 {
+            assert_eq!(edge_crossing(&a, &b, y).x, edge_crossing(&b, &a, y).x, "seam at y={y}");
+        }
     }
 
     #[test]

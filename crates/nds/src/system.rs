@@ -264,6 +264,8 @@ pub struct Machine {
     pub(crate) sound: crate::sound::Sound,
     /// The ARM9 3D graphics engine (geometry command FIFO + rasterizer).
     pub(crate) gpu3d: gpu3d::Gpu3d,
+    /// Debug: total words streamed through GXFIFO DMA (confirms it is being used).
+    pub(crate) gxfifo_dma_words: u64,
     /// The ARM9 hardware division and square-root units.
     pub(crate) math: crate::math::Math,
     /// ARM9 instruction- and data-cache timing models (hit/miss cycle costs only):
@@ -318,6 +320,7 @@ impl Machine {
             rtc: crate::rtc::Rtc::new(),
             sound: crate::sound::Sound::new(),
             gpu3d: gpu3d::Gpu3d::new(),
+            gxfifo_dma_words: 0,
             math: crate::math::Math::new(),
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
@@ -351,6 +354,17 @@ impl Machine {
             self.vram.write(addr, value, bytes);
             return;
         }
+        // A DMA into the ARM9 3D/geometry register block (GXFIFO + command ports)
+        // must reach the GX engine, not the memory map — games stream display lists
+        // by DMAing them to the GXFIFO at 0x4000400. The plain memory path drops
+        // I/O writes (`map` returns `None`), so route this range explicitly, mirroring
+        // the CPU bus's `io_write`. (The GX block needs no scheduler, unlike the rest
+        // of I/O, so it is safe to handle here.)
+        if core == Core::Arm9 && (addr == 0x0400_0060 || (0x0400_0320..0x0400_06A8).contains(&addr)) {
+            self.gpu3d.write_register(addr - 0x0400_0000, value, bytes);
+            self.gpu3d.run_pending();
+            return;
+        }
         match bytes {
             1 => self.memory.write8(core, addr, value as u8, &self.cp15),
             2 => self.memory.write16(core, addr, value as u16, &self.cp15),
@@ -380,6 +394,28 @@ impl Machine {
             dest = dest.wrapping_add(dest_step);
         }
         self.dma[c].channels[channel].complete(source, dest);
+        if ch.irq_on_end() {
+            self.interrupts[c].request(crate::dma::irq_source(channel));
+        }
+    }
+
+    /// Run a **GXFIFO DMA** (ARM9 start mode 7): read each 32-bit word from the source
+    /// and push it straight into the 3D engine's command FIFO (the ordinary DMA path
+    /// writes to the memory map, which does not route to the GX registers). Since the
+    /// FIFO drains synchronously, the whole batch transfers at once.
+    fn run_gxfifo_dma(&mut self, core: Core, channel: usize) {
+        let c = core.index();
+        let ch = self.dma[c].channels[channel];
+        let source_step = ch.source_step();
+        let mut source = ch.internal_source();
+        for _ in 0..ch.internal_count() {
+            let word = self.data_read(core, source, 4);
+            self.gpu3d.write_gxfifo(word);
+            self.gpu3d.run_pending();
+            source = source.wrapping_add(source_step);
+        }
+        self.gxfifo_dma_words += ch.internal_count() as u64;
+        self.dma[c].channels[channel].complete(source, ch.internal_dest());
         if ch.irq_on_end() {
             self.interrupts[c].request(crate::dma::irq_source(channel));
         }
@@ -554,14 +590,19 @@ impl Machine {
         // runs to completion here.
         if (0x0400_00B0..0x0400_00E0).contains(&addr) {
             let base = addr & 0xFF;
+            let arm9 = core == Core::Arm9;
             let armed = if bytes == 4 {
-                self.dma[c].write_register(base, value as u16);
-                self.dma[c].write_register(base + 2, (value >> 16) as u16)
+                self.dma[c].write_register(base, value as u16, arm9);
+                self.dma[c].write_register(base + 2, (value >> 16) as u16, arm9)
             } else {
-                self.dma[c].write_register(base, value as u16)
+                self.dma[c].write_register(base, value as u16, arm9)
             };
             if let Some(channel) = armed {
-                self.run_dma_channel(core, channel);
+                if self.dma[c].channels[channel].is_gxfifo(arm9) {
+                    self.run_gxfifo_dma(core, channel);
+                } else {
+                    self.run_dma_channel(core, channel);
+                }
             }
             return;
         }
@@ -741,6 +782,9 @@ pub struct System {
     machine: Machine,
     /// Whether the recurring sound-sample event has been scheduled.
     audio_started: bool,
+    /// Debug: snapshot of `(total_commands, submitted, emitted, cmd_hist)` at the
+    /// previous `debug_report` call, so each report can show the delta since then.
+    dbg_prev: Option<(u64, u64, u64, Box<[u64; 128]>)>,
 }
 
 impl Default for System {
@@ -758,6 +802,7 @@ impl System {
             scheduler: Scheduler::new(),
             machine: Machine::new(),
             audio_started: false,
+            dbg_prev: None,
         }
     }
 
@@ -818,6 +863,22 @@ impl System {
     /// `CLEAR_COLOR` (`0x4000350`) — the rear-plane color/alpha register, for debug.
     pub fn gpu3d_clear_color(&self) -> u32 {
         self.machine.gpu3d.clear_color()
+    }
+
+    /// Recent per-swap 3D polygon counts (oldest first), for debug.
+    pub fn gpu3d_poly_log(&self) -> Vec<u16> {
+        self.machine.gpu3d.poly_log()
+    }
+
+    /// Per-polygon texcoord-transform mode (`TEXIMAGE_PARAM` bits 30-31), for debug.
+    pub fn gpu3d_poly_texcoord_modes(&self) -> Vec<u8> {
+        self.machine
+            .gpu3d
+            .render_list()
+            .polygons()
+            .iter()
+            .map(|p| ((p.tex_param >> 30) & 3) as u8)
+            .collect()
     }
 
     /// Per-polygon texture debug: `(format, image_offset, pltt_base, centre-texel color,
@@ -1274,6 +1335,149 @@ impl System {
     }
 
     /// Read memory/VRAM as `core`'s CPU would (I/O routes to [`Self::io_read`]).
+    /// A one-shot human-readable diagnostic of the current 2D/3D graphics state — the
+    /// screen assignment, both engines' config, and the sealed 3D render list — for a
+    /// host "dump state" key while a game sits on a screen of interest.
+    pub fn debug_report(&mut self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let rd = |sys: &mut Self, a: u32| sys.read(Core::Arm9, a, 4);
+        let powcnt1 = self.read(Core::Arm9, 0x0400_0304, 2);
+        let disp3d = self.read(Core::Arm9, 0x0400_0060, 2);
+        let clear = self.gpu3d_clear_color();
+        let _ = writeln!(s, "POWCNT1={powcnt1:#06x} (EngineA_on_top={})", (powcnt1 >> 15) & 1);
+        let _ = writeln!(s, "DISP3DCNT={disp3d:#06x} (tex_en={} alpha_test={} alpha_blend={} rear_bitmap={})",
+            disp3d & 1, (disp3d >> 2) & 1, (disp3d >> 3) & 1, (disp3d >> 14) & 1);
+        let _ = writeln!(s, "CLEAR_COLOR={clear:#010x} (rgb5=[{},{},{}] alpha={})",
+            clear & 0x1F, (clear >> 5) & 0x1F, (clear >> 10) & 0x1F, (clear >> 16) & 0x1F);
+        for (eng, base) in [(0usize, 0x0400_0000u32), (1, 0x0400_1000)] {
+            let dc = rd(self, base);
+            let r = self.engine_registers(eng);
+            let _ = writeln!(s, "Engine{} DISPCNT={dc:#010x} mode={} dispmode={} 3d_bg0={} ext_pal={} cov={:?}",
+                if eng == 0 { "A" } else { "B" }, dc & 7, (dc >> 16) & 3, (dc >> 3) & 1, (dc >> 30) & 3,
+                self.debug_layer_coverage(eng));
+            for bg in 0..4 {
+                let _ = writeln!(s, "  BG{bg} en={} BGCNT={:#06x} prio={} bit7={} bit2={} size={} hofs={} vofs={} affine(PA={} PD={} X={} Y={})",
+                    r.dispcnt & (1 << (8 + bg)) != 0, r.bgcnt[bg], r.bgcnt[bg] & 3,
+                    (r.bgcnt[bg] >> 7) & 1, (r.bgcnt[bg] >> 2) & 1, (r.bgcnt[bg] >> 14) & 3,
+                    r.bg_hofs[bg], r.bg_vofs[bg],
+                    if bg >= 2 { r.bg_pa[bg - 2] } else { 0 }, if bg >= 2 { r.bg_pd[bg - 2] } else { 0 },
+                    if bg >= 2 { r.bg_ref_x[bg - 2] } else { 0 }, if bg >= 2 { r.bg_ref_y[bg - 2] } else { 0 });
+            }
+        }
+        let (polys, verts) = self.gpu3d_render_list();
+        let (peak_p, peak_v) = self.gpu3d_peak_geometry();
+        let ram_count = self.read(Core::Arm9, 0x0400_0604, 4);
+        let _ = writeln!(s, "3D render list: {polys} polys, {verts} verts | peak {peak_p}/{peak_v} | RAM_COUNT={ram_count:#010x} (build polys={} verts={}) | GXFIFO-DMA words={}",
+            ram_count & 0xFFF, (ram_count >> 16) & 0x1FFF, self.machine.gxfifo_dma_words);
+        // Breakdown of the sealed render list by shading path — reveals whether polys
+        // are textured, and which blend mode (0=modulate 1=decal 2=toon/highlight
+        // 3=shadow) and opacity they use, to diagnose miscoloured/washed-out 3D.
+        let (_, summary) = self.gpu3d_poly_summary();
+        let (mut modes, mut textured, mut opaque, mut translucent, mut wire) = ([0u32; 4], 0u32, 0u32, 0u32, 0u32);
+        for &(fmt, alpha, mode) in &summary {
+            modes[mode as usize & 3] += 1;
+            if fmt != 0 { textured += 1; }
+            match alpha { 0 => wire += 1, 31 => opaque += 1, _ => translucent += 1 }
+        }
+        let _ = writeln!(s, "render-list shading: textured={textured}/{} untextured={} | blend[modulate={} decal={} toon={} shadow={}] | opaque={opaque} translucent={translucent} wire/opaque0={wire}",
+            summary.len(), summary.len() as u32 - textured, modes[0], modes[1], modes[2], modes[3]);
+        let total = self.machine.gpu3d.total_commands();
+        let (gxw, portw) = self.machine.gpu3d.channel_writes();
+        let _ = writeln!(s, "recent per-swap poly counts: {:?} | total GX commands executed={total}",
+            self.gpu3d_poly_log());
+        let _ = writeln!(s, "GX submission channels (lifetime): gxfifo_port_writes={gxw} command_port_writes={portw}");
+        let (sub, clip, cull, emit) = self.machine.gpu3d.pipeline_stats();
+        let _ = writeln!(s, "geometry pipeline (lifetime): submitted={sub} clipped_out={clip} culled={cull} emitted={emit}");
+        let (bt_run, bt_pass) = self.machine.gpu3d.box_test_stats();
+        let _ = writeln!(s, "box tests (lifetime): run={bt_run} passed_inside={bt_pass} gxstat=0x{:08X}",
+            self.machine.gpu3d.gxstat());
+        let ((sw_p, sw_v), dropped) = self.machine.gpu3d.swap_debug();
+        let (bl_p, bl_v) = self.machine.gpu3d.build_len();
+        let _ = writeln!(s, "swap/build: last_swap_saw_build={sw_p}p/{sw_v}v current_build={bl_p}p/{bl_v}v emit_dropped(RAM full)={dropped}");
+        // ARM9 DMA channels: any channel enabled and pointed at the GXFIFO (0x4000400)
+        // is streaming a display list — the geometry path this screen may depend on.
+        for ch in 0..4 {
+            let (ctrl, src, dst, cnt) = self.machine.dma[Core::Arm9.index()].channels[ch].debug_regs();
+            let en = ctrl & (1 << 15) != 0;
+            let mode = (ctrl >> 11) & 7;
+            let _ = writeln!(s, "ARM9 DMA{ch}: en={en} start_mode={mode} src={src:#010x} dst={dst:#010x} count={cnt} ctrl={ctrl:#06x}");
+        }
+        // Per-opcode GX command histogram: which commands the game actually issues.
+        let hist = self.machine.gpu3d.cmd_hist();
+        let named: &[(u8, &str)] = &[
+            (0x10, "MTX_MODE"), (0x11, "MTX_PUSH"), (0x12, "MTX_POP"),
+            (0x13, "MTX_STORE"), (0x14, "MTX_RESTORE"), (0x15, "MTX_IDENTITY"),
+            (0x16, "MTX_LOAD_4x4"), (0x17, "MTX_LOAD_4x3"), (0x18, "MTX_MULT_4x4"),
+            (0x19, "MTX_MULT_4x3"), (0x1A, "MTX_MULT_3x3"), (0x1B, "MTX_SCALE"),
+            (0x1C, "MTX_TRANS"), (0x20, "COLOR"), (0x21, "NORMAL"),
+            (0x22, "TEXCOORD"), (0x23, "VTX_16"), (0x24, "VTX_10"),
+            (0x25, "VTX_XY"), (0x26, "VTX_XZ"), (0x27, "VTX_YZ"),
+            (0x28, "VTX_DIFF"), (0x29, "POLYGON_ATTR"), (0x2A, "TEXIMAGE_PARAM"),
+            (0x2B, "PLTT_BASE"), (0x30, "DIF_AMB"), (0x31, "SPE_EMI"),
+            (0x32, "LIGHT_VECTOR"), (0x33, "LIGHT_COLOR"), (0x34, "SHININESS"),
+            (0x40, "BEGIN_VTXS"), (0x41, "END_VTXS"), (0x50, "SWAP_BUFFERS"),
+            (0x60, "VIEWPORT"), (0x70, "BOX_TEST"), (0x71, "POS_TEST"),
+            (0x72, "VEC_TEST"),
+        ];
+        let mut line = String::from("GX command histogram (lifetime):");
+        for &(op, name) in named {
+            let c = hist[op as usize];
+            if c > 0 {
+                let _ = write!(line, " {name}={c}");
+            }
+        }
+        let _ = writeln!(s, "{line}");
+        // Delta since the previous F5 dump: what actually moved in this interval.
+        // This is the signal that matters — lifetime totals are dominated by earlier
+        // screens, but the delta is exactly what the *current* screen is doing.
+        if let Some((p_tot, p_sub, p_emit, p_hist)) = &self.dbg_prev {
+            let mut d = format!(
+                "DELTA since last F5: commands=+{} submitted=+{} emitted=+{} |",
+                total.saturating_sub(*p_tot),
+                sub.saturating_sub(*p_sub),
+                emit.saturating_sub(*p_emit),
+            );
+            for &(op, name) in named {
+                let dc = hist[op as usize].saturating_sub(p_hist[op as usize]);
+                if dc > 0 {
+                    let _ = write!(d, " {name}=+{dc}");
+                }
+            }
+            let _ = writeln!(s, "{d}");
+        } else {
+            let _ = writeln!(s, "DELTA since last F5: (first dump — press F5 again to see per-interval movement)");
+        }
+        self.dbg_prev = Some((total, sub, emit, Box::new(*hist)));
+        let dispcap = self.read(Core::Arm9, 0x0400_0064, 4);
+        let _ = writeln!(s, "DISPCAPCNT={dispcap:#010x} (capture_enable={} src={} dst_block={})",
+            (dispcap >> 31) & 1, (dispcap >> 29) & 3, (dispcap >> 16) & 3);
+        let pc = self.arm9.register(15);
+        let thumb = self.arm9.cpsr().thumb();
+        let _ = writeln!(s, "ARM9 PC={pc:#010x} thumb={thumb} irq_en={} | ARM7 PC={:#010x}",
+            self.arm9.irq_enabled(), self.arm7.register(15));
+        // Disassemble a window around the ARM9 PC (to reveal a spin/wait loop).
+        let step: u32 = if thumb { 2 } else { 4 };
+        for i in 0..12u32 {
+            let a = pc.wrapping_sub(step * 6).wrapping_add(step * i);
+            let mark = if a == pc { ">>" } else { "  " };
+            let text = if thumb {
+                let w = self.read(Core::Arm9, a, 2) as u16;
+                format!("{w:04x}     {}", arm::format_thumb(&arm::decode_thumb(w)))
+            } else {
+                let w = self.read(Core::Arm9, a, 4);
+                format!("{w:08x} {}", arm::format_arm(&arm::decode_arm(w)))
+            };
+            let _ = writeln!(s, "{mark} {a:#010x}: {text}");
+        }
+        let modes = self.gpu3d_poly_texcoord_modes();
+        for (i, (fmt, _off, pb, color, alpha)) in self.gpu3d_poly_texture_debug().iter().enumerate().take(16) {
+            let _ = writeln!(s, "  poly{i}: fmt={fmt} tcmode={} pltt={pb:#x} texel={color:?} alpha={alpha}",
+                modes.get(i).copied().unwrap_or(0));
+        }
+        s
+    }
+
     pub fn read(&mut self, core: Core, addr: u32, bytes: u32) -> u32 {
         if (0x0400_0000..0x0500_0000).contains(&addr) {
             self.machine.io_read(core, addr, bytes)
@@ -1514,6 +1718,50 @@ mod tests {
             assert_eq!(system.interrupts(core).iflags(), IrqSource::Dma0.mask());
             assert_eq!(system.io_read(core, 0x0400_00BA, 2) & (1 << 15), 0);
         }
+    }
+
+    #[test]
+    fn gxfifo_dma_streams_geometry_commands_to_the_3d_engine() {
+        // Games submit heavy 3D scenes via GXFIFO DMA (ARM9 start-mode 7). Regression
+        // for that being dropped as an unmodelled "Special" timing (→ black 3D).
+        let mut system = System::new();
+        let one = 0x1000u32; // matrix 4.12 unit
+        // GX command stream: MTX_MODE=position(1); MTX_TRANS(2.0, 0, 0).
+        let cmds = [0x10u32, 1, 0x1C, 2 * one, 0, 0];
+        for (i, w) in cmds.iter().enumerate() {
+            system.memory().main[i * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        // DMA0 (ARM9): source main RAM → GXFIFO, 32-bit, dest-fixed, start mode 7.
+        system.io_write(Core::Arm9, 0x0400_00B0, 0x0200_0000, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0400_0400, 4); // DAD = GXFIFO
+        system.io_write(Core::Arm9, 0x0400_00B8, cmds.len() as u32, 2); // word count
+        let cnt = 0x8000 | 0x0400 | 0x3800 | 0x0040; // enable | 32bit | mode 7 | dest fixed
+        system.io_write(Core::Arm9, 0x0400_00BA, cnt, 2); // control → runs the DMA now
+        // The stream reached the geometry engine: the clip matrix's translation-x
+        // (CLIPMTX element 12) is 2.0.
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_0640 + 12 * 4, 4), 2 * one);
+    }
+
+    #[test]
+    fn immediate_dma_to_the_gxfifo_reaches_the_3d_engine() {
+        // Games also stream display lists to the GXFIFO via an *immediate*-timing DMA
+        // (start mode 0) with a fixed destination — not only start-mode-7. That path
+        // runs through `data_write`, which used to drop I/O-region writes to the memory
+        // map (→ the geometry silently vanished and the 3D screen went black).
+        let mut system = System::new();
+        let one = 0x1000u32; // matrix 4.12 unit
+        // GX command stream: MTX_MODE=position(1); MTX_TRANS(3.0, 0, 0).
+        let cmds = [0x10u32, 1, 0x1C, 3 * one, 0, 0];
+        for (i, w) in cmds.iter().enumerate() {
+            system.memory().main[i * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        system.io_write(Core::Arm9, 0x0400_00B0, 0x0200_0000, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0400_0400, 4); // DAD = GXFIFO
+        system.io_write(Core::Arm9, 0x0400_00B8, cmds.len() as u32, 2); // word count
+        let cnt = 0x8000 | 0x0400 | 0x0040; // enable | 32bit | dest fixed | mode 0 (immediate)
+        system.io_write(Core::Arm9, 0x0400_00BA, cnt, 2); // control → runs the DMA now
+        // The stream reached the geometry engine: CLIPMTX translation-x is 3.0.
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_0640 + 12 * 4, 4), 3 * one);
     }
 
     #[test]

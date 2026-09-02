@@ -355,6 +355,24 @@ impl Emulator {
         }
     }
 
+    /// A human-readable graphics-state diagnostic for the DS, or `None` on GBA. Used by
+    /// the host's "dump state" key to capture a live screen for debugging.
+    pub fn nds_debug_report(&mut self) -> Option<String> {
+        match self {
+            Emulator::Nds(n) => Some(n.system.debug_report()),
+            Emulator::Gba(_) => None,
+        }
+    }
+
+    /// The isolated 256×192 BGR555 framebuffer for one BG (`0..4`) or OBJ (`4`) of a DS
+    /// engine — force-enabled, so a *disabled* layer's content is still visible. Debug.
+    pub fn nds_debug_layer(&mut self, engine: usize, layer: usize) -> Option<Vec<u16>> {
+        match self {
+            Emulator::Nds(n) => Some(n.system.debug_render_layer(engine, layer)),
+            Emulator::Gba(_) => None,
+        }
+    }
+
     /// Take the underlying GBA system, consuming the facade. Used to hand the
     /// concrete machine to the (currently GBA-only) debug server.
     pub fn into_gba(self) -> Option<gba::System> {

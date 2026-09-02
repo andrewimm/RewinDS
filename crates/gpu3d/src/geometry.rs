@@ -418,6 +418,22 @@ pub struct GeometryEngine {
     /// High-water marks of `(polygons, vertices)` built in a single frame, captured at
     /// each `SWAP_BUFFERS` — a debug window on how much geometry a game submits.
     peak: (usize, usize),
+    /// Debug lifetime counters over `finalize_polygon`: primitives submitted, dropped by
+    /// clipping (< 3 survivors), dropped by winding culling, and emitted.
+    dbg_submitted: u64,
+    dbg_clipped: u64,
+    dbg_culled: u64,
+    dbg_emitted: u64,
+    /// The last `BOX_TEST` result (GXSTAT bit 1): the tested cuboid is inside the view.
+    box_test_result: bool,
+    /// Debug lifetime counters: total `BOX_TEST`s run, and how many reported "inside".
+    dbg_box_tests: u64,
+    dbg_box_pass: u64,
+    /// Debug: build-buffer `(polys, verts)` observed at the moment of the last swap,
+    /// before it was sealed — distinguishes "swap saw an empty buffer" from a sealing bug.
+    dbg_last_swap_build: (usize, usize),
+    /// Debug: lifetime count of `emit_polygon` calls dropped by the RAM-full guard.
+    dbg_emit_dropped: u64,
 }
 
 impl GeometryEngine {
@@ -442,7 +458,31 @@ impl GeometryEngine {
     /// The `GXSTAT` bits the geometry side owns (currently the matrix-stack bits;
     /// geometry-busy is added with command timing).
     pub fn gxstat_bits(&self) -> u32 {
-        self.matrix.gxstat_bits()
+        // Bit 1 is the BOX_TEST result; bit 0 (test busy) stays 0 — tests run
+        // synchronously here, so a game polling for "ready" sees it immediately.
+        self.matrix.gxstat_bits() | ((self.box_test_result as u32) << 1)
+    }
+
+    /// Debug lifetime `(submitted, clipped_out, culled, emitted)` primitive counts.
+    pub fn pipeline_stats(&self) -> (u64, u64, u64, u64) {
+        (self.dbg_submitted, self.dbg_clipped, self.dbg_culled, self.dbg_emitted)
+    }
+
+    /// Debug lifetime `(box_tests_run, box_tests_passed)` — how many occlusion
+    /// queries a game issued, and how many we reported as "inside the view".
+    pub fn box_test_stats(&self) -> (u64, u64) {
+        (self.dbg_box_tests, self.dbg_box_pass)
+    }
+
+    /// Debug: build buffer `(polys, verts)` seen at the last swap, and the lifetime
+    /// count of polygons dropped by the vertex/polygon-RAM-full guard.
+    pub fn swap_debug(&self) -> ((usize, usize), u64) {
+        (self.dbg_last_swap_build, self.dbg_emit_dropped)
+    }
+
+    /// Debug: the current (not-yet-sealed) build buffer `(polys, verts)`.
+    pub fn build_len(&self) -> (usize, usize) {
+        (self.polygons.len(), self.vertices.len())
     }
 
     /// The `(polygons, vertices)` high-water mark across all frames so far.
@@ -522,7 +562,13 @@ impl GeometryEngine {
             }
             NORMAL => {
                 let p = params[0];
-                self.compute_lighting([se10(p), se10(p >> 10), se10(p >> 20)]);
+                let raw = [se10(p), se10(p >> 10), se10(p >> 20)];
+                // Texcoord-transform mode 2 ("Normal source") derives the texcoord from
+                // the normal here, at the NORMAL command.
+                if (self.state.tex_param >> 30) & 3 == 2 {
+                    self.state.texcoord = self.transform_texcoord_normal(raw);
+                }
+                self.compute_lighting(raw);
             }
 
             VTX_16 => {
@@ -570,9 +616,40 @@ impl GeometryEngine {
             END_VTXS => {}
             SWAP_BUFFERS => self.swap_buffers(params[0]),
 
-            // BOX/POS/VEC_TEST and unknown opcodes — later phases.
+            // BOX_TEST: games skip drawing objects whose bounding box is outside the
+            // view (occlusion culling). Without it, GXSTAT's result bit stays 0 and the
+            // game skips *everything*. POS/VEC_TEST readbacks are still later work.
+            BOX_TEST => {
+                self.box_test_result = self.box_test(params);
+                self.dbg_box_tests += 1;
+                self.dbg_box_pass += self.box_test_result as u64;
+            }
             _ => {}
         }
+    }
+
+    /// `BOX_TEST`: whether a bounding cuboid is (partly or fully) inside the view
+    /// volume. The cuboid corner `(x,y,z)` and size `(w,h,d)` come as three packed
+    /// words (1.3.12 fixed, treated as the 4.12 vertex scale). Its 8 corners are pushed
+    /// through the clip matrix; it is outside only if all 8 lie beyond one frustum
+    /// plane (a conservative AABB test — never reports a visible box as hidden).
+    fn box_test(&self, p: &[u32]) -> bool {
+        let (x, y) = (se16(p[0]), se16(p[0] >> 16));
+        let (z, w) = (se16(p[1]), se16(p[1] >> 16));
+        let (h, d) = (se16(p[2]), se16(p[2] >> 16));
+        let m = self.matrix.clip();
+        let mut corners = [[0i32; 4]; 8];
+        let mut i = 0;
+        for &dx in &[0, w] {
+            for &dy in &[0, h] {
+                for &dz in &[0, d] {
+                    corners[i] = m.transform([x + dx, y + dy, z + dz, ONE]);
+                    i += 1;
+                }
+            }
+        }
+        // Fully outside iff every corner is beyond some single frustum plane.
+        !(0..6).any(|plane| corners.iter().all(|c| plane_value(c, plane) < 0))
     }
 
     /// Transform a texture coordinate `(s, t)` by the texture matrix per GBATEK's
@@ -584,6 +661,28 @@ impl GeometryEngine {
         let (s, t, c) = (s as i64, t as i64, 1i64);
         let sp = (s * m[0] as i64 + t * m[1] as i64 + c * m[2] as i64 + c * m[3] as i64) >> 12;
         let tp = (s * m[4] as i64 + t * m[5] as i64 + c * m[6] as i64 + c * m[7] as i64) >> 12;
+        [sp as i32, tp as i32]
+    }
+
+    /// Texcoord-transform mode 3 ("Vertex source"): the coordinate comes from the
+    /// vertex position × texture matrix, computed at each VTX. GBATEK
+    /// `(S' T') = (Vx Vy Vz 1.0) · TexMtx` (columns 0/1 of our column-major 4.12 matrix).
+    fn transform_texcoord_vertex(&self, v: [i32; 3]) -> [i32; 2] {
+        let m = &self.matrix.texture().m;
+        let (vx, vy, vz, one) = (v[0] as i64, v[1] as i64, v[2] as i64, ONE as i64);
+        let sp = (vx * m[0] as i64 + vy * m[1] as i64 + vz * m[2] as i64 + one * m[3] as i64) >> 12;
+        let tp = (vx * m[4] as i64 + vy * m[5] as i64 + vz * m[6] as i64 + one * m[7] as i64) >> 12;
+        [sp as i32, tp as i32]
+    }
+
+    /// Texcoord-transform mode 2 ("Normal source"): spherical reflection mapping. GBATEK
+    /// `(S' T') = (Nx Ny Nz)·TexMtx + current texcoord`, computed at NORMAL with the raw
+    /// normal (1.9); the game bakes the directional matrix into the texture matrix.
+    fn transform_texcoord_normal(&self, n: [i32; 3]) -> [i32; 2] {
+        let m = &self.matrix.texture().m;
+        let (nx, ny, nz) = (n[0] as i64, n[1] as i64, n[2] as i64);
+        let sp = ((nx * m[0] as i64 + ny * m[1] as i64 + nz * m[2] as i64) >> 12) + self.state.texcoord[0] as i64;
+        let tp = ((nx * m[4] as i64 + ny * m[5] as i64 + nz * m[6] as i64) >> 12) + self.state.texcoord[1] as i64;
         [sp as i32, tp as i32]
     }
 
@@ -642,6 +741,13 @@ impl GeometryEngine {
     fn submit_vertex(&mut self, source_op: u8) {
         let [x, y, z] = self.state.position;
         let clip = self.matrix.clip().transform([x, y, z, ONE]);
+        // Texcoord-transform mode 3 ("Vertex source") derives the texcoord from this
+        // vertex's position; modes 0/1/2 use the current (already-resolved) texcoord.
+        let texcoord = if (self.state.tex_param >> 30) & 3 == 3 {
+            self.transform_texcoord_vertex([x, y, z])
+        } else {
+            self.state.texcoord
+        };
         let cv = ClipVertex {
             clip,
             color: [
@@ -649,7 +755,7 @@ impl GeometryEngine {
                 self.state.color[1] as i32,
                 self.state.color[2] as i32,
             ],
-            texcoord: self.state.texcoord,
+            texcoord,
             origin: VertexOrigin {
                 source_op,
                 command_seq: self.command_seq,
@@ -676,8 +782,13 @@ impl GeometryEngine {
                 break;
             }
         }
-        let survived = src.len() >= 3 && !culled(self.state.cur_attr, &src);
-        if survived {
+        self.dbg_submitted += 1;
+        if src.len() < 3 {
+            self.dbg_clipped += 1;
+        } else if culled(self.state.cur_attr, &src) {
+            self.dbg_culled += 1;
+        } else {
+            self.dbg_emitted += 1;
             self.emit_polygon(&src);
         }
         // Return the buffers for reuse.
@@ -689,6 +800,7 @@ impl GeometryEngine {
     fn emit_polygon(&mut self, poly: &[ClipVertex]) {
         let n = poly.len().min(MAX_POLY_VERTS);
         if self.polygons.len() >= POLYGON_RAM || self.vertices.len() + n > VERTEX_RAM {
+            self.dbg_emit_dropped += 1;
             return;
         }
         let mut verts = [0u16; MAX_POLY_VERTS];
@@ -728,6 +840,7 @@ impl GeometryEngine {
     /// On hardware the swap waits for V-blank; here it takes effect on the command
     /// (still one frame ahead of the rasterizer, which reads the sealed list).
     fn swap_buffers(&mut self, param: u32) {
+        self.dbg_last_swap_build = (self.polygons.len(), self.vertices.len());
         self.peak.0 = self.peak.0.max(self.polygons.len());
         self.peak.1 = self.peak.1.max(self.vertices.len());
         self.render_list.vertices = std::mem::take(&mut self.vertices);
@@ -848,6 +961,20 @@ mod tests {
         assert_eq!(poly_xs(&e, 0), vec![e8(0), e8(1), e8(2)]);
         assert_eq!(poly_xs(&e, 1), vec![e8(2), e8(1), e8(3)]);
         assert_eq!(poly_xs(&e, 2), vec![e8(2), e8(3), e8(4)]);
+    }
+
+    #[test]
+    fn box_test_reports_inside_and_outside_the_frustum() {
+        // With the identity clip matrix, a box near the origin is inside the view and a
+        // box translated past the right plane is outside. GXSTAT bit 1 carries the result.
+        let mut e = GeometryEngine::new();
+        let pack = |a: i32, b: i32| (a as u32 & 0xFFFF) | ((b as u32 & 0xFFFF) << 16);
+        let half = ONE / 2;
+        e.execute(op::BOX_TEST, &[pack(0, 0), pack(0, half), pack(half, half)]);
+        assert_ne!(e.gxstat_bits() & (1 << 1), 0, "box at the origin is inside the view");
+        // Corner x = 2.0 with size 1.0 → entirely beyond the right plane (w = 1.0).
+        e.execute(op::BOX_TEST, &[pack(2 * ONE, 0), pack(0, ONE), pack(ONE, ONE)]);
+        assert_eq!(e.gxstat_bits() & (1 << 1), 0, "box past the right plane is outside");
     }
 
     #[test]

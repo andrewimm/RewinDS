@@ -171,6 +171,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // F5: dump a graphics-state diagnostic + both screens (PPM) to /tmp, for
+        // debugging the current on-screen state (DS only).
+        if window.is_key_pressed(Key::F5, minifb::KeyRepeat::No) {
+            if let Some(report) = emulator.nds_debug_report() {
+                let _ = std::fs::write("/tmp/rewinds_state.txt", &report);
+                for i in 0..screen_count {
+                    let s = emulator.screen(i).expect("screen");
+                    let mut ppm = format!("P6\n{} {}\n255\n", s.width, s.height).into_bytes();
+                    for px in s.rgba.as_chunks::<4>().0 {
+                        ppm.extend_from_slice(&px[..3]);
+                    }
+                    let _ = std::fs::write(format!("/tmp/rewinds_screen{i}.ppm"), ppm);
+                }
+                // Also dump each Engine-A BG in isolation (force-enabled), so the
+                // content of a *disabled* layer is still captured.
+                for layer in 0..4 {
+                    if let Some(fb) = emulator.nds_debug_layer(0, layer) {
+                        let mut ppm = b"P6\n256 192\n255\n".to_vec();
+                        for p in &fb {
+                            let (r, g, b) = ((p & 0x1F) as u8, ((p >> 5) & 0x1F) as u8, ((p >> 10) & 0x1F) as u8);
+                            ppm.extend_from_slice(&[(r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)]);
+                        }
+                        let _ = std::fs::write(format!("/tmp/rewinds_A_bg{layer}.ppm"), ppm);
+                    }
+                }
+                log::info!("dumped graphics state -> /tmp/rewinds_state.txt + screen/BG PPMs");
+            }
+        }
+
         // Hold Space to fast-forward: run unthrottled for a display frame's worth
         // of real time, presenting only the final frame and muting audio. Otherwise
         // run one frame at 60 fps with audio.
