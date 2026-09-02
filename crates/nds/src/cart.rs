@@ -26,6 +26,21 @@ const BACKUP_SIZE: usize = 2 * 1024 * 1024;
 /// code their save type never read it; it's here for the ones that probe.
 const JEDEC_ID: [u8; 3] = [0x20, 0x40, 0x12];
 
+/// Whether a backup command programs or erases the chip — the ops that clear the
+/// write-enable latch on completion (`WRITE`/`WRHI`, page/sector/chip erase, `WRSR`).
+fn is_write_or_erase(command: u8) -> bool {
+    matches!(command, 0x02 | 0x0A | 0xDB | 0xD8 | 0xC7 | 0x62 | 0x01)
+}
+
+/// Whether `REWINDS_BACKUP_TRACE` is set — gates one stderr line per backup-SPI
+/// transaction (command, address, byte count, detected address width) for diagnosing
+/// save-detection failures. Read once and cached.
+fn backup_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REWINDS_BACKUP_TRACE").is_some())
+}
+
 /// ROMCTRL bit 23: a data word is ready to read (`DRQ`).
 const ROMCTRL_DRQ: u32 = 1 << 23;
 /// ROMCTRL bit 31: block transfer start / busy.
@@ -75,14 +90,30 @@ pub struct Cart {
     backup_dirty: bool,
     backup_data: u8,
     /// How many address bytes the backup command stream carries. The DS header has no
-    /// save-type field, so we auto-detect the chip class from its protocol: EEPROMs
-    /// (2-byte addressing) are the common case, while a serial FLASH is identified by
-    /// its `RDID` (`0x9F`) probe — which every FLASH driver issues to read the JEDEC id
-    /// before any save access — and uses 3-byte addressing. We default to 2 and latch
-    /// to 3 on the first `RDID`. Getting this wrong shifts the first data byte into the
-    /// address, so a written record can never be read back (NSMB: "could not erase
-    /// data"). (A rare 512-byte EEPROM uses 1 address byte; not yet auto-detected.)
+    /// save-type field, so we auto-detect the chip class from its protocol (GBATEK "DS
+    /// Cartridge Backup"). We default to 2 (the common 8K/64K EEPROM) and latch:
+    ///
+    /// - to **3** on the first `RDID` (`0x9F`) — the JEDEC-id probe every serial-FLASH
+    ///   driver issues before any save access (and which EEPROMs never use);
+    /// - to **1** on `RDHI` (`0x0B`) — a read command that exists only on the 0.5K
+    ///   EEPROM, whose 9th address bit (A8) is carried in the command opcode.
+    ///
+    /// Getting the width wrong shifts the first data byte into the address, so a written
+    /// record can never be read back (NSMB: "could not erase data"). A 0.5K EEPROM whose
+    /// very first access is a *low*-page op (never touching the high page) can't be told
+    /// from a 2-byte chip without tracing the program counter, and stays at the default.
     backup_addr_bytes: u32,
+    /// This cart shares its SPI bus between the backup chip and an infrared transceiver
+    /// (GBATEK "DS Cart Infrared Cartridge SPI Commands"; e.g. Pokémon HG/SS, B/W). On
+    /// such carts every savedata command is prefixed with a `00h` byte, and other leading
+    /// bytes are infrared operations that must not reach the backup chip. Latched the
+    /// first time a `00h` prefix is seen; never cleared.
+    backup_ir: bool,
+    /// A `00h` prefix was just consumed — the next byte is the real savedata command.
+    backup_await_command: bool,
+    /// The current transfer is an infrared operation (non-`00h` prefix on an IR cart):
+    /// its bytes are stubbed so they can neither read nor corrupt the backup chip.
+    backup_ir_op: bool,
 }
 
 impl Default for Cart {
@@ -106,6 +137,9 @@ impl Default for Cart {
             backup_dirty: false,
             backup_data: 0,
             backup_addr_bytes: 2,
+            backup_ir: false,
+            backup_await_command: false,
+            backup_ir_op: false,
         }
     }
 }
@@ -146,37 +180,57 @@ impl Cart {
         self.backup_data
     }
 
-    /// Clock a byte to the backup FLASH chip and latch the byte clocked back. The
-    /// first byte of a transfer selects the command; the rest carry the address
-    /// (three bytes) and then data. `WREN`/`WRDI` (`06`/`04`) toggle the write-enable
-    /// latch; `RDSR` (`05`) reports it; `READ` (`03`) streams stored bytes; `PP`/`PW`
-    /// (`02`/`0A`) store bytes when write-enabled; `RDID` (`9F`) reports the chip id.
-    /// Chip-select hold is `AUXSPICNT` bit 6; releasing it ends the transfer (and
-    /// clears the latch after a write, as the hardware does).
+    /// Clock a byte to the backup chip and latch the byte clocked back. The first byte
+    /// of a transfer selects the command; the rest carry the address (1-3 bytes,
+    /// auto-detected — see [`Cart::backup_addr_bytes`]) and then data. `WREN`/`WRDI`
+    /// (`06`/`04`) toggle the write-enable latch; `RDSR` (`05`) reports it; `READ`
+    /// (`03`, plus `0B` = high page on the 0.5K EEPROM) streams stored bytes; `WRITE`
+    /// (`02`, plus `0A` = high page / FLASH write+erase) stores bytes when write-enabled;
+    /// FLASH erases (`DB` page, `D8` sector, `C7`/`62` chip) reset a region to `FFh`;
+    /// `RDID` (`9F`) reports the chip id. Chip-select hold is `AUXSPICNT` bit 6; releasing
+    /// it ends the transfer (and clears the latch after a write/erase, as hardware does).
     pub fn write_auxspidata(&mut self, value: u8) {
         if !self.backup_in_transfer {
-            self.backup_command = value;
-            self.backup_phase = 0;
-            self.backup_addr = 0;
             self.backup_in_transfer = true;
             self.backup_data = 0;
-            match value {
-                0x06 => self.backup_wel = true,  // WREN
-                0x04 => self.backup_wel = false, // WRDI
-                // A FLASH driver reads the JEDEC id before any save access; that probe
-                // identifies the chip as 3-byte-addressed serial FLASH.
-                0x9F | 0x9E => self.backup_addr_bytes = 3,
-                _ => {}
+            if value == 0x00 {
+                // IR-cart savedata prefix: the real backup command is the next byte.
+                // The first prefix also identifies the cart as IR-type. Every known IR
+                // cart (Pokémon HG/SS, B/W; Walk with Me) uses serial FLASH with 24-bit
+                // addressing, and its flash driver skips the RDID probe that would
+                // otherwise reveal the width — so default to 3 bytes here rather than
+                // mangling every command by one byte against the 2-byte EEPROM default.
+                if !self.backup_ir {
+                    self.backup_ir = true;
+                    self.backup_addr_bytes = 3;
+                }
+                self.backup_await_command = true;
+            } else if self.backup_ir {
+                // A non-00h leading byte on an IR cart is an infrared operation (RX/TX/
+                // status), not savedata — stub it so it can never touch the backup chip.
+                self.backup_ir_op = true;
+            } else {
+                self.start_backup_command(value);
             }
+        } else if self.backup_await_command {
+            // The byte after a 00h prefix is the real savedata command.
+            self.backup_await_command = false;
+            self.start_backup_command(value);
+        } else if self.backup_ir_op {
+            self.backup_data = 0; // infrared payload: ignored
         } else {
             self.backup_phase += 1;
             let phase = self.backup_phase;
             self.backup_data = match self.backup_command {
-                0x05 => (self.backup_wel as u8) << 1, // RDSR: WIP=0 (ready), WEL in bit 1
-                0x9F | 0x9E => JEDEC_ID[((phase - 1) % 3) as usize],
-                0x03 => {
+                0x05 => self.status_register(), // RDSR
+                0x9F | 0x9E => JEDEC_ID[((phase - 1) % 3) as usize], // RDID
+                // Reads: RDLO (03h) low page, RDHI (0Bh) high page (0.5K EEPROM only).
+                0x03 | 0x0B => {
                     if phase <= self.backup_addr_bytes {
                         self.backup_addr = (self.backup_addr << 8) | value as u32;
+                        if phase == self.backup_addr_bytes {
+                            self.latch_high_page();
+                        }
                         0
                     } else {
                         let a = self.backup_addr as usize & (BACKUP_SIZE - 1);
@@ -184,9 +238,15 @@ impl Cart {
                         self.backup[a]
                     }
                 }
+                // Writes: WRLO (02h)/PP low page, WRHI (0Ah)/PW high page. For FLASH, 0Ah
+                // is write+erase and 02h a plain program; both just store bytes here — an
+                // overwrite is always valid, so the erase-before-write rule isn't modeled.
                 0x02 | 0x0A => {
                     if phase <= self.backup_addr_bytes {
                         self.backup_addr = (self.backup_addr << 8) | value as u32;
+                        if phase == self.backup_addr_bytes {
+                            self.latch_high_page();
+                        }
                     } else if self.backup_wel {
                         let a = self.backup_addr as usize & (BACKUP_SIZE - 1);
                         self.backup[a] = value;
@@ -195,14 +255,37 @@ impl Cart {
                     }
                     0
                 }
+                // FLASH erase: page (DBh, 256 B) / sector (D8h, 64 KB). Once the address
+                // is clocked in, the region is reset to the erased state (FFh).
+                0xDB | 0xD8 => {
+                    self.backup_addr = (self.backup_addr << 8) | value as u32;
+                    if phase == self.backup_addr_bytes {
+                        self.erase_region(self.backup_command);
+                    }
+                    0
+                }
                 _ => 0,
             };
         }
         if self.auxspicnt & (1 << 6) == 0 {
-            if matches!(self.backup_command, 0x02 | 0x0A) {
-                self.backup_wel = false; // a program completes and disarms the latch
+            if is_write_or_erase(self.backup_command) {
+                self.backup_wel = false; // a program/erase completes and disarms the latch
+            }
+            if backup_trace_enabled() {
+                eprintln!(
+                    "[backup] cmd={:02X} addr={:05X} phase={} addr_bytes={} ir={} irop={} wel={}",
+                    self.backup_command,
+                    self.backup_addr & (BACKUP_SIZE as u32 - 1),
+                    self.backup_phase,
+                    self.backup_addr_bytes,
+                    self.backup_ir as u8,
+                    self.backup_ir_op as u8,
+                    self.backup_wel as u8,
+                );
             }
             self.backup_in_transfer = false;
+            self.backup_await_command = false;
+            self.backup_ir_op = false;
             self.backup_command = 0;
         }
         #[cfg(feature = "cyctrace")]
@@ -216,6 +299,74 @@ impl Cart {
                 self.backup_in_transfer as u8,
             );
         }
+    }
+
+    /// Begin a backup command: latch it, reset the address/phase, and apply the
+    /// command-time effects (the write-enable latch, address-width auto-detection, and
+    /// the address-less chip erase). Reached for a plain command or, on an IR cart, for
+    /// the command byte that follows a `00h` savedata prefix.
+    fn start_backup_command(&mut self, value: u8) {
+        self.backup_command = value;
+        self.backup_phase = 0;
+        self.backup_addr = 0;
+        self.backup_in_transfer = true;
+        self.backup_data = 0;
+        match value {
+            0x06 => self.backup_wel = true,  // WREN
+            0x04 => self.backup_wel = false, // WRDI
+            // A FLASH driver reads the JEDEC id before any save access; that probe
+            // identifies the chip as 3-byte-addressed serial FLASH.
+            0x9F | 0x9E => self.backup_addr_bytes = 3,
+            // RDHI exists only on the 0.5K EEPROM (address bit A8 in the opcode); seeing
+            // it identifies a 1-byte-addressed chip. Never downgrade FLASH.
+            0x0B if self.backup_addr_bytes != 3 => self.backup_addr_bytes = 1,
+            // Chip/bulk erase carries no address, so it runs at command time.
+            0xC7 | 0x62 => self.erase_chip(),
+            _ => {}
+        }
+    }
+
+    /// The RDSR (`05h`) reply: WIP = 0 (always ready) and WEL in bit 1. A 0.5K EEPROM
+    /// (1-byte address) additionally reads bits 4-7 as 1 — the `F0h` signature that
+    /// identifies its narrow address bus (GBATEK "Detection by examining responses").
+    fn status_register(&self) -> u8 {
+        let mut s = (self.backup_wel as u8) << 1;
+        if self.backup_addr_bytes == 1 {
+            s |= 0xF0;
+        }
+        s
+    }
+
+    /// Fold in the 0.5K EEPROM's 9th address bit once the 1-byte address is latched: the
+    /// high-page opcodes RDHI/WRHI (`0B`/`0A`) select `100h-1FFh`, RDLO/WRLO (`03`/`02`)
+    /// the low page. A no-op for wider chips (the address already holds every bit).
+    fn latch_high_page(&mut self) {
+        if self.backup_addr_bytes == 1 && matches!(self.backup_command, 0x0B | 0x0A) {
+            self.backup_addr |= 0x100;
+        }
+    }
+
+    /// Reset a FLASH page (`DBh`, 256 B) or sector (`D8h`, 64 KB) around the latched
+    /// address to the erased state (`FFh`), if write-enabled.
+    fn erase_region(&mut self, command: u8) {
+        if !self.backup_wel {
+            return;
+        }
+        let size = if command == 0xDB { 0x100 } else { 0x1_0000 };
+        let start = (self.backup_addr as usize & (BACKUP_SIZE - 1)) & !(size - 1);
+        let end = (start + size).min(BACKUP_SIZE);
+        self.backup[start..end].fill(0xFF);
+        self.backup_dirty = true;
+    }
+
+    /// Reset the whole chip to the erased state (`FFh`) — FLASH bulk/chip erase
+    /// (`C7h`/`62h`), which carries no address — if write-enabled.
+    fn erase_chip(&mut self) {
+        if !self.backup_wel {
+            return;
+        }
+        self.backup.fill(0xFF);
+        self.backup_dirty = true;
     }
 
     /// The backup (save) contents, for the host to persist.
@@ -407,6 +558,80 @@ mod tests {
             &[0xCD, b'M', b'a'],
             "2-byte-addressed data must read back at the same address"
         );
+    }
+
+    /// A 0.5K EEPROM (1-byte address) is identified by its high-page read command
+    /// (RDHI, 0Bh), reports RDSR=F0h, and carries the 9th address bit in the opcode so
+    /// the low page (03h/02h) and high page (0Bh/0Ah) don't collide.
+    #[test]
+    fn backup_small_eeprom_detects_and_addresses_high_page() {
+        let mut cart = Cart::new();
+        // A high-page read identifies the 1-byte-addressed 0.5K EEPROM.
+        spi(&mut cart, &[0x0B, 0x00, 0]);
+        // RDSR now carries the F0h signature (bits 4-7 set).
+        assert_eq!(spi(&mut cart, &[0x05, 0])[1] & 0xF0, 0xF0);
+
+        spi(&mut cart, &[0x06]); // WREN
+        // WRLO 0x00 = 0xAA (low page), WRHI 0x00 = 0xBB (high page, addr 0x100).
+        spi(&mut cart, &[0x02, 0x00, 0xAA]);
+        spi(&mut cart, &[0x06]); // WREN again (a write cleared the latch)
+        spi(&mut cart, &[0x0A, 0x00, 0xBB]);
+        // The two 0x00 offsets must not collide: low reads 0xAA, high reads 0xBB.
+        assert_eq!(spi(&mut cart, &[0x03, 0x00, 0])[2], 0xAA, "low page");
+        assert_eq!(spi(&mut cart, &[0x0B, 0x00, 0])[2], 0xBB, "high page (A8 in opcode)");
+    }
+
+    /// A FLASH sector erase resets its 64 KB region to FFh; a program then writes into it.
+    #[test]
+    fn backup_flash_erase_resets_region_to_ff() {
+        let mut cart = Cart::new();
+        spi(&mut cart, &[0x9F, 0, 0, 0]); // RDID → FLASH, 3-byte address
+        spi(&mut cart, &[0x06]);
+        spi(&mut cart, &[0x02, 0x01, 0x00, 0x00, 0x42]); // program 0x42 at 0x010000
+        assert_eq!(spi(&mut cart, &[0x03, 0x01, 0x00, 0x00, 0])[4], 0x42);
+        // Sector-erase the 64 KB region containing 0x010000.
+        spi(&mut cart, &[0x06]);
+        spi(&mut cart, &[0xD8, 0x01, 0x00, 0x00]);
+        assert_eq!(spi(&mut cart, &[0x03, 0x01, 0x00, 0x00, 0])[4], 0xFF, "erased to FFh");
+        // A neighbouring sector is untouched.
+        spi(&mut cart, &[0x06]);
+        spi(&mut cart, &[0x02, 0x02, 0x00, 0x00, 0x99]); // 0x020000, different sector
+        spi(&mut cart, &[0x06]);
+        spi(&mut cart, &[0xD8, 0x01, 0x00, 0x00]); // erase sector 0x01xxxx again
+        assert_eq!(spi(&mut cart, &[0x03, 0x02, 0x00, 0x00, 0])[4], 0x99, "other sector kept");
+    }
+
+    /// An IR cart (Pokémon HG/SS, B/W) shares the SPI bus between an infrared chip and
+    /// the save flash: every savedata command is prefixed with a 00h byte, and other
+    /// leading bytes are infrared ops that must not touch the flash.
+    #[test]
+    fn backup_ir_cart_passes_through_00_prefixed_savedata_only() {
+        let mut cart = Cart::new();
+        // 00h-prefixed savedata: RDID (→FLASH, 3-byte), WREN, program 0x77 at 0x010000.
+        spi(&mut cart, &[0x00, 0x9F, 0, 0, 0]);
+        spi(&mut cart, &[0x00, 0x06]);
+        spi(&mut cart, &[0x00, 0x02, 0x01, 0x00, 0x00, 0x77]);
+        let r = spi(&mut cart, &[0x00, 0x03, 0x01, 0x00, 0x00, 0]);
+        assert_eq!(r[5], 0x77, "00h-prefixed savedata must reach the flash");
+
+        // An infrared op (non-00h prefix) must not corrupt the flash, even mid write-enable.
+        spi(&mut cart, &[0x00, 0x06]); // WREN
+        spi(&mut cart, &[0x02, 0xDE, 0xAD, 0xBE]); // IR TX-shaped op, not savedata
+        let r = spi(&mut cart, &[0x00, 0x03, 0x01, 0x00, 0x00, 0]);
+        assert_eq!(r[5], 0x77, "an infrared operation must not write the flash");
+    }
+
+    /// IR carts use 24-bit FLASH addressing but their drivers skip the RDID probe, so
+    /// merely detecting the cart (the 00h prefix) must default the width to 3 bytes —
+    /// otherwise every command is mangled by one byte (Pokémon Black: "can't write save").
+    #[test]
+    fn backup_ir_cart_defaults_to_three_byte_flash_addressing() {
+        let mut cart = Cart::new();
+        // No RDID anywhere — just 00h-prefixed savedata, as Pokémon Black does.
+        spi(&mut cart, &[0x00, 0x06]); // WREN
+        spi(&mut cart, &[0x00, 0x02, 0x01, 0x23, 0x45, 0xA5]); // program 0xA5 at 0x012345
+        let r = spi(&mut cart, &[0x00, 0x03, 0x01, 0x23, 0x45, 0]); // read back, 3-byte addr
+        assert_eq!(r[5], 0xA5, "IR cart must use 3-byte addressing without an RDID probe");
     }
 
     /// A ROMCTRL value selecting a `bytes`-length block with the Start bit set.
