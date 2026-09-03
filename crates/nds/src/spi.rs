@@ -13,6 +13,20 @@
 
 use crate::firmware;
 
+/// Power-on reset values of the DS Power Management chip's registers (GBATEK "DS Power
+/// Management Device"). Register 0 powers up with the sound amplifier (bit 0) and both
+/// backlights (bits 2-3) enabled (`0x0D`); register 2 = `0x01`, register 4 = `0x03`.
+/// These are the chip's hardware defaults, present from power-on — a direct-booted game
+/// reads them before it writes any of its own, and boot handshakes check e.g. the
+/// sound-amplifier bit, so starting them at zero would misreport the console's state.
+fn pmic_reset() -> [u8; 8] {
+    let mut regs = [0u8; 8];
+    regs[0] = 0x0D;
+    regs[2] = 0x01;
+    regs[4] = 0x03;
+    regs
+}
+
 /// `SPICNT` device select (bits 8-9).
 const DEVICE_POWER: u16 = 0;
 const DEVICE_FIRMWARE: u16 = 1;
@@ -61,7 +75,7 @@ impl Spi {
             command: 0,
             address: 0,
             phase: 0,
-            pmic: [0; 8],
+            pmic: pmic_reset(),
             pmic_index: 0,
             pmic_reading: false,
             pmic_command: true,
@@ -263,6 +277,28 @@ mod tests {
         spi.write_data(0);
         let b1 = spi.read_data();
         assert_eq!((b0 << 5) | (b1 >> 3), 0);
+    }
+
+    /// The power chip powers up with its hardware defaults, not zeroed — register 0
+    /// reports the sound amplifier (bit 0) and backlights (bits 2-3) already enabled.
+    /// A direct-booted game reads these before writing its own, and an IPC boot
+    /// handshake checks the sound-amplifier bit, so a zeroed register 0 stalls it.
+    #[test]
+    fn power_management_powers_up_with_hardware_defaults() {
+        let mut spi = Spi::new();
+        let hold = (DEVICE_POWER << 8) | (1 << 11) | (1 << 15);
+        let read_reg = |spi: &mut Spi, reg: u8| -> u8 {
+            spi.write_cnt(hold);
+            spi.write_data((reg | 0x80) as u16); // read command
+            spi.write_data(0); // clock the byte out
+            let v = spi.read_data() as u8;
+            spi.write_cnt(0);
+            v
+        };
+        assert_eq!(read_reg(&mut spi, 0), 0x0D); // sound amp + both backlights
+        assert_eq!(read_reg(&mut spi, 0) & 1, 1); // sound-amplifier-enable bit set
+        assert_eq!(read_reg(&mut spi, 2), 0x01);
+        assert_eq!(read_reg(&mut spi, 4), 0x03);
     }
 
     #[test]
