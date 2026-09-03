@@ -215,6 +215,15 @@ impl NdsCpuBus<'_> {
                 clock,
             );
         }
+        // Debug write watch / break (guest data writes only; both idle when unset).
+        if self.machine.dbg_write_watch.is_some() || self.machine.dbg_break_write.is_some() {
+            if let Some(w) = self.machine.dbg_write_watch.as_mut() {
+                *w.entry(address).or_insert(0) += 1;
+            }
+            if self.machine.dbg_break_write == Some(address) {
+                self.machine.dbg_write_hit = true;
+            }
+        }
         if is_io(address) {
             self.machine
                 .io_write(self.core, address, value, bytes, self.scheduler);

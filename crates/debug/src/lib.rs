@@ -33,7 +33,7 @@ pub mod server;
 pub use gba::Key as Button;
 
 /// Map a core index to a DS core (0 = ARM9, 1 = ARM7); the GBA ignores it.
-fn nds_core(core: usize) -> nds::Core {
+pub(crate) fn nds_core(core: usize) -> nds::Core {
     if core == 1 {
         nds::Core::Arm7
     } else {

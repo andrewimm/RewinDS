@@ -184,48 +184,115 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             state_summary(emu)
         }
 
-        // --- run control (GBA-only: single-step machinery) ---
+        // --- run control (single-step; `core` selects the DS CPU) ---
         "run.steps" => {
-            let system = gba_only(emu)?;
-            for _ in 0..u64p(params, "n", 1) {
-                system.step();
+            let (n, core) = (u64p(params, "n", 1), corep(params));
+            if let Some(system) = emu.as_gba_mut() {
+                for _ in 0..n {
+                    system.step();
+                }
+            } else if let Some(nds) = emu.as_nds_mut() {
+                nds.debug_run(crate::nds_core(core), n, None, None, None);
             }
             state_summary(emu)
         }
         "run.untilPc" => {
-            let (pc, max) = (u32p(params, "pc"), u64p(params, "maxSteps", 20_000_000));
-            let system = gba_only(emu)?;
-            let mut steps = 0;
-            let mut hit = false;
-            while steps < max {
-                if system.cpu.register(15) == pc {
-                    hit = true;
-                    break;
+            let (pc, max, core) = (u32p(params, "pc"), u64p(params, "maxSteps", 20_000_000), corep(params));
+            if let Some(system) = emu.as_gba_mut() {
+                let mut steps = 0;
+                let mut hit = false;
+                while steps < max {
+                    if system.cpu.register(15) == pc {
+                        hit = true;
+                        break;
+                    }
+                    system.step();
+                    steps += 1;
                 }
-                system.step();
-                steps += 1;
+                json!({"hit": hit, "steps": steps, "pc": system.cpu.register(15)})
+            } else if let Some(nds) = emu.as_nds_mut() {
+                let dc = crate::nds_core(core);
+                let (steps, hit) = nds.debug_run(dc, max, Some(pc), None, None);
+                json!({"hit": hit, "steps": steps, "pc": nds.core_pc(dc)})
+            } else {
+                Value::Null
             }
-            json!({"hit": hit, "steps": steps, "pc": system.cpu.register(15)})
         }
         "run.untilWrite" => {
-            let (addr, max) = (u32p(params, "addr"), u64p(params, "maxSteps", 20_000_000));
-            let system = gba_only(emu)?;
-            system.gba.bus.break_write_addr = Some(addr);
-            system.gba.bus.write_hit = false;
-            let mut steps = 0;
-            let mut writer_pc = None;
-            while steps < max {
-                let before = system.cpu.register(15);
-                system.step();
-                if system.gba.bus.write_hit {
-                    writer_pc = Some(before);
-                    break;
+            let (addr, max, core) = (u32p(params, "addr"), u64p(params, "maxSteps", 20_000_000), corep(params));
+            if let Some(system) = emu.as_gba_mut() {
+                system.gba.bus.break_write_addr = Some(addr);
+                system.gba.bus.write_hit = false;
+                let mut steps = 0;
+                let mut writer_pc = None;
+                while steps < max {
+                    let before = system.cpu.register(15);
+                    system.step();
+                    if system.gba.bus.write_hit {
+                        writer_pc = Some(before);
+                        break;
+                    }
+                    steps += 1;
                 }
-                steps += 1;
+                system.gba.bus.break_write_addr = None;
+                system.gba.bus.write_hit = false;
+                json!({"hit": writer_pc.is_some(), "writerPc": writer_pc, "steps": steps, "value": read32(system, addr)})
+            } else if let Some(nds) = emu.as_nds_mut() {
+                let dc = crate::nds_core(core);
+                let (steps, hit) = nds.debug_run(dc, max, None, Some(addr), None);
+                // The writer's PC is the core's PC at the break (the store instruction).
+                json!({"hit": hit, "writerPc": nds.core_pc(dc), "steps": steps, "value": nds.read(dc, addr, 4)})
+            } else {
+                Value::Null
             }
-            system.gba.bus.break_write_addr = None;
-            system.gba.bus.write_hit = false;
-            json!({"hit": writer_pc.is_some(), "writerPc": writer_pc, "steps": steps, "value": read32(system, addr)})
+        }
+        // Register-transition watchpoint (DS only): break when register `reg` becomes
+        // `value`, via an instruction whose PC is in [pcLo, pcHi) (default: anywhere),
+        // after `skip` earlier matches. Pins where a specific value originates.
+        "run.untilReg" => {
+            let core = corep(params);
+            let nds = emu.as_nds_mut().ok_or_else(|| "run.untilReg is DS-only".to_string())?;
+            let dc = crate::nds_core(core);
+            let watch = nds::RegWatch {
+                reg: u32p(params, "reg") as usize,
+                value: u32p(params, "value"),
+                pc_lo: u32p_or(params, "pcLo", 0),
+                pc_hi: u32p_or(params, "pcHi", 0xFFFF_FFFF),
+                skip: u32p(params, "skip"),
+            };
+            let max = u64p(params, "maxSteps", 40_000_000);
+            let reg = watch.reg;
+            let (steps, hit) = nds.debug_run(dc, max, None, None, Some(watch));
+            json!({"hit": hit, "steps": steps, "pc": nds.core_pc(dc), "reg": reg, "value": nds.core_reg(dc, reg)})
+        }
+
+        // Emit a diffable execution trace to a file (DS only): fast-forward `skip`
+        // instructions, then log `count` lines of "PC R0..R15 CPSR" to `path`.
+        "run.trace" => {
+            let core = corep(params);
+            let nds = emu.as_nds_mut().ok_or_else(|| "run.trace is DS-only".to_string())?;
+            let path = params.get("path").and_then(Value::as_str).ok_or("run.trace needs a path")?;
+            let skip = u64p(params, "skip", 0);
+            let count = u64p(params, "count", 1000);
+            match nds.debug_trace(crate::nds_core(core), skip, count, path) {
+                Ok(n) => json!({"wrote": n, "path": path}),
+                Err(e) => return Err(format!("trace write failed: {e}")),
+            }
+        }
+
+        // Emit a full-register trace (DS only) for value-level diffing: `PC R0..R15 CPSR`
+        // per line. Finds *data* divergences (a register with the wrong value under a
+        // matching PC), which a PC-only trace can't see.
+        "run.traceRegs" => {
+            let core = corep(params);
+            let nds = emu.as_nds_mut().ok_or_else(|| "run.traceRegs is DS-only".to_string())?;
+            let path = params.get("path").and_then(Value::as_str).ok_or("run.traceRegs needs a path")?;
+            let skip = u64p(params, "skip", 0);
+            let count = u64p(params, "count", 1000);
+            match nds.debug_trace_regs(crate::nds_core(core), skip, count, path) {
+                Ok(n) => json!({"wrote": n, "path": path}),
+                Err(e) => return Err(format!("trace write failed: {e}")),
+            }
         }
 
         // --- cpu (console-agnostic; `core` selects the DS CPU) ---
@@ -265,19 +332,33 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
         }
         "memory.watch" => {
             let enable = params.get("enable").and_then(Value::as_bool).unwrap_or(true);
-            let system = gba_only(emu)?;
-            match params.get("kind").and_then(Value::as_str).unwrap_or("writes") {
-                "reads" => system.gba.bus.read_watch = enable.then(Default::default),
-                _ => system.gba.bus.write_watch = enable.then(Default::default),
+            let kind = params.get("kind").and_then(Value::as_str).unwrap_or("writes").to_string();
+            if let Some(system) = emu.as_gba_mut() {
+                match kind.as_str() {
+                    "reads" => system.gba.bus.read_watch = enable.then(Default::default),
+                    _ => system.gba.bus.write_watch = enable.then(Default::default),
+                }
+            } else if let Some(nds) = emu.as_nds_mut() {
+                // The DS watch tracks writes only.
+                nds.set_write_watch(enable);
             }
             json!({"ok": true})
         }
         "memory.watchReport" => {
             let top = u64p(params, "top", 24) as usize;
             let kind = params.get("kind").and_then(Value::as_str).unwrap_or("writes").to_string();
-            let system = gba_only(emu)?;
-            let watch = if kind == "reads" { &system.gba.bus.read_watch } else { &system.gba.bus.write_watch };
-            watch.as_ref().map(|w| addr_entries(w, top)).unwrap_or(Value::Null)
+            if let Some(system) = emu.as_gba() {
+                let watch = if kind == "reads" { &system.gba.bus.read_watch } else { &system.gba.bus.write_watch };
+                watch.as_ref().map(|w| addr_entries(w, top)).unwrap_or(Value::Null)
+            } else if let Some(nds) = emu.as_nds() {
+                json!(nds
+                    .write_watch_report(top)
+                    .iter()
+                    .map(|&(addr, count)| json!({"addr": addr, "count": count}))
+                    .collect::<Vec<_>>())
+            } else {
+                Value::Null
+            }
         }
 
         // --- execution profiling / disassembly (GBA-only) ---

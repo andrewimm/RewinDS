@@ -28,6 +28,7 @@ pub mod spi;
 pub mod system;
 pub mod timer;
 pub mod vram;
+pub mod wifi;
 
 pub use boot::{BootError, Header};
 pub use cart::Cart;
@@ -37,6 +38,6 @@ pub use interrupt::{Interrupts, IrqSource};
 pub use ipc::Ipc;
 pub use memory::{Core, Memory};
 pub use ppu::Ppu;
-pub use system::{Machine, NdsEvent, System};
+pub use system::{Machine, NdsEvent, RegWatch, System};
 pub use timer::{TimerId, Timers};
 pub use vram::Vram;

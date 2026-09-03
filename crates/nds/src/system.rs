@@ -141,6 +141,8 @@ pub enum NdsEvent {
     Ppu(PpuEvent),
     /// The sound mixer should emit one output sample.
     SoundSample,
+    /// One real-time-clock second elapsed (advances the RTC calendar).
+    RtcTick,
 }
 
 /// Per-core per-instruction timing state for the ARM pipeline model, where an
@@ -262,6 +264,8 @@ pub struct Machine {
     pub(crate) rtc: crate::rtc::Rtc,
     /// The 16-channel sound engine (`0x4000400`-`0x400051F`, ARM7).
     pub(crate) sound: crate::sound::Sound,
+    /// The ARM7 Wi-Fi register block (`0x4808000`-`0x4808FFF`); storage only.
+    pub(crate) wifi: crate::wifi::Wifi,
     /// The ARM9 3D graphics engine (geometry command FIFO + rasterizer).
     pub(crate) gpu3d: gpu3d::Gpu3d,
     /// Debug: total words streamed through GXFIFO DMA (confirms it is being used).
@@ -302,6 +306,26 @@ pub struct Machine {
     /// CP15 wait-for-interrupt. A halted core executes nothing until an enabled
     /// interrupt is pending (`IE & IF`, regardless of `IME`/CPSR.I).
     pub(crate) halted: [bool; 2],
+    /// Debug: break when this address is written by the guest (set by the debug server's
+    /// `run.untilWrite`); the bus sets [`Self::dbg_write_hit`] and the run loop stops.
+    pub(crate) dbg_break_write: Option<u32>,
+    pub(crate) dbg_write_hit: bool,
+    /// Debug: when present, the bus tallies every guest data-write address here (the
+    /// `memory.watch`/`watchReport` histogram).
+    pub(crate) dbg_write_watch: Option<std::collections::HashMap<u32, u64>>,
+}
+
+/// A register-transition watchpoint for [`System::debug_run`]: break when the watched
+/// `core`'s register `reg` (0-15) *becomes* `value` (was something else), via an
+/// instruction whose PC is in `[pc_lo, pc_hi)`, after `skip` earlier matches. The PC
+/// window and `skip` cut through the many benign times a common value (`0`, `1`, `-1`)
+/// appears, to catch the specific assignment that matters.
+pub struct RegWatch {
+    pub reg: usize,
+    pub value: u32,
+    pub pc_lo: u32,
+    pub pc_hi: u32,
+    pub skip: u32,
 }
 
 impl Machine {
@@ -319,6 +343,7 @@ impl Machine {
             spi: crate::spi::Spi::new(),
             rtc: crate::rtc::Rtc::new(),
             sound: crate::sound::Sound::new(),
+            wifi: crate::wifi::Wifi::new(),
             gpu3d: gpu3d::Gpu3d::new(),
             gxfifo_dma_words: 0,
             math: crate::math::Math::new(),
@@ -332,6 +357,9 @@ impl Machine {
             exmemcnt: 0,
             powcnt1: 0,
             clock: [0; 2],
+            dbg_break_write: None,
+            dbg_write_hit: false,
+            dbg_write_watch: None,
         }
     }
 
@@ -518,6 +546,13 @@ impl Machine {
         if core == Core::Arm7 && (0x0400_0400..0x0400_0520).contains(&addr) {
             return self.sound.read(addr - 0x0400_0000, bytes);
         }
+        // Wi-Fi registers (ARM7): storage-only, so the boot write-verify loop passes.
+        if core == Core::Arm7
+            && (crate::wifi::Wifi::BASE..crate::wifi::Wifi::BASE + crate::wifi::Wifi::LEN)
+                .contains(&addr)
+        {
+            return self.wifi.read(addr - crate::wifi::Wifi::BASE, bytes);
+        }
         // 3D/geometry registers (ARM9): DISP3DCNT, the clear/fog/toon control block,
         // GXFIFO + command ports, GXSTAT, and matrix/test results. Sound occupies the
         // same 0x4000400 range on the ARM7, so this is ARM9-gated.
@@ -559,7 +594,7 @@ impl Machine {
             0x0400_01C0 if core == Core::Arm7 => self.spi.read_cnt() as u32,
             0x0400_01C2 if core == Core::Arm7 => self.spi.read_data() as u32,
             0x0400_0280..=0x0400_02BF if core == Core::Arm9 => {
-                self.math.read(addr & 0xFFF, bytes)
+                self.math.read(addr & 0xFFF, bytes, self.clock[c])
             }
             0x0400_0208 => self.interrupts[c].ime() as u32,
             0x0400_0210 => self.interrupts[c].ie(),
@@ -651,6 +686,14 @@ impl Machine {
             self.sound.write(addr - 0x0400_0000, value, bytes);
             return;
         }
+        // Wi-Fi registers (ARM7): storage-only, so the boot write-verify loop passes.
+        if core == Core::Arm7
+            && (crate::wifi::Wifi::BASE..crate::wifi::Wifi::BASE + crate::wifi::Wifi::LEN)
+                .contains(&addr)
+        {
+            self.wifi.write(addr - crate::wifi::Wifi::BASE, value, bytes);
+            return;
+        }
         // 3D/geometry registers (ARM9): DISP3DCNT, clear/fog/toon control, GXFIFO +
         // command ports, GXSTAT. ARM9-gated (sound shares 0x4000400 on the ARM7).
         if core == Core::Arm9
@@ -697,7 +740,7 @@ impl Machine {
         }
         // ARM9 hardware division / square-root units.
         if core == Core::Arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
-            self.math.write(addr & 0xFFF, value, bytes);
+            self.math.write(addr & 0xFFF, value, bytes, self.clock[core.index()]);
             return;
         }
         // 2D engine register blocks (BGxCNT..BLDY), ARM9 only: Engine A at 0x4000008,
@@ -817,6 +860,11 @@ impl EventHandler<NdsEvent> for Machine {
                 ctx.scheduler
                     .schedule_after(crate::sound::CYCLES_PER_SAMPLE, NdsEvent::SoundSample);
             }
+            NdsEvent::RtcTick => {
+                self.rtc.tick_second();
+                ctx.scheduler
+                    .schedule_after(crate::rtc::CYCLES_PER_SECOND, NdsEvent::RtcTick);
+            }
         }
     }
 }
@@ -829,6 +877,8 @@ pub struct System {
     machine: Machine,
     /// Whether the recurring sound-sample event has been scheduled.
     audio_started: bool,
+    /// Whether the recurring 1 Hz RTC tick has been scheduled.
+    rtc_started: bool,
     /// Debug: snapshot of `(total_commands, submitted, emitted, cmd_hist)` at the
     /// previous `debug_report` call, so each report can show the delta since then.
     dbg_prev: Option<(u64, u64, u64, Box<[u64; 128]>)>,
@@ -849,6 +899,7 @@ impl System {
             scheduler: Scheduler::new(),
             machine: Machine::new(),
             audio_started: false,
+            rtc_started: false,
             dbg_prev: None,
         }
     }
@@ -1061,6 +1112,203 @@ impl System {
     /// The number of pending scheduler events, stale ones included.
     pub fn pending_count(&self) -> usize {
         self.scheduler.pending_count()
+    }
+
+    // --- debug: single-step, run-to-condition, write/register watch ---
+
+    /// The program counter of `core`.
+    // (see also [`RegWatch`] for the register-transition watchpoint)
+    pub fn core_pc(&self, core: Core) -> u32 {
+        self.core_reg(core, 15)
+    }
+
+    /// Register `idx` (0-15) of `core`.
+    pub fn core_reg(&self, core: Core, idx: usize) -> u32 {
+        match core {
+            Core::Arm9 => self.arm9.register(idx),
+            Core::Arm7 => self.arm7.register(idx),
+        }
+    }
+
+    /// The `CPSR` of `core` as a raw word.
+    pub fn core_cpsr(&self, core: Core) -> u32 {
+        match core {
+            Core::Arm9 => self.arm9.cpsr().bits(),
+            Core::Arm7 => self.arm7.cpsr().bits(),
+        }
+    }
+
+    /// Debug: fast-forward `skip` instructions of `core`, then single-step `count` more,
+    /// writing one line per instruction to `path` — `PC R0..R15 CPSR` in hex. A diffable
+    /// execution trace (for a reference diff, or self-contained anomaly hunting such as
+    /// stack-pointer corruption). Uses the deterministic stepping, so instruction `N` from
+    /// boot is reproducible.
+    pub fn debug_trace(&mut self, core: Core, skip: u64, count: u64, path: &str) -> std::io::Result<u64> {
+        use std::io::Write;
+        if skip > 0 {
+            self.debug_run(core, skip, None, None, None);
+        }
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for _ in 0..count {
+            // PC and the core's cumulative clock (master ticks) — enough to compare both
+            // control flow and timing against a reference trace.
+            writeln!(w, "{:08X} {}", self.core_reg(core, 15), self.clock(core))?;
+            self.debug_run(core, 1, None, None, None);
+        }
+        Ok(count)
+    }
+
+    /// Emit a full-register trace for value-level diffing against a reference emulator:
+    /// one line per instruction, `PC R0..R15 CPSR` (all hex, space-separated). Where a
+    /// [`Self::debug_trace`] PC trace only exposes control-flow divergences, this exposes
+    /// *data* divergences — a register holding a different value under an identical PC —
+    /// which is how a wrong computed value (feeding a store, an IPC send, …) is traced to
+    /// its origin.
+    pub fn debug_trace_regs(
+        &mut self,
+        core: Core,
+        skip: u64,
+        count: u64,
+        path: &str,
+    ) -> std::io::Result<u64> {
+        use std::io::Write;
+        if skip > 0 {
+            self.debug_run(core, skip, None, None, None);
+        }
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut line = String::with_capacity(17 * 9 + 9);
+        for _ in 0..count {
+            line.clear();
+            // PC first (R15 is included again in the register list, so both a bare-PC
+            // aligner and a register comparator can read the same file).
+            // `PC R0..R14 CPSR`: R15 is the PC (already the first column) and carries a
+            // pipeline offset that differs harmlessly across emulators, so it is omitted.
+            line.push_str(&format!("{:08X}", self.core_reg(core, 15)));
+            for i in 0..15 {
+                line.push_str(&format!(" {:08X}", self.core_reg(core, i)));
+            }
+            line.push_str(&format!(" {:08X}", self.core_cpsr(core)));
+            writeln!(w, "{line}")?;
+            self.debug_run(core, 1, None, None, None);
+        }
+        Ok(count)
+    }
+
+    /// Enable/disable the guest-write address histogram (`memory.watch`).
+    pub fn set_write_watch(&mut self, on: bool) {
+        self.machine.dbg_write_watch = on.then(Default::default);
+    }
+
+    /// The write-address histogram as `(addr, count)`, hottest first, top `n`.
+    pub fn write_watch_report(&self, n: usize) -> Vec<(u32, u64)> {
+        let mut v: Vec<_> = self
+            .machine
+            .dbg_write_watch
+            .as_ref()
+            .map(|w| w.iter().map(|(&a, &c)| (a, c)).collect())
+            .unwrap_or_default();
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        v.truncate(n);
+        v
+    }
+
+    /// Debug: run the machine, executing up to `max` instructions of `core` (interleaving
+    /// the other core and firing scheduled events just like [`Self::run_until`]), stopping
+    /// early when the core's PC reaches `stop_pc`, a `break_write` address is written, or a
+    /// `reg_watch` register transition fires. Returns `(instructions_of_core_executed,
+    /// stopped_on_a_condition)`.
+    pub fn debug_run(
+        &mut self,
+        core: Core,
+        max: u64,
+        stop_pc: Option<u32>,
+        break_write: Option<u32>,
+        mut reg_watch: Option<RegWatch>,
+    ) -> (u64, bool) {
+        // Seed the recurring timeline events (video, audio, RTC) so single-stepped
+        // execution sees the same interrupts — VBlank especially — as a real `run_frame`.
+        // Without this a traced boot stalls in a VBlank-wait the frame path clears.
+        self.start_video();
+        self.start_audio();
+        self.start_rtc();
+        self.machine.dbg_break_write = break_write;
+        self.machine.dbg_write_hit = false;
+        let mut steps = 0u64;
+        let mut slices = 0u64;
+        // A halted, event-starved machine advances time without executing; cap the number
+        // of scheduler slices so a fully-idle (hung) game can't loop forever.
+        let slice_cap = max.saturating_mul(4).max(2_000_000);
+        while steps < max && slices < slice_cap {
+            slices += 1;
+            let deadline = self.scheduler.next_deadline().unwrap_or(self.scheduler.now() + crate::ppu::CYCLES_PER_LINE);
+            loop {
+                for c in 0..2 {
+                    if self.machine.halted[c] && self.machine.interrupts[c].pending() {
+                        self.machine.halted[c] = false;
+                    }
+                    if self.machine.halted[c] && self.machine.clock[c] < deadline {
+                        self.machine.clock[c] = deadline;
+                    }
+                }
+                let (c0, c1) = (self.machine.clock[0], self.machine.clock[1]);
+                let run0 = !self.machine.halted[0] && c0 < deadline;
+                let run1 = !self.machine.halted[1] && c1 < deadline;
+                let sel = if run0 && (!run1 || c0 <= c1) {
+                    Core::Arm9
+                } else if run1 {
+                    Core::Arm7
+                } else {
+                    break;
+                };
+                // Capture the target core's watched register and PC *before* the step, so a
+                // transition is attributed to the instruction that caused it.
+                let (pc_before, reg_before) = match (&reg_watch, sel == core) {
+                    (Some(w), true) => (self.core_pc(core), Some(self.core_reg(core, w.reg))),
+                    _ => (0, None),
+                };
+                self.step_core(sel);
+                if self.machine.dbg_write_hit {
+                    self.machine.dbg_break_write = None;
+                    return (steps, true);
+                }
+                if sel == core {
+                    steps += 1;
+                    if let Some(w) = reg_watch.as_mut() {
+                        let cur = self.core_reg(core, w.reg);
+                        // A transition to the target value, by an instruction in the PC window.
+                        if cur == w.value
+                            && reg_before != Some(w.value)
+                            && (w.pc_lo..w.pc_hi).contains(&pc_before)
+                        {
+                            if w.skip > 0 {
+                                w.skip -= 1;
+                            } else {
+                                self.machine.dbg_break_write = None;
+                                return (steps, true);
+                            }
+                        }
+                    }
+                    if stop_pc == Some(self.core_pc(core)) {
+                        self.machine.dbg_break_write = None;
+                        return (steps, true);
+                    }
+                    if steps >= max {
+                        // Mid-slice pause: return WITHOUT firing this slice's events. The
+                        // cores are left ahead of `now` with events still pending, so the
+                        // next call resumes the identical timeline — chunking the run into
+                        // different step counts no longer shifts interrupt delivery (which
+                        // would diverge execution). Events fire only at true slice ends.
+                        self.machine.dbg_break_write = None;
+                        return (steps, false);
+                    }
+                }
+            }
+            // Natural slice end (both cores reached the deadline): settle and dispatch.
+            self.scheduler.set_now(deadline);
+            self.scheduler.run_due_events(&mut self.machine);
+        }
+        self.machine.dbg_break_write = None;
+        (steps, false)
     }
 
     /// Run the machine until the master clock reaches `target`, interleaving the
@@ -1362,6 +1610,35 @@ impl System {
             .schedule_at(now + crate::sound::CYCLES_PER_SAMPLE, NdsEvent::SoundSample);
     }
 
+    /// Begin the RTC's recurring 1 Hz tick (idempotent).
+    pub fn start_rtc(&mut self) {
+        if self.rtc_started {
+            return;
+        }
+        self.rtc_started = true;
+        let now = self.scheduler.now();
+        self.scheduler
+            .schedule_at(now + crate::rtc::CYCLES_PER_SECOND, NdsEvent::RtcTick);
+    }
+
+    /// Seed the RTC calendar (e.g. from the host's current local time). See
+    /// [`crate::rtc::Rtc::set_datetime`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rtc_datetime(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        day_of_week: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.machine
+            .rtc
+            .set_datetime(year, month, day, day_of_week, hour, minute, second);
+    }
+
     /// Drain the mixer's interleaved stereo `i16` samples produced since the last call.
     pub fn take_audio(&mut self) -> Vec<i16> {
         self.machine.sound.take_samples()
@@ -1381,6 +1658,7 @@ impl System {
     pub fn run_frame(&mut self) {
         self.start_video();
         self.start_audio();
+        self.start_rtc();
         let start = self.machine.ppu.frame();
         for _ in 0..(crate::ppu::HEIGHT as u64 + 100) {
             if self.machine.ppu.frame() != start {

@@ -116,6 +116,9 @@ pub fn firmware_flash() -> Vec<u8> {
     let ptr = (AREA1 / 8) as u16;
     flash[0x20..0x22].copy_from_slice(&ptr.to_le_bytes());
 
+    // Wi-Fi calibration block (0x2A..0x1FF), which the ARM7's Wi-Fi init reads at boot.
+    write_wifi_calibration(&mut flash);
+
     let data = user_settings();
     // Two copies for wear-levelling; the game picks the valid one with the higher
     // update counter, so area 1 (counter 1) wins over area 2 (counter 0).
@@ -126,4 +129,49 @@ pub fn firmware_flash() -> Vec<u8> {
         flash[base + 0x72..base + 0x74].copy_from_slice(&crc.to_le_bytes());
     }
     flash
+}
+
+/// Fill the firmware's Wi-Fi calibration/settings block (GBATEK "DS Firmware Wifi
+/// Calibration Data"), located directly after the header at `0x2A`. The ARM7's Wi-Fi
+/// init reads this at boot: it range-checks the `config_length` at `0x2C`, verifies the
+/// CRC16 at `0x2A` over the config region, then copies the RF/BB values into the Wi-Fi
+/// hardware. A missing block (all `0xFF`) fails the length/CRC check and deadlocks the
+/// boot handshake. We emit a plausible, self-consistent block; the exact RF/BB constants
+/// only feed (unemulated) Wi-Fi hardware registers, so structural fields and a matching
+/// CRC are what matter.
+fn write_wifi_calibration(flash: &mut [u8]) {
+    // Config region: 0x0138 bytes at 0x2C..0x164 (the usual length), zero-initialized so
+    // unused fields read as 00h. 0x163 stays 0xFF per GBATEK (still inside the CRC).
+    const CFG: usize = 0x2C;
+    const CFG_LEN: usize = 0x0138;
+    for b in &mut flash[CFG..CFG + CFG_LEN] {
+        *b = 0x00;
+    }
+    let put16 = |flash: &mut [u8], off: usize, v: u16| {
+        flash[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    };
+
+    put16(flash, 0x2C, CFG_LEN as u16); // config_length
+    flash[0x2F] = 0x00; // version (v1)
+    // 48-bit MAC address (Nintendo OUI 00:09:BF + an arbitrary but fixed suffix).
+    flash[0x36..0x3C].copy_from_slice(&[0x00, 0x09, 0xBF, 0x12, 0x34, 0x56]);
+    put16(flash, 0x3C, 0x3FFE); // enabled channels: 1..13
+    put16(flash, 0x3E, 0xFFFF); // flags
+    flash[0x40] = 0x02; // RF chip type (NDS: Type2, Mitsumi MM3155)
+    flash[0x41] = 0x18; // RF bits per entry at 0xCE (24-bit)
+    flash[0x42] = 0x0C; // RF number of entries at 0xCE
+    flash[0x43] = 0x01;
+    // Channel 1..14 BB[1Eh] values (usually ~0xB1..0xB7); RF[9] bits (usually 0x10).
+    for (i, b) in flash[0x146..0x154].iter_mut().enumerate() {
+        *b = 0xB1 + (i as u8 % 7);
+    }
+    for b in &mut flash[0x154..0x162] {
+        *b = 0x10;
+    }
+    flash[0x162] = 0x1C; // unknown per-console calibration byte (usual 0x19..0x1C)
+    flash[0x163] = 0xFF; // GBATEK: 0xFF, inside the CRC region
+
+    // CRC16 (initial value 0) over the config region [0x2C .. 0x2C+config_length).
+    let crc = crc16(0x0000, &flash[CFG..CFG + CFG_LEN]);
+    put16(flash, 0x2A, crc);
 }
