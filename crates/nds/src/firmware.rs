@@ -119,6 +119,9 @@ pub fn firmware_flash() -> Vec<u8> {
     // Wi-Fi calibration block (0x2A..0x1FF), which the ARM7's Wi-Fi init reads at boot.
     write_wifi_calibration(&mut flash);
 
+    // Wi-Fi Connection (WFC) access-point slots, just below the user-settings area.
+    write_wifi_access_points(&mut flash, AREA1);
+
     let data = user_settings();
     // Two copies for wear-levelling; the game picks the valid one with the higher
     // update counter, so area 1 (counter 1) wins over area 2 (counter 0).
@@ -129,6 +132,29 @@ pub fn firmware_flash() -> Vec<u8> {
         flash[base + 0x72..base + 0x74].copy_from_slice(&crc.to_le_bytes());
     }
     flash
+}
+
+/// Write the three Wi-Fi Connection (WFC) access-point slots (GBATEK "DS Firmware
+/// Wifi Internet Access Points") as valid but *unconfigured* entries. The slots sit
+/// at `user_settings - 0x400/0x300/0x200` (the `0x3FA00/0x3FB00/0x3FC00` region a
+/// game copies out of flash). Games that support online read these, checksum each
+/// slot's `0xFE` bytes against the CRC16 at offset `0xFE`, and — if the CRC fails —
+/// report the Wi-Fi user information as corrupt/erased. Erased (`0xFF`-filled) flash
+/// fails that check, so we emit zero-filled slots with `Status = FFh` ("connection
+/// not configured") and a matching CRC: a clean "no connections set up" state rather
+/// than a corrupt one.
+fn write_wifi_access_points(flash: &mut [u8], user_settings_ptr: usize) {
+    const SLOT_LEN: usize = 0x100;
+    const CRC_LEN: usize = 0xFE; // CRC16 covers bytes 0x00..0xFD.
+    const STATUS: usize = 0xE7; // 00h=Normal, 01h=AOSS, FFh=not configured.
+    for delta in [0x400, 0x300, 0x200] {
+        let base = user_settings_ptr - delta;
+        let slot = &mut flash[base..base + SLOT_LEN];
+        slot.fill(0x00);
+        slot[STATUS] = 0xFF; // connection not configured
+        let crc = crc16(0x0000, &slot[..CRC_LEN]);
+        slot[CRC_LEN..CRC_LEN + 2].copy_from_slice(&crc.to_le_bytes());
+    }
 }
 
 /// Fill the firmware's Wi-Fi calibration/settings block (GBATEK "DS Firmware Wifi
@@ -174,4 +200,27 @@ fn write_wifi_calibration(flash: &mut [u8]) {
     // CRC16 (initial value 0) over the config region [0x2C .. 0x2C+config_length).
     let crc = crc16(0x0000, &flash[CFG..CFG + CFG_LEN]);
     put16(flash, 0x2A, crc);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wifi_access_point_slots_are_valid_but_unconfigured() {
+        // A game reads each 0x100-byte WFC slot and checksums bytes 0x00..0xFD
+        // against the CRC16 at 0xFE (initial 0x0000). A stale/erased slot fails the
+        // check and triggers "Your Wi-Fi User Information may have been erased." All
+        // three slots must validate, and none may read as a configured connection.
+        let flash = firmware_flash();
+        let user_settings_ptr = 0x3FE00usize; // Header [0x20]*8; matches AREA1.
+        for delta in [0x400usize, 0x300, 0x200] {
+            let base = user_settings_ptr - delta;
+            let slot = &flash[base..base + 0x100];
+            let stored = u16::from_le_bytes([slot[0xFE], slot[0xFF]]);
+            assert_eq!(crc16(0x0000, &slot[..0xFE]), stored, "slot @{base:#x} CRC");
+            assert_eq!(slot[0xE7], 0xFF, "slot @{base:#x} status = not configured");
+            assert_eq!(slot[0xEF], 0x00, "slot @{base:#x} no connection configured");
+        }
+    }
 }
