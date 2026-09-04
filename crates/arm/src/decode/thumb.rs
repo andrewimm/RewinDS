@@ -158,18 +158,22 @@ fn decode_alu_operation(raw: u16) -> ThumbInstruction {
     }
 }
 
-/// Format 5 — high-register operations and `BX`. The `H1`/`H2` bits (7 and 6)
-/// extend `rd`/`rs` to the full 4-bit register range.
+/// Format 5 — high-register operations and `BX`/`BLX`. The `H1`/`H2` bits (7
+/// and 6) extend `rd`/`rs` to the full 4-bit register range, except in the
+/// branch form where `H1` selects `BX` vs `BLX` (see below).
 fn decode_hi_register(raw: u16) -> ThumbInstruction {
+    let rd_high = (raw >> 7) & 1;
+    let rs_high = (raw >> 6) & 1;
     let op = match (raw >> 8) & 0b11 {
         0b00 => ThumbHiRegOp::Add,
         0b01 => ThumbHiRegOp::Cmp,
         0b10 => ThumbHiRegOp::Mov,
-        0b11 => ThumbHiRegOp::Bx,
-        _ => unreachable!(),
+        // For the branch form, H1 (bit 7) is the link bit, not a register
+        // extension: 0 = `BX`, 1 = `BLX` register (ARMv5). `rs` (via H2) is the
+        // target either way.
+        _ if rd_high == 1 => ThumbHiRegOp::Blx,
+        _ => ThumbHiRegOp::Bx,
     };
-    let rd_high = (raw >> 7) & 1;
-    let rs_high = (raw >> 6) & 1;
     ThumbInstruction::HiRegister {
         op,
         rs: Register::new((((raw >> 3) & 0b111) | (rs_high << 3)) as u8),

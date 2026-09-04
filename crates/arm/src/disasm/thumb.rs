@@ -58,6 +58,7 @@ pub fn format_thumb(inst: &ThumbInstruction) -> String {
 
         ThumbInstruction::HiRegister { op, rs, rd } => match op {
             ThumbHiRegOp::Bx => format!("bx\t{}", reg(*rs)),
+            ThumbHiRegOp::Blx => format!("blx\t{}", reg(*rs)),
             ThumbHiRegOp::Add => format!("add\t{}, {}", reg(*rd), reg(*rs)),
             ThumbHiRegOp::Cmp => format!("cmp\t{}, {}", reg(*rd), reg(*rs)),
             ThumbHiRegOp::Mov => format!("mov\t{}, {}", reg(*rd), reg(*rs)),

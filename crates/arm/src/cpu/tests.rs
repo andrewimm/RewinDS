@@ -676,6 +676,55 @@ fn blx_immediate_is_nop_on_v4t() {
 }
 
 #[test]
+fn thumb_blx_register_links_and_exchanges() {
+    use super::ArmVersion::Armv5TE;
+    // Enter Thumb at 0x08, then `blx r1` (0x4788) to an ARM target at 0x40.
+    // The distinguishing behavior from `bx` is that LR must be set.
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xE12F_FF10]); // bx r0 -> Thumb at 0x08
+    bus.load_thumb(0x08, &[0x4788]); // blx r1
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(0, 0x08 | 1); // Thumb entry
+    cpu.set_register(1, 0x40); // ARM target (bit0 clear)
+    cpu.step(&mut bus); // bx r0
+    cpu.step(&mut bus); // blx r1
+    assert_eq!(cpu.register(15), 0x40); // branched to the target
+    assert!(!cpu.cpsr().thumb()); // exchanged to ARM
+    assert_eq!(cpu.register(14), 0x0B); // LR = (0x08 + 2) | 1
+}
+
+#[test]
+fn thumb_blx_register_stays_thumb_when_target_is_thumb() {
+    use super::ArmVersion::Armv5TE;
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xE12F_FF10]); // bx r0 -> Thumb at 0x08
+    bus.load_thumb(0x08, &[0x4788]); // blx r1
+    let mut cpu = Cpu::with_version(Armv5TE);
+    cpu.set_register(0, 0x08 | 1);
+    cpu.set_register(1, 0x41); // Thumb target (bit0 set)
+    cpu.step(&mut bus); // bx r0
+    cpu.step(&mut bus); // blx r1
+    assert_eq!(cpu.register(15), 0x40);
+    assert!(cpu.cpsr().thumb()); // stayed in Thumb
+    assert_eq!(cpu.register(14), 0x0B);
+}
+
+#[test]
+fn thumb_blx_register_traps_on_v4t() {
+    // `BLX` register is undefined on the ARM7TDMI.
+    let mut bus = TestBus::new(0x100);
+    bus.load(0, &[0xE12F_FF10]); // bx r0 -> Thumb at 0x08
+    bus.load_thumb(0x08, &[0x4788]); // blx r1 (undefined on v4t)
+    let mut cpu = Cpu::with_version(super::ArmVersion::Armv4T);
+    cpu.set_register(0, 0x08 | 1);
+    cpu.set_register(1, 0x40);
+    cpu.step(&mut bus); // bx r0
+    cpu.step(&mut bus); // blx r1 -> undefined
+    assert_eq!(cpu.mode(), Some(Mode::Undefined));
+    assert_ne!(cpu.register(15), 0x40); // did not branch to the target
+}
+
+#[test]
 fn bkpt_enters_abort_on_v5_and_traps_on_v4t() {
     let v5 = run_one(super::ArmVersion::Armv5TE, 0xE120_0070, &[]);
     assert_eq!(v5.mode(), Some(Mode::Abort));

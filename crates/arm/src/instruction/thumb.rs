@@ -52,9 +52,9 @@ pub enum ThumbInstruction {
         rd: Register,
     },
 
-    /// Format 5 — high-register operations and `BX`. The `H` bits are folded
-    /// into full 4-bit `rd`/`rs`, so either operand may be r8..r15. For `Bx`,
-    /// `rs` is the target and `rd` is unused.
+    /// Format 5 — high-register operations and `BX`/`BLX`. The `H` bits are
+    /// folded into full 4-bit `rd`/`rs`, so either operand may be r8..r15. For
+    /// `Bx`/`Blx`, `rs` is the target and `rd` is unused.
     HiRegister {
         op: ThumbHiRegOp,
         rs: Register,
@@ -230,7 +230,8 @@ pub enum ThumbHiRegOp {
     Add, // 00
     Cmp, // 01
     Mov, // 10
-    Bx,  // 11
+    Bx,  // 11, H1 = 0
+    Blx, // 11, H1 = 1 (ARMv5): branch-and-exchange with link
 }
 
 /// Format 8 sign-extended load/store operations (the `S`/`H` field).

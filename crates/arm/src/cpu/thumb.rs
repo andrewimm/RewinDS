@@ -108,6 +108,20 @@ impl Cpu {
                     self.cpsr.set_thumb(target & 1 != 0);
                     self.set_reg(Register::PC, target & !1);
                 }
+                ThumbHiRegOp::Blx => {
+                    // `BLX` register is ARMv5-only; undefined on the ARM7TDMI.
+                    if !self.version.is_v5() {
+                        let return_address = self.r[15].wrapping_add(2);
+                        self.enter_exception(0x04, Mode::Undefined, return_address, false);
+                    } else {
+                        // Link to the instruction after this one (Thumb bit set),
+                        // then exchange to the target's instruction set.
+                        let target = self.reg(rs);
+                        self.set_reg(Register::LR, self.r[15].wrapping_add(2) | 1);
+                        self.cpsr.set_thumb(target & 1 != 0);
+                        self.set_reg(Register::PC, target & !1);
+                    }
+                }
             },
             PcRelativeLoad { rd, word8 } => {
                 self.data_access = true;
