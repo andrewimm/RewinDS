@@ -269,6 +269,16 @@ impl Emulator {
         }
     }
 
+    /// Re-derive the RGBA present buffers from the machine's current framebuffer,
+    /// so [`Self::screen`] reflects the latest rendered frame even after partial
+    /// runs (single-stepping) that did not go through [`Self::run_frame`].
+    pub fn present(&mut self) {
+        match self {
+            Emulator::Gba(g) => g.refresh_rgba(),
+            Emulator::Nds(n) => n.refresh_rgba(),
+        }
+    }
+
     /// The presentable screen at `index`, or `None` if out of range. Screen 0 is
     /// the top screen.
     pub fn screen(&self, index: usize) -> Option<Screen<'_>> {
@@ -469,7 +479,19 @@ impl NdsEmulator {
 
     fn run_frame(&mut self) {
         self.system.run_frame();
-        // Both physical screens, each from its POWCNT1-assigned 2D engine.
+        self.refresh_rgba();
+        // Always drain (so the buffer can't grow unbounded); feed only when attached.
+        let samples = self.system.take_audio();
+        if let Some(sink) = self.audio.as_mut() {
+            if !self.audio_muted {
+                sink.push(&samples);
+            }
+        }
+    }
+
+    /// Convert both engines' BGR555 framebuffers into the RGBA8 present buffers.
+    /// Both physical screens, each from its POWCNT1-assigned 2D engine.
+    fn refresh_rgba(&mut self) {
         for screen in 0..2 {
             for (px, &color) in self.rgba[screen]
                 .as_chunks_mut::<4>()
@@ -478,13 +500,6 @@ impl NdsEmulator {
                 .zip(self.system.screen(screen))
             {
                 *px = bgr555_to_rgba8(color);
-            }
-        }
-        // Always drain (so the buffer can't grow unbounded); feed only when attached.
-        let samples = self.system.take_audio();
-        if let Some(sink) = self.audio.as_mut() {
-            if !self.audio_muted {
-                sink.push(&samples);
             }
         }
     }

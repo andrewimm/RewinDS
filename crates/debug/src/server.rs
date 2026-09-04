@@ -429,6 +429,23 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             }
             out
         }
+        // The full RGBA8 present buffer for one physical screen (`screen`: 0 = top,
+        // 1 = the DS bottom screen). Works for both consoles; the client stacks the
+        // two DS screens itself. `base64` is width*height*4 bytes, row-major.
+        "video.framebuffer" => {
+            emu.present();
+            let index = params.get("screen").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let s = emu
+                .screen(index)
+                .ok_or_else(|| format!("screen {index} out of range"))?;
+            json!({
+                "screen": index,
+                "width": s.width,
+                "height": s.height,
+                "format": "rgba8",
+                "base64": base64(s.rgba),
+            })
+        }
         "video.explainPixel" => {
             let (engine, x, y) = (enginep(params), u32p(params, "x") as u16, u32p(params, "y") as u16);
             let ex = Debugger::new(emu)
