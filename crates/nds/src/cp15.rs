@@ -178,6 +178,20 @@ impl Cp15 {
         self.control & (1 << 13) != 0
     }
 
+    /// Whether the data cache is enabled (control bit 2). The ARM946E-S powers up
+    /// with its caches off; software enables them once the memory-protection regions
+    /// are configured. Until then, cacheable memory is accessed uncached (full bus
+    /// waitstates), which matters for accurate boot-time timing.
+    pub fn dcache_enabled(&self) -> bool {
+        self.control & (1 << 2) != 0
+    }
+
+    /// Whether the instruction cache is enabled (control bit 12). See
+    /// [`Self::dcache_enabled`].
+    pub fn icache_enabled(&self) -> bool {
+        self.control & (1 << 12) != 0
+    }
+
     /// Whether DTCM is enabled (control bit 16).
     pub fn dtcm_enabled(&self) -> bool {
         self.control & (1 << 16) != 0

@@ -550,6 +550,13 @@ impl Cart {
     pub fn transfer_irq_enabled(&self) -> bool {
         self.auxspicnt & (1 << 14) != 0
     }
+
+    /// Words of the current block still awaiting readout. The gamecard clocks a
+    /// block out word by word, asserting `DRQ` for each; a cart-mode DMA drains
+    /// them until this reaches zero.
+    pub fn words_remaining(&self) -> u32 {
+        self.words_left
+    }
 }
 
 /// The gamecard data port (`4100010h`), a fixed DMA source for cart-mode DMA.

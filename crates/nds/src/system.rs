@@ -903,8 +903,25 @@ impl EventHandler<NdsEvent> for Machine {
                 let c = core.index();
                 self.cart.mark_ready();
                 for channel in 0..4 {
-                    if self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9) {
+                    if !self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9) {
+                        continue;
+                    }
+                    // The gamecard asserts `DRQ` once per unit of data and drives one
+                    // DMA request each time; the common card-read idiom arms a
+                    // single-word repeating channel that moves the whole block one word
+                    // per request. This controller makes the entire block ready at once,
+                    // so keep servicing the channel until the block is drained — the
+                    // equivalent of retriggering the DMA for every `DRQ`. A channel that
+                    // stops making progress (misconfigured, or not sourcing the data
+                    // port) breaks the loop rather than spinning.
+                    while self.cart.words_remaining() > 0
+                        && self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9)
+                    {
+                        let before = self.cart.words_remaining();
                         self.run_dma_channel(core, channel);
+                        if self.cart.words_remaining() == before {
+                            break;
+                        }
                     }
                 }
                 if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
@@ -2514,6 +2531,52 @@ mod tests {
         // transfer IRQ.
         let fire = system.now() + 4260;
         system.run_until(fire);
+        assert_eq!(&system.memory().main[..0x200], &rom[0x8000..0x8200]);
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
+        assert_eq!(
+            system.interrupts(Core::Arm9).iflags(),
+            IrqSource::Gamecard.mask()
+        );
+    }
+
+    #[test]
+    fn cart_dma_single_word_repeat_drains_whole_block() {
+        use crate::IrqSource;
+        // The common card-read idiom arms a *single-word* repeating channel: the
+        // gamecard asserts DRQ once per word and drives one DMA request each time, so
+        // a count-of-1 repeat channel moves the whole block one word per request. The
+        // completion IRQ (which the loader thread waits on) must still fire once the
+        // block is fully drained — a channel that transferred only one word would leave
+        // the block unfinished and hang the loader.
+        let mut system = System::new();
+        let mut rom = vec![0u8; 0x9000];
+        for (i, b) in rom[0x8000..0x8200].iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        system.machine.cart.insert(&rom);
+
+        system.io_write(Core::Arm9, 0x0400_01A0, (1 << 15) | (1 << 14), 2); // AUXSPICNT: slot + IRQ
+        system.io_write(Core::Arm9, 0x0400_0210, IrqSource::Gamecard.mask(), 4); // IE
+        system.io_write(Core::Arm9, 0x0400_0208, 1, 4); // IME
+
+        // Fixed source = data port, incrementing dest, 32-bit, ARM9 start mode 5,
+        // repeat, count = 1 — one word per DRQ.
+        let cnt_h: u32 = (1 << 15) | (1 << 9) | (1 << 10) | (2 << 7) | (5 << 11);
+        system.io_write(Core::Arm9, 0x0400_00B0, crate::cart::DATA_PORT, 4); // SAD
+        system.io_write(Core::Arm9, 0x0400_00B4, 0x0200_0000, 4); // DAD
+        system.io_write(Core::Arm9, 0x0400_00B8, 1, 2); // count = 1 word
+        system.io_write(Core::Arm9, 0x0400_00BA, cnt_h, 2); // armed, waits for cart start
+
+        let command = 0xB7u32 | (0x80 << 24);
+        system.io_write(Core::Arm9, 0x0400_01A8, command, 4);
+        system.io_write(Core::Arm9, 0x0400_01AC, 0, 4);
+        system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (1 << 24), 4); // 0x200 block, start
+
+        let fire = system.now() + 4260;
+        system.run_until(fire);
+
+        // The entire 0x200 block streamed into Main RAM, Busy cleared, and the
+        // transfer-complete IRQ fired.
         assert_eq!(&system.memory().main[..0x200], &rom[0x8000..0x8200]);
         assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
         assert_eq!(
