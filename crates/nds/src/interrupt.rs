@@ -90,6 +90,12 @@ impl Interrupts {
         self.asserted_at = t;
     }
 
+    /// The master clock at which the pending cross-core interrupt was raised (`0`
+    /// if none); a core waking from halt on this interrupt resumes here, not before.
+    pub fn asserted_at(&self) -> emu_core::Timestamp {
+        self.asserted_at
+    }
+
     pub fn ime(&self) -> bool {
         self.ime
     }

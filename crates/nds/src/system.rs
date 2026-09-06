@@ -1289,11 +1289,12 @@ impl System {
             let deadline = self.scheduler.next_deadline().unwrap_or(self.scheduler.now() + crate::ppu::CYCLES_PER_LINE);
             loop {
                 for c in 0..2 {
+                    // See `run_until`: wake a halted core at the interrupt's raise
+                    // clock (never before), and don't skip halted cores mid-slice.
                     if self.machine.halted[c] && self.machine.interrupts[c].pending() {
                         self.machine.halted[c] = false;
-                    }
-                    if self.machine.halted[c] && self.machine.clock[c] < deadline {
-                        self.machine.clock[c] = deadline;
+                        self.machine.clock[c] =
+                            self.machine.clock[c].max(self.machine.interrupts[c].asserted_at());
                     }
                 }
                 let (c0, c1) = (self.machine.clock[0], self.machine.clock[1]);
@@ -1349,6 +1350,12 @@ impl System {
                     }
                 }
             }
+            // Any core still halted idled through the slice: advance it to the deadline.
+            for c in 0..2 {
+                if self.machine.halted[c] && self.machine.clock[c] < deadline {
+                    self.machine.clock[c] = deadline;
+                }
+            }
             // Natural slice end (both cores reached the deadline): settle and dispatch.
             self.scheduler.set_now(deadline);
             self.scheduler.run_due_events(&mut self.machine);
@@ -1373,11 +1380,16 @@ impl System {
             // the deadline so the barrier can advance and events there may wake it.
             loop {
                 for c in 0..2 {
+                    // A halted core wakes on a pending interrupt and resumes at the
+                    // clock the interrupt was raised (a cross-core IRQ is stamped by
+                    // its raiser; see `step_core`), never before it — so a woken core
+                    // does not act on the interrupt in its (stale) past. Halted cores
+                    // are NOT skipped to the deadline here; that would jump their clock
+                    // ahead of the raise time and lose this resume point.
                     if self.machine.halted[c] && self.machine.interrupts[c].pending() {
                         self.machine.halted[c] = false;
-                    }
-                    if self.machine.halted[c] && self.machine.clock[c] < deadline {
-                        self.machine.clock[c] = deadline;
+                        self.machine.clock[c] =
+                            self.machine.clock[c].max(self.machine.interrupts[c].asserted_at());
                     }
                 }
                 let (c0, c1) = (self.machine.clock[0], self.machine.clock[1]);
@@ -1393,6 +1405,13 @@ impl System {
                 self.step_core(core);
             }
 
+            // Any core still halted idled through the whole slice: advance it to the
+            // deadline so the barrier moves and events there can wake it.
+            for c in 0..2 {
+                if self.machine.halted[c] && self.machine.clock[c] < deadline {
+                    self.machine.clock[c] = deadline;
+                }
+            }
             // Settle the master clock at the deadline and dispatch what is due.
             self.scheduler.set_now(deadline);
             self.scheduler.run_due_events(&mut self.machine);
