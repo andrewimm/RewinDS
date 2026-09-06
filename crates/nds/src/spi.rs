@@ -14,16 +14,15 @@
 use crate::firmware;
 
 /// Power-on reset values of the DS Power Management chip's registers (GBATEK "DS Power
-/// Management Device"). Register 0 powers up with the sound amplifier (bit 0) and both
-/// backlights (bits 2-3) enabled (`0x0D`); register 2 = `0x01`, register 4 = `0x03`.
-/// These are the chip's hardware defaults, present from power-on — a direct-booted game
-/// reads them before it writes any of its own, and boot handshakes check e.g. the
-/// sound-amplifier bit, so starting them at zero would misreport the console's state.
+/// Management Device"). Every control bit powers up clear — the sound amplifier and both
+/// backlights are *off* until software enables them — so register 0 is `0x00`; only
+/// register 4 (a fixed hardware bit) reads back non-zero (`0x40`). A direct-booted game
+/// reads and then writes these itself; seeding register 0 with bits already set makes the
+/// ARM7 misreport the console's power state back to the ARM9 over PXI and diverges the
+/// boot handshake (HeartGold's `C0194008` PXI query returns the raw register-0 byte).
 fn pmic_reset() -> [u8; 8] {
     let mut regs = [0u8; 8];
-    regs[0] = 0x0D;
-    regs[2] = 0x01;
-    regs[4] = 0x03;
+    regs[4] = 0x40;
     regs
 }
 
@@ -286,10 +285,11 @@ mod tests {
         assert_eq!((b0 << 5) | (b1 >> 3), 0);
     }
 
-    /// The power chip powers up with its hardware defaults, not zeroed — register 0
-    /// reports the sound amplifier (bit 0) and backlights (bits 2-3) already enabled.
-    /// A direct-booted game reads these before writing its own, and an IPC boot
-    /// handshake checks the sound-amplifier bit, so a zeroed register 0 stalls it.
+    /// The power chip powers up with every control bit clear: the sound amplifier and
+    /// backlights are off until software enables them, so register 0 reads `0x00`. Only
+    /// register 4 (a fixed hardware bit) reads back non-zero (`0x40`). Seeding register 0
+    /// with bits set makes the ARM7 misreport power state to the ARM9 over PXI and
+    /// diverges the boot handshake.
     #[test]
     fn power_management_powers_up_with_hardware_defaults() {
         let mut spi = Spi::new();
@@ -302,10 +302,8 @@ mod tests {
             spi.write_cnt(0);
             v
         };
-        assert_eq!(read_reg(&mut spi, 0), 0x0D); // sound amp + both backlights
-        assert_eq!(read_reg(&mut spi, 0) & 1, 1); // sound-amplifier-enable bit set
-        assert_eq!(read_reg(&mut spi, 2), 0x01);
-        assert_eq!(read_reg(&mut spi, 4), 0x03);
+        assert_eq!(read_reg(&mut spi, 0), 0x00); // all control bits clear at power-on
+        assert_eq!(read_reg(&mut spi, 4), 0x40); // fixed hardware bit
     }
 
     #[test]
