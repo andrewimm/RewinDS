@@ -1422,7 +1422,14 @@ impl System {
             Core::Arm9 => self.arm9.register(15),
             Core::Arm7 => self.arm7.register(15),
         };
-        let asserted = self.machine.interrupts[core.index()].line_asserted();
+        let c = core.index();
+        let other = c ^ 1;
+        // Causality gate: only vector once this core's clock has reached the time a
+        // cross-core interrupt was raised (see `Interrupts::note_asserted_at`).
+        let asserted = self.machine.interrupts[c].line_ready(self.machine.clock[c]);
+        // Snapshot the *other* core's pending flags so a cross-core interrupt this
+        // instruction raises can be timestamped at our post-instruction clock.
+        let other_if_before = self.machine.interrupts[other].iflags();
         let cpu = match core {
             Core::Arm9 => &mut self.arm9,
             Core::Arm7 => &mut self.arm7,
@@ -1433,7 +1440,6 @@ impl System {
         // Each core charges its clock at the instruction boundary via the pipeline
         // model: the bus accumulates fetch/data/internal costs during the step, and
         // we combine them into one cost here.
-        let c = core.index();
         self.machine.timing[c].begin_step();
         let mut bus = NdsCpuBus {
             machine: &mut self.machine,
@@ -1457,6 +1463,14 @@ impl System {
         let cost = t.pending_execute.max(t.fetch) as Timestamp;
         t.pending_execute = execute;
         self.machine.clock[c] += if arm9 { cost } else { cost * 2 };
+        // If this instruction raised a new interrupt on the *other* core (e.g. an
+        // IPC send), stamp it with our just-advanced clock so that core does not
+        // vector before this instruction causally completed.
+        let raised = self.machine.interrupts[other].iflags() & !other_if_before;
+        if raised != 0 {
+            let now = self.machine.clock[c];
+            self.machine.interrupts[other].note_asserted_at(now);
+        }
     }
 
     /// Direct-boot a `.nds` image: copy the ARM9/ARM7 binaries to their RAM

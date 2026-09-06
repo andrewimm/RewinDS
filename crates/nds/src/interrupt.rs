@@ -47,6 +47,12 @@ pub struct Interrupts {
     ime: bool,
     ie: u32,
     iflags: u32,
+    /// Master-clock time at which a *cross-core* interrupt was last raised for
+    /// this core (the raiser's post-instruction clock). The receiving core must
+    /// not vector until its own clock reaches this, so an IRQ set by the other —
+    /// possibly clock-ahead — core (e.g. an IPC send) is never delivered before it
+    /// causally happened. `0` (the default) means no cross-core gate is pending.
+    asserted_at: emu_core::Timestamp,
 }
 
 impl Interrupts {
@@ -68,6 +74,20 @@ impl Interrupts {
     /// `IME`). The orchestrator gates this further on the CPSR I-bit.
     pub fn line_asserted(&self) -> bool {
         self.ime && self.pending()
+    }
+
+    /// Like [`Self::line_asserted`], additionally gated on causality: a
+    /// cross-core interrupt is delivered only once the receiver's clock `now`
+    /// reaches the raise time recorded by [`Self::note_asserted_at`].
+    pub fn line_ready(&self, now: emu_core::Timestamp) -> bool {
+        self.line_asserted() && now >= self.asserted_at
+    }
+
+    /// Record that a cross-core interrupt was raised for this core at master
+    /// clock `t` (the raiser's post-instruction clock), gating delivery until the
+    /// receiver catches up.
+    pub fn note_asserted_at(&mut self, t: emu_core::Timestamp) {
+        self.asserted_at = t;
     }
 
     pub fn ime(&self) -> bool {
