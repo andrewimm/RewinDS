@@ -43,7 +43,20 @@ pub struct Ipc {
     /// Previous edge-detector conditions, for the two FIFO interrupts.
     prev_send_empty: [bool; 2],
     prev_recv_ready: [bool; 2],
+    /// Rolling log of recent IPC traffic for the debug API: `(sender index,
+    /// kind, value, sender PC)` where kind 0 = FIFO send, 1 = SYNC write.
+    /// Bounded so it always reflects the most recent conversation (e.g. a
+    /// steady-state loop). The PC pins which code issued each message.
+    log: VecDeque<(u8, u8, u32, u32)>,
+    /// PC of the instruction currently accessing IPC, stashed by the bus before
+    /// a write so [`log_event`](Self::log_event) can attribute it. Debug only.
+    pending_pc: u32,
 }
+
+/// Most recent IPC events kept for the debug API. Sized with headroom so a
+/// caller streaming via [`Ipc::drain`] loses nothing between frequent polls
+/// even under a busy-wait that hammers the FIFO/SYNC registers.
+const LOG_CAPACITY: usize = 1 << 16;
 
 /// The remote core's index.
 fn remote(core: Core) -> usize {
@@ -53,6 +66,34 @@ fn remote(core: Core) -> usize {
 impl Ipc {
     pub fn new() -> Self {
         Ipc::default()
+    }
+
+    /// Stash the PC of the instruction about to access IPC, so a resulting
+    /// FIFO send / SYNC write is attributed to it in the debug log.
+    pub fn set_pending_pc(&mut self, pc: u32) {
+        self.pending_pc = pc;
+    }
+
+    /// Record an event in the rolling debug log, tagged with the pending PC.
+    fn log_event(&mut self, core: Core, kind: u8, value: u32) {
+        if self.log.len() >= LOG_CAPACITY {
+            self.log.pop_front();
+        }
+        self.log
+            .push_back((core.index() as u8, kind, value, self.pending_pc));
+    }
+
+    /// The recent IPC traffic, oldest first: `(sender_index, kind, value, pc)`
+    /// with kind 0 = FIFO send, 1 = SYNC write. For the debug API.
+    pub fn recent(&self) -> Vec<(u8, u8, u32, u32)> {
+        self.log.iter().copied().collect()
+    }
+
+    /// Take and clear the logged IPC traffic, for streaming the full ordered
+    /// event history by polling repeatedly (the [`recent`](Self::recent) ring
+    /// only retains the last [`LOG_CAPACITY`] events).
+    pub fn drain(&mut self) -> Vec<(u8, u8, u32, u32)> {
+        self.log.drain(..).collect()
     }
 
     // --- IPCSYNC ------------------------------------------------------------
@@ -70,6 +111,7 @@ impl Ipc {
     /// bit 13 fires an IRQ at the remote if it has enabled one.
     pub fn write_sync(&mut self, core: Core, value: u16, irqs: &mut [Interrupts; 2]) {
         let c = core.index();
+        self.log_event(core, 1, value as u32);
         self.sync_out[c] = ((value >> 8) & 0xF) as u8;
         self.sync_irq_enable[c] = value & (1 << 14) != 0;
         if value & (1 << 13) != 0 {
@@ -124,6 +166,7 @@ impl Ipc {
         if !self.fifo_enabled[c] {
             return;
         }
+        self.log_event(core, 0, value);
         if self.fifo[c].len() >= FIFO_DEPTH {
             self.error[c] = true;
         } else {
