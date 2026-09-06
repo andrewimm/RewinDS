@@ -377,6 +377,17 @@ impl Input<'_> {
     pub fn release_name(&mut self, name: &str) -> bool {
         self.set_name(name, false)
     }
+
+    /// Set a DS touch at lower-screen pixel `(x, y)`, or lift the pen with `None`.
+    /// Returns `false` on the GBA (no touchscreen).
+    pub fn set_touch(&mut self, pos: Option<(i32, i32)>) -> bool {
+        if let Some(n) = self.emu.as_nds_mut() {
+            n.set_touch(pos);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

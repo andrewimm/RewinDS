@@ -509,6 +509,84 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 return Err(format!("unknown key: {name}"));
             }
         }
+        // DS touchscreen: `{x, y}` (lower-screen pixels) presses the pen; omit or
+        // `pressed:false` lifts it.
+        "input.touch" => {
+            let pressed = params.get("pressed").and_then(Value::as_bool).unwrap_or(true);
+            let pos = pressed.then(|| {
+                let x = params.get("x").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let y = params.get("y").and_then(Value::as_i64).unwrap_or(0) as i32;
+                (x, y)
+            });
+            if Debugger::new(emu).input().set_touch(pos) {
+                json!({"ok": true})
+            } else {
+                return Err("touch is DS-only".to_string());
+            }
+        }
+        // Recent inter-core IPC traffic (DS): the ARM9<->ARM7 conversation, to
+        // see which core is waiting on what. kind 0 = FIFO send, 1 = SYNC write.
+        "ipc.recent" => {
+            let nds = emu
+                .as_nds()
+                .ok_or_else(|| "ipc.recent is DS-only".to_string())?;
+            let events: Vec<Value> = nds
+                .ipc_recent()
+                .into_iter()
+                .map(|(core, kind, value, pc)| {
+                    json!({
+                        "core": if core == 0 { "arm9" } else { "arm7" },
+                        "kind": if kind == 0 { "send" } else { "sync" },
+                        "value": value,
+                        "pc": pc,
+                    })
+                })
+                .collect();
+            json!({ "events": events })
+        }
+        // Per-core master-cycle clocks + scheduler now, for measuring the ARM9/ARM7
+        // relative execution rate (a timing-imbalance check).
+        "sys.clocks" => {
+            let nds = emu
+                .as_nds()
+                .ok_or_else(|| "sys.clocks is DS-only".to_string())?;
+            json!({
+                "arm9": nds.clock(nds::Core::Arm9),
+                "arm7": nds.clock(nds::Core::Arm7),
+                "now": nds.now(),
+            })
+        }
+        // Take-and-clear the IPC log, for streaming the full ordered history by
+        // polling repeatedly (the ring in `ipc.recent` only keeps recent events).
+        "ipc.drain" => {
+            let nds = emu
+                .as_nds_mut()
+                .ok_or_else(|| "ipc.drain is DS-only".to_string())?;
+            let events: Vec<Value> = nds
+                .ipc_drain()
+                .into_iter()
+                .map(|(core, kind, value, pc)| {
+                    json!({
+                        "core": if core == 0 { "arm9" } else { "arm7" },
+                        "kind": if kind == 0 { "send" } else { "sync" },
+                        "value": value,
+                        "pc": pc,
+                    })
+                })
+                .collect();
+            json!({ "events": events })
+        }
+        // Launch the inserted cartridge after a firmware boot has reached the menu
+        // (run enough frames first). Deterministic, menu-free counterpart to
+        // selecting the cart in the firmware menu.
+        "system.launchCart" => {
+            let nds = emu
+                .as_nds_mut()
+                .ok_or_else(|| "system.launchCart is DS-only".to_string())?;
+            nds.launch_cart_from_firmware()
+                .map_err(|e| format!("{e:?}"))?;
+            json!({"ok": true})
+        }
 
         // --- GBA-only extras ---
         "audio.take" => {
