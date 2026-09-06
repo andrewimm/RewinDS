@@ -73,6 +73,12 @@ pub struct Cart {
     reply: Reply,
     /// Words still to stream this block; zero means idle/complete.
     words_left: u32,
+    /// Whether the block's data has become available yet. A block starts Busy (the
+    /// cart clocks out the command and gap first) with data withheld — `DRQ` low —
+    /// until the scheduled completion marks it ready. Holding this off keeps a
+    /// polling reader spinning for the real access latency (see
+    /// [`Cart::transfer_delay`]) instead of draining the block instantly.
+    ready: bool,
     /// Set when the final word of a block is consumed; the caller then raises the
     /// transfer-complete IRQ and clears it via [`Cart::take_completion`].
     completed: bool,
@@ -127,6 +133,7 @@ impl Default for Cart {
             seed: [0; 2],
             reply: Reply::Fixed(0xFFFF_FFFF),
             words_left: 0,
+            ready: false,
             completed: false,
             backup: vec![0xFF; BACKUP_SIZE],
             backup_command: 0,
@@ -164,6 +171,12 @@ impl Cart {
     /// The cartridge's ROM chip ID (the boot-info footer mirrors it into RAM).
     pub fn chip_id(&self) -> u32 {
         self.chip_id
+    }
+
+    /// The inserted ROM image, for loading the game binaries after a firmware
+    /// boot has established real hardware state (menu-free cart launch).
+    pub fn rom(&self) -> &[u8] {
+        &self.rom
     }
 
     // --- register access ----------------------------------------------------
@@ -390,10 +403,17 @@ impl Cart {
     }
 
     /// `ROMCTRL` with the live `DRQ`/`Start` status bits reflecting the transfer.
+    /// `Start` (Busy) stays set for the whole outstanding block; `DRQ` (a word is
+    /// readable) asserts only once the command+gap latency has elapsed and the
+    /// block is [`Cart::mark_ready`]. A reader that spins on Busy or polls DRQ thus
+    /// waits out the real cart latency.
     pub fn read_romctrl(&self) -> u32 {
         let mut v = self.romctrl;
         if self.words_left > 0 {
-            v |= ROMCTRL_DRQ | ROMCTRL_START;
+            v |= ROMCTRL_START;
+            if self.ready {
+                v |= ROMCTRL_DRQ;
+            }
         }
         v
     }
@@ -402,6 +422,24 @@ impl Cart {
     /// read-modify-write of partial-width register writes.
     pub fn romctrl_config(&self) -> u32 {
         self.romctrl
+    }
+
+    /// Master-tick latency of the current block transfer: the time the real cart
+    /// keeps `Start/Busy` set (and before the completion IRQ/DMA fire) while it
+    /// clocks out the 8 command bytes and the ROMCTRL gap1, at the selected
+    /// transfer clock. Formula from GBATEK cart timing: `(8 + gap1) * clocks`
+    /// (+ 4 for the returned data word), then `* 2` for the 33→67 MHz master.
+    /// `gap1` = ROMCTRL bits 0-12; `clocks` = 8 at 4.2 MHz (bit 27) else 5 at
+    /// 6.7 MHz. This per-access latency — not modelled before — is what makes
+    /// cart-heavy code (a game's boot loader) wait, drifting the PPU/CPU phase.
+    pub fn transfer_delay(&self) -> u64 {
+        let clocks = if self.romctrl & (1 << 27) != 0 { 8 } else { 5 };
+        let gap = (self.romctrl & 0x1FFF) as u64;
+        let mut delay = (8 + gap) * clocks;
+        if self.words_left > 0 {
+            delay += 4; // first word is fetched before it can be read out
+        }
+        delay * 2
     }
 
     /// Write `ROMCTRL`. Setting the `Start` bit (bit 31) launches the transfer for
@@ -462,14 +500,24 @@ impl Cart {
             _ => Reply::Fixed(0xFFFF_FFFF),
         };
         self.words_left = block / 4;
-        // A zero-length block completes immediately (mode-switch commands).
+        // A zero-length block (mode-switch commands) completes at once and carries
+        // no data. A data block starts Busy with its data withheld until the
+        // command+gap latency elapses and [`Cart::mark_ready`] releases it.
         self.completed = self.words_left == 0;
+        self.ready = self.words_left == 0;
+    }
+
+    /// The command+gap latency has elapsed: the block's data is now available, so
+    /// `DRQ` may assert and reads may drain it.
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
     }
 
     /// Read one 32-bit word from the data port (`4100010h`), advancing the stream.
     /// The final word of a block sets the completion flag.
     pub fn read_data(&mut self) -> u32 {
-        if self.words_left == 0 {
+        // Nothing to give until the block has data and the latency has elapsed.
+        if self.words_left == 0 || !self.ready {
             return 0;
         }
         let word = match self.reply {
@@ -661,6 +709,12 @@ mod tests {
         let started = cart.write_romctrl(start_block(0x200));
         assert!(started);
         assert_eq!(cart.read_romctrl() & ROMCTRL_START, ROMCTRL_START, "busy");
+        // Data is withheld (DRQ low) during the command+gap latency; the scheduled
+        // completion releases it — modelled here by `mark_ready`.
+        assert_eq!(cart.read_romctrl() & ROMCTRL_DRQ, 0, "DRQ low until ready");
+        assert_eq!(cart.read_data(), 0, "no data until ready");
+        cart.mark_ready();
+        assert_eq!(cart.read_romctrl() & ROMCTRL_DRQ, ROMCTRL_DRQ, "DRQ up");
         // ROM is filled with `i as u8`, so ROM[0x8000..0x8004] = 00 01 02 03.
         let expect0 = u32::from_le_bytes([0x00, 0x01, 0x02, 0x03]);
         assert_eq!(cart.read_data(), expect0);
@@ -681,6 +735,7 @@ mod tests {
         assert_eq!((cart.chip_id >> 8) & 0xFF, 0x0F);
         cart.command = [0xB8, 0, 0, 0, 0, 0, 0, 0];
         cart.write_romctrl(start_block(4)); // 4-byte block
+        cart.mark_ready(); // latency elapsed
         assert_eq!(cart.read_data(), cart.chip_id);
         assert!(cart.take_completion());
     }
@@ -700,6 +755,7 @@ mod tests {
         let mut cart = cart_with_rom(0x8000);
         cart.command = [0xB7, 0x00, 0x10, 0x00, 0x00, 0, 0, 0]; // addr 0x100000 > len
         cart.write_romctrl(start_block(0x200));
+        cart.mark_ready(); // latency elapsed
         assert_eq!(cart.read_data(), 0xFFFF_FFFF);
     }
 
