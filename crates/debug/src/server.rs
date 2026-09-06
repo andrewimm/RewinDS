@@ -524,6 +524,16 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 return Err("touch is DS-only".to_string());
             }
         }
+        // DS clamshell: `{closed: true}` shuts the lid, `{closed: false}` (or omitted)
+        // opens it; a change raises the hinge IRQ (games sleep closed, wake on open).
+        "input.lid" => {
+            let closed = params.get("closed").and_then(Value::as_bool).unwrap_or(false);
+            if Debugger::new(emu).input().set_lid(closed) {
+                json!({"ok": true})
+            } else {
+                return Err("lid is DS-only".to_string());
+            }
+        }
         // Recent inter-core IPC traffic (DS): the ARM9<->ARM7 conversation, to
         // see which core is waiting on what. kind 0 = FIFO send, 1 = SYNC write.
         "ipc.recent" => {

@@ -32,6 +32,10 @@ pub enum IrqSource {
     Gamecard = 19,
     /// The 3D geometry command FIFO reached its `GXSTAT` IRQ condition (ARM9 only).
     GxFifo = 21,
+    /// The clamshell lid opened or closed ("screens unfolding"; ARM7 only). The hinge
+    /// sensor raises this on every open/close transition; a game's handler uses it to
+    /// enter or leave sleep, so it also wakes the ARM7 from a halt.
+    Hinge = 22,
 }
 
 impl IrqSource {

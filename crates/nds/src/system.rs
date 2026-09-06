@@ -1721,8 +1721,9 @@ impl System {
     pub fn set_keypad(&mut self, pressed: u32) {
         self.machine.keyinput = 0x03FF & !(pressed as u16);
         // EXTKEYIN carries the X (bit 10) and Y (bit 11) buttons, active-low; the
-        // hinge stays "open", and the pen-down bit (6) is owned by `set_touch`, so
-        // preserve it rather than clobbering an in-progress touch.
+        // pen-down bit (6, owned by `set_touch`) and the hinge bit (7, owned by
+        // `set_lid`) live elsewhere, so preserve them rather than clobbering an
+        // in-progress touch or the lid state.
         let mut ext = 0x007F;
         if pressed & (1 << 10) != 0 {
             ext &= !0x01; // X pressed
@@ -1730,7 +1731,8 @@ impl System {
         if pressed & (1 << 11) != 0 {
             ext &= !0x02; // Y pressed
         }
-        ext = (ext & !(1 << 6)) | (self.machine.extkeyin & (1 << 6));
+        let owned = (1 << 6) | (1 << 7);
+        ext = (ext & !owned) | (self.machine.extkeyin & owned);
         self.machine.extkeyin = ext;
     }
 
@@ -1762,6 +1764,25 @@ impl System {
                 self.machine.extkeyin |= 1 << 6; // pen up
             }
         }
+    }
+
+    /// Set the clamshell lid closed (`true`) or open (`false`). The state is reflected
+    /// in `EXTKEYIN`'s hinge bit (bit 7, `0 = open`, `1 = closed`), and every *change*
+    /// raises the ARM7 "screens unfolding" interrupt — the hinge sensor's IRQ, which a
+    /// game uses to enter sleep on close and (crucially, since it wakes a halted ARM7)
+    /// resume on open. Powers up open; idempotent when the state is unchanged.
+    pub fn set_lid(&mut self, closed: bool) {
+        let was_closed = self.machine.extkeyin & (1 << 7) != 0;
+        if closed == was_closed {
+            return;
+        }
+        if closed {
+            self.machine.extkeyin |= 1 << 7;
+        } else {
+            self.machine.extkeyin &= !(1 << 7);
+        }
+        self.machine.interrupts[Core::Arm7.index()]
+            .request(crate::interrupt::IrqSource::Hinge);
     }
 
     /// Begin the PPU's continuous scanline schedule (idempotent).
@@ -2801,5 +2822,38 @@ mod tests {
         // The store landed in DTCM, not the Shared WRAM sitting under that address.
         assert_eq!(system.memory().dtcm[0], 0x5A);
         assert_eq!(system.memory().shared_wram[0], 0);
+    }
+
+    #[test]
+    fn clamshell_lid_toggles_extkeyin_and_raises_hinge_irq() {
+        use crate::IrqSource;
+        let mut system = System::new();
+        let ext = |s: &mut System| s.io_read(Core::Arm7, 0x0400_0136, 2) & (1 << 7);
+        let hinge = |s: &System| s.interrupts(Core::Arm7).iflags() & IrqSource::Hinge.mask();
+
+        // Powers up with the lid open (hinge bit clear) and no hinge IRQ pending.
+        assert_eq!(ext(&mut system), 0);
+        assert_eq!(hinge(&system), 0);
+
+        // Closing the lid sets EXTKEYIN bit 7 and raises the ARM7 hinge interrupt.
+        system.set_lid(true);
+        assert_ne!(ext(&mut system), 0);
+        assert_ne!(hinge(&system), 0);
+
+        // A keypad update leaves the lid state (and pen state) alone.
+        system.set_keypad(0);
+        assert_ne!(ext(&mut system), 0);
+
+        // Re-closing while already closed is idempotent: after acknowledging the IF,
+        // it does not re-raise.
+        system.io_write(Core::Arm7, 0x0400_0214, IrqSource::Hinge.mask(), 4);
+        system.set_lid(true);
+        assert_eq!(hinge(&system), 0);
+
+        // Opening again clears the bit and raises the interrupt once more — the event
+        // that wakes a game sleeping with the lid shut.
+        system.set_lid(false);
+        assert_eq!(ext(&mut system), 0);
+        assert_ne!(hinge(&system), 0);
     }
 }

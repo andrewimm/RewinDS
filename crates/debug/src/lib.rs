@@ -388,6 +388,17 @@ impl Input<'_> {
             false
         }
     }
+
+    /// Set the DS clamshell lid closed (`true`) or open (`false`); a change raises the
+    /// hinge interrupt. Returns `false` on the GBA (no lid).
+    pub fn set_lid(&mut self, closed: bool) -> bool {
+        if let Some(n) = self.emu.as_nds_mut() {
+            n.set_lid(closed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]

@@ -251,6 +251,22 @@ impl Emulator {
         }
     }
 
+    /// Open or close the DS clamshell lid (`closed = true` shuts it). Unlike the
+    /// per-frame [`Self::set_input`] snapshot, the lid is discrete, sticky console
+    /// state: closing raises the hinge interrupt so the game enters sleep; opening
+    /// raises it again so the game wakes. It changes only on real events, so the host
+    /// drives it directly rather than folding it into every input frame.
+    ///
+    /// This is the surface a native host toggles on lifecycle transitions — e.g. an
+    /// iOS app closing the lid in `applicationDidEnterBackground` and opening it in
+    /// `applicationWillEnterForeground`, so the game suspends and resumes with the app.
+    /// Idempotent (no change, no interrupt) and a no-op on the GBA, which has no lid.
+    pub fn set_lid(&mut self, closed: bool) {
+        if let Emulator::Nds(n) = self {
+            n.system.set_lid(closed);
+        }
+    }
+
     /// Mute audio capture: while muted, [`Self::run_frame`] still runs but drops
     /// the frame's samples instead of feeding the sink. Used for fast-forward.
     pub fn set_audio_muted(&mut self, muted: bool) {
