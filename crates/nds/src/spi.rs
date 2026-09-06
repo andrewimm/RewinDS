@@ -84,6 +84,13 @@ impl Spi {
         }
     }
 
+    /// Replace the firmware flash with a real dump, for firmware boot (where the
+    /// ARM7 BIOS reads and runs the firmware's boot code rather than the emulator
+    /// synthesizing the settings). Direct boot keeps the synthesized flash.
+    pub fn set_flash(&mut self, data: &[u8]) {
+        self.flash = data.to_vec();
+    }
+
     /// Set (or clear) the touchscreen pen position as a raw 12-bit ADC `(x, y)` pair.
     /// `None` lifts the pen: position channels then read 0. The caller converts a
     /// screen pixel to ADC via [`crate::firmware::touch_adc`].

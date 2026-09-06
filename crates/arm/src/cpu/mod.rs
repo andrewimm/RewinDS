@@ -277,6 +277,30 @@ impl Cpu {
         self.exception_base = base;
     }
 
+    /// Reset the core to a power-on state at `entry`: Supervisor mode with IRQ
+    /// and FIQ masked and ARM state, PC at `entry`. Used to run the BIOS from its
+    /// reset vector (firmware boot); the BIOS establishes the rest.
+    pub fn reset_to(&mut self, entry: u32) {
+        let mut cpsr = Psr::from_bits(0);
+        cpsr.set_mode(Mode::Supervisor);
+        cpsr.set_irq_disabled(true);
+        cpsr.set_fiq_disabled(true);
+        self.cpsr = cpsr;
+        self.set_pc(entry);
+    }
+
+    /// Reset the core to the direct-boot handoff state at `entry`: System mode,
+    /// ARM state, IRQ/FIQ enabled — the power-on default a fresh core already
+    /// holds. Made explicit so a core that has been running (e.g. firmware boot)
+    /// can be handed off to a game exactly as a fresh direct boot would, rather
+    /// than inheriting a dirty mode/stack from wherever it was executing.
+    pub fn boot_reset(&mut self, entry: u32) {
+        let mut cpsr = Psr::from_bits(0);
+        cpsr.set_mode(Mode::System);
+        self.cpsr = cpsr;
+        self.set_pc(entry);
+    }
+
     /// The architecture variant this core implements.
     pub fn version(&self) -> ArmVersion {
         self.version

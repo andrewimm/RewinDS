@@ -153,6 +153,10 @@ pub struct Load<'a> {
     pub bios: Option<&'a [u8]>,
     /// The DS ARM7 BIOS. Optional (BIOS-free homebrew runs without it).
     pub bios7: Option<&'a [u8]>,
+    /// A DS firmware dump. When present (with both BIOS images), the DS runs the
+    /// real firmware boot instead of direct boot — required by games that reject
+    /// direct boot. Absent → direct boot.
+    pub firmware: Option<&'a [u8]>,
 }
 
 /// Either console, behind one surface.
@@ -189,10 +193,17 @@ impl Emulator {
                 if let (Some(b9), Some(b7)) = (cfg.bios, cfg.bios7) {
                     system.load_bios(b9, b7);
                 }
-                // Direct-boot the cartridge if present; a bare DS (no ROM) still
-                // runs and presents its two screens.
+                // Boot the cartridge if present; a bare DS (no ROM) still runs and
+                // presents its two screens. A supplied firmware dump (with both
+                // BIOS images) selects the real firmware boot; otherwise direct boot.
                 if let Some(rom) = cfg.rom {
-                    system.direct_boot(rom).map_err(LoadError::BadImage)?;
+                    match (cfg.firmware, cfg.bios, cfg.bios7) {
+                        (Some(fw), Some(_), Some(_)) => {
+                            system.load_firmware(fw);
+                            system.firmware_boot(rom).map_err(LoadError::BadImage)?;
+                        }
+                        _ => system.direct_boot(rom).map_err(LoadError::BadImage)?,
+                    }
                 }
                 Ok(Emulator::Nds(NdsEmulator::new(system)))
             }
@@ -609,6 +620,7 @@ mod tests {
             rom: None,
             bios: Some(&bios),
             bios7: None,
+            firmware: None,
         })
         .expect("bios-only GBA boot");
         assert_eq!(emu.console(), Console::Gba);
@@ -628,6 +640,7 @@ mod tests {
             rom: None,
             bios: None,
             bios7: None,
+            firmware: None,
         });
         assert!(matches!(result, Err(LoadError::MissingBios)));
     }
@@ -639,6 +652,7 @@ mod tests {
             rom: None,
             bios: None,
             bios7: None,
+            firmware: None,
         })
         .expect("bare NDS");
         assert_eq!(emu.console(), Console::Nds);
@@ -689,6 +703,7 @@ mod tests {
             rom: Some(&rom),
             bios: None,
             bios7: None,
+            firmware: None,
         })
         .expect("direct boot");
         emu.run_frame();
@@ -707,6 +722,7 @@ mod tests {
             rom: None,
             bios: Some(&bios),
             bios7: None,
+            firmware: None,
         })
         .unwrap();
         let mut input = Input::default();
