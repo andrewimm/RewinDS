@@ -143,6 +143,11 @@ pub enum NdsEvent {
     SoundSample,
     /// One real-time-clock second elapsed (advances the RTC calendar).
     RtcTick,
+    /// A gamecard block transfer on `core` finished. The data is available at
+    /// once, but the completion IRQ is delayed to this event so it arrives after
+    /// the requester's `IntrWait` halt (the ARM7 firmware-boot pattern), rather
+    /// than firing synchronously at the ROMCTRL start.
+    CartTransferComplete { core: Core },
 }
 
 /// Per-core per-instruction timing state for the ARM pipeline model, where an
@@ -280,6 +285,10 @@ pub struct Machine {
     /// pipeline model), indexed by [`Core::index`]. The bus fills these during a step;
     /// [`System::step_core`] combines them into the core's clock at the boundary.
     pub(crate) timing: [CoreTiming; 2],
+    /// PC of the instruction each core is currently executing, set by
+    /// [`System::step_core`] before the step so the bus can attribute a device
+    /// access (e.g. the IPC debug log) to the code that issued it. Debug only.
+    pub(crate) exec_pc: [u32; 2],
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
@@ -350,6 +359,7 @@ impl Machine {
             icache: crate::icache::Cache::instruction(),
             dcache: crate::icache::Cache::data(),
             timing: [CoreTiming::default(), CoreTiming::default()],
+            exec_pc: [0, 0],
             keyinput: 0x03FF,   // all released
             extkeyin: 0x007F,   // X/Y released, pen up, hinge open
             postflg: [0, 0],
@@ -469,30 +479,46 @@ impl Machine {
         }
     }
 
-    /// A ROMCTRL block start launched a gamecard transfer on `core`: drain it via
-    /// any enabled cart-mode DMA channel (games read the cart by DMA), then raise
-    /// the transfer-complete IRQ if the block finished and `AUXSPICNT` enables it.
-    /// A game using manual (polled) reads finishes the block in [`Self::io_read`]
-    /// instead, which raises the IRQ the same way.
-    fn start_cart_transfer(&mut self, core: Core) {
-        let c = core.index();
-        for channel in 0..4 {
-            if self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9) {
-                self.run_dma_channel(core, channel);
-            }
-        }
-        if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
-            self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
-        }
+    /// A ROMCTRL block start launched a gamecard transfer on `core`: the cart holds
+    /// Busy while it clocks out the command and gap, so we leave the block armed but
+    /// not-yet-ready (`DRQ` low, data withheld) and schedule its completion for when
+    /// that latency elapses. A reader spinning on Busy or polling `DRQ` — as a
+    /// game's boot loader does — therefore waits out the real cart latency, which is
+    /// what drifts the PPU/CPU phase across a cart-heavy boot. The data delivery
+    /// (cart-mode DMA drain) and completion IRQ both happen in
+    /// [`NdsEvent::CartTransferComplete`]; a manual-read game instead drains the
+    /// block through [`Self::io_read`] once `DRQ` asserts.
+    fn start_cart_transfer(&mut self, core: Core, scheduler: &mut Scheduler<NdsEvent>) {
+        let delay = self.cart.transfer_delay();
+        scheduler.schedule_after(delay, NdsEvent::CartTransferComplete { core });
     }
 
     /// Route a write to the gamecard registers (`40001A0h`..`40001BFh`). ROMCTRL is
     /// read-modify-written so any access width works; a start bit launches the
     /// transfer. The command buffer takes byte writes; the KEY2 seed ports are
     /// accepted and ignored (the cartridge serves plaintext — see [`crate::cart`]).
-    fn write_gamecard(&mut self, core: Core, addr: u32, value: u32, bytes: u32) {
+    fn write_gamecard(
+        &mut self,
+        core: Core,
+        addr: u32,
+        value: u32,
+        bytes: u32,
+        scheduler: &mut Scheduler<NdsEvent>,
+    ) {
         match addr {
-            0x0400_01A0 => self.cart.write_auxspicnt(value as u16),
+            // AUXSPICNT (16-bit): merge byte/halfword writes to either byte so a
+            // high-byte write (0x40001A1) — where the transfer-complete IRQ enable
+            // (bit 14) lives — is not dropped.
+            0x0400_01A0 | 0x0400_01A1 => {
+                let shift = (addr - 0x0400_01A0) * 8;
+                // A 32-bit store (bytes == 4) spans the whole register; `1 << 32`
+                // would overflow, so saturate the width mask to all ones.
+                let width_mask: u32 = if bytes >= 4 { u32::MAX } else { (1u32 << (bytes * 8)) - 1 };
+                let mask = ((width_mask << shift) & 0xFFFF) as u16;
+                let merged =
+                    (self.cart.read_auxspicnt() & !mask) | ((value << shift) as u16 & mask);
+                self.cart.write_auxspicnt(merged);
+            }
             0x0400_01A2 => self.cart.write_auxspidata(value as u8), // backup SPI data
             0x0400_01A4..=0x0400_01A7 => {
                 // Merge into the stored config, then honour a start bit.
@@ -501,7 +527,7 @@ impl Machine {
                 let mask = (width_mask << shift) as u32;
                 let merged = (self.cart.romctrl_config() & !mask) | ((value << shift) & mask);
                 if self.cart.write_romctrl(merged) {
-                    self.start_cart_transfer(core);
+                    self.start_cart_transfer(core, scheduler);
                 }
             }
             0x0400_01A8..=0x0400_01AF => {
@@ -643,6 +669,8 @@ impl Machine {
         scheduler: &mut Scheduler<NdsEvent>,
     ) {
         let c = core.index();
+        // Attribute any IPC write in this step to the issuing instruction (debug log).
+        self.ipc.set_pending_pc(self.exec_pc[c]);
         if (0x0400_0100..0x0400_0110).contains(&addr) {
             let now = self.clock[c];
             let id = TimerId::from_index(((addr - 0x0400_0100) / 4) as usize);
@@ -726,7 +754,7 @@ impl Machine {
         }
         // Gamecard slot: AUXSPICNT/ROMCTRL/command/seed ports.
         if (0x0400_01A0..0x0400_01C0).contains(&addr) {
-            self.write_gamecard(core, addr, value, bytes);
+            self.write_gamecard(core, addr, value, bytes, scheduler);
             return;
         }
         // ARM7 SPI bus: SPICNT (0x40001C0) / SPIDATA (0x40001C2), the firmware flash.
@@ -864,6 +892,24 @@ impl EventHandler<NdsEvent> for Machine {
                 self.rtc.tick_second();
                 ctx.scheduler
                     .schedule_after(crate::rtc::CYCLES_PER_SECOND, NdsEvent::RtcTick);
+            }
+            NdsEvent::CartTransferComplete { core } => {
+                // The command/gap latency elapsed: release the data. `DRQ` may now
+                // assert, so drive any cart-mode DMA to drain the block (a game that
+                // reads by DMA); a manual-read game instead drains it through
+                // `io_read` now that `DRQ` is set. Raise the completion IRQ if a DMA
+                // finished the block and the requester still enables it (AUXSPICNT
+                // bit 14); a manual read raises it the same way from `io_read`.
+                let c = core.index();
+                self.cart.mark_ready();
+                for channel in 0..4 {
+                    if self.dma[c].channels[channel].is_cart_dma(core == Core::Arm9) {
+                        self.run_dma_channel(core, channel);
+                    }
+                }
+                if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
+                    self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
+                }
             }
         }
     }
@@ -1370,6 +1416,12 @@ impl System {
             };
             self.arm9.set_exception_base(base);
         }
+        // Stash the executing PC so a device access during this step (e.g. an
+        // IPC FIFO/SYNC write) can be attributed to the issuing instruction.
+        self.machine.exec_pc[core.index()] = match core {
+            Core::Arm9 => self.arm9.register(15),
+            Core::Arm7 => self.arm7.register(15),
+        };
         let asserted = self.machine.interrupts[core.index()].line_asserted();
         let cpu = match core {
             Core::Arm9 => &mut self.arm9,
@@ -1419,10 +1471,32 @@ impl System {
         // runtime (the main data area is identical before/after secure-area decrypt).
         self.machine.cart.insert(rom);
 
-        // A commercial ROM keeps its ARM9 boot code in the secure area, whose first
-        // 2 KB may be KEY1-encrypted. Decrypt into an owned copy only when the ID
-        // shows work is pending (an already-boot-ready dump skips the 128 MB copy).
-        let mut decrypted: Option<Vec<u8>> = None;
+        let decrypted = self.decrypt_secure_area(rom, &header);
+        let rom: &[u8] = decrypted.as_deref().unwrap_or(rom);
+
+        self.load_cart_binaries(rom, &header);
+        // The firmware copies the header to Main RAM at 0x027F_FE00.
+        for (i, &byte) in rom.iter().take(0x170).enumerate() {
+            self.machine
+                .data_write(Core::Arm9, 0x027F_FE00 + i as u32, byte as u32, 1);
+        }
+        // Rebuild the firmware boot-info footer + user settings + POSTFLG that
+        // retail games expect the firmware to have established.
+        self.seed_firmware_state(rom, &header);
+        self.enter_game(&header);
+        Ok(())
+    }
+
+    /// Decrypt the KEY1-encrypted secure area into an owned copy when the cart
+    /// needs it. A commercial ROM keeps its ARM9 boot code in the secure area,
+    /// whose first 2 KB may be KEY1-encrypted; an already-boot-ready dump reports
+    /// no pending work and skips the (up to 128 MB) copy. Returns `None` when no
+    /// decryption is needed, so the caller uses the ROM as-is.
+    fn decrypt_secure_area(
+        &self,
+        rom: &[u8],
+        header: &crate::boot::Header,
+    ) -> Option<Vec<u8>> {
         if crate::key1::secure_area_present(header.arm9_rom_offset)
             && rom.len() >= crate::key1::SECURE_AREA_START + crate::key1::SECURE_AREA_ENC_LEN
             && crate::key1::secure_area_needs_work(
@@ -1432,10 +1506,14 @@ impl System {
             let keytable = self.machine.memory.key1_keytable().to_vec();
             let mut buf = rom.to_vec();
             let _state = crate::key1::process_secure_area(&mut buf, header.gamecode, &keytable);
-            decrypted = Some(buf);
+            Some(buf)
+        } else {
+            None
         }
-        let rom: &[u8] = decrypted.as_deref().unwrap_or(rom);
+    }
 
+    /// Copy the ARM9 and ARM7 game binaries from the ROM into their RAM homes.
+    fn load_cart_binaries(&mut self, rom: &[u8], header: &crate::boot::Header) {
         self.load_binary(
             Core::Arm9,
             rom,
@@ -1450,32 +1528,91 @@ impl System {
             header.arm7_ram_address,
             header.arm7_size,
         );
-        // The firmware copies the header to Main RAM at 0x027F_FE00.
-        for (i, &byte) in rom.iter().take(0x170).enumerate() {
-            self.machine
-                .data_write(Core::Arm9, 0x027F_FE00 + i as u32, byte as u32, 1);
-        }
-        // Rebuild the firmware boot-info footer + user settings + POSTFLG that
-        // retail games expect the firmware to have established.
-        self.seed_firmware_state(rom, &header);
+    }
+
+    /// Hand both cores off to the game at its entry points: seed CP15/TCM, the
+    /// WRAM split, and conventional stacks, then reset the cores into the
+    /// direct-boot handoff state (System mode) at their entries. Shared by direct
+    /// boot and the post-firmware cart launch, so both reach the game identically
+    /// — the only difference between them is who established the RAM/hardware
+    /// state the game inherits (synthesized vs. the real firmware).
+    fn enter_game(&mut self, header: &crate::boot::Header) {
         // Seed CP15 to the TCM state the ARM9 BIOS establishes, which BIOS-less
         // homebrew relies on (armwrestler's stack lives in DTCM and its startup
         // never configures CP15): DTCM 16 KB at 0x0080_0000 and ITCM 32 KB at 0,
-        // both enabled. Games that manage CP15 themselves overwrite this.
+        // both enabled, low exception vectors. Games that manage CP15 themselves
+        // overwrite this.
         self.machine.cp15.write(0, 9, 1, 0, 0x0080_000A); // DTCM base 0x0080_0000, 16 KB
         self.machine.cp15.write(0, 9, 1, 1, 0x0000_000C); // ITCM 32 KB (base fixed at 0)
-        self.machine.cp15.write(0, 1, 0, 0, (1 << 16) | (1 << 18)); // enable DTCM + ITCM
-                                                                    // Give the ARM7 the Shared WRAM (WRAMCNT=3): its crt0 relocates code into
-                                                                    // the 32K Shared WRAM mirrored at 0x037F8000, using Shared + ARM7-WRAM as
-                                                                    // one continuous 96K block (GBATEK "Shared-RAM").
+        // Enable DTCM + ITCM and select HIGH exception vectors (CP15 bit 13, the V bit).
+        // The DS ARM9 powers up with high vectors (VINITHI) and retail games rely on it:
+        // interrupts must reach the BIOS handler at 0xFFFF0018, which trampolines to the
+        // game's handler. Forcing low vectors here routes IRQs past the BIOS and breaks
+        // the game's interrupt/IntrWait handling (verified by diffing against desmume,
+        // whose ARM9 defaults to 0xFFFF0000). Games that want low vectors clear V themselves.
+        self.machine.cp15.write(0, 1, 0, 0, (1 << 16) | (1 << 18) | (1 << 13));
+        self.arm9.set_exception_base(0xFFFF_0000);
+                                                    // Give the ARM7 the Shared WRAM (WRAMCNT=3): its crt0 relocates code into
+                                                    // the 32K Shared WRAM mirrored at 0x037F8000, using Shared + ARM7-WRAM as
+                                                    // one continuous 96K block (GBATEK "Shared-RAM").
         self.machine.memory.wramcnt = 3;
         // Entry points and conventional system-mode stacks (the cores boot in
         // System mode; each game's startup replaces these with its own). The ARM7
         // stack sits in ARM7-WRAM; the ARM9's is a fallback it reconfigures early.
-        self.arm9.set_pc(header.arm9_entry);
+        // `boot_reset` also clears any mode/state left over from a firmware boot.
+        self.arm9.boot_reset(header.arm9_entry);
         self.arm9.set_register(13, 0x0300_2F7C);
-        self.arm7.set_pc(header.arm7_entry);
+        self.arm7.boot_reset(header.arm7_entry);
         self.arm7.set_register(13, 0x0380_FD80);
+    }
+
+    /// Load a real firmware image into the SPI flash, for firmware boot.
+    pub fn load_firmware(&mut self, data: &[u8]) {
+        self.machine.spi.set_flash(data);
+    }
+
+    /// Launch the inserted cartridge after a firmware boot has run far enough to
+    /// establish real hardware and RAM state (the firmware menu). Loads the game
+    /// binaries and hands the cores off exactly as direct boot does, but *without*
+    /// re-synthesizing the firmware footer/user settings — the real firmware wrote
+    /// those. This is the deterministic, menu-free counterpart to selecting the
+    /// cartridge in the firmware menu: the games that require a firmware boot (Gen
+    /// 4/5 Pokémon) can be reached without scripting the touch-screen menu.
+    pub fn launch_cart_from_firmware(&mut self) -> Result<(), crate::boot::BootError> {
+        let rom = self.machine.cart.rom().to_vec();
+        let header = crate::boot::Header::parse(&rom)?;
+        let decrypted = self.decrypt_secure_area(&rom, &header);
+        let rom: &[u8] = decrypted.as_deref().unwrap_or(&rom);
+        self.load_cart_binaries(rom, &header);
+        // Hand the cores off to the game, but — unlike direct boot — keep the
+        // CP15/TCM, exception vectors, and WRAM split the real firmware and BIOS
+        // established. Crucially the ARM9 keeps its BIOS high exception vectors
+        // (`0xFFFF_0000`): the game's early startup issues BIOS SWIs before it
+        // installs its own vector table, and routing those to low vectors (junk)
+        // hangs it in an exception loop. `boot_reset` just clears the mode/state
+        // left over from the firmware's idle loop and enters at the game's entry.
+        self.arm9.boot_reset(header.arm9_entry);
+        self.arm9.set_register(13, 0x0300_2F7C);
+        self.arm7.boot_reset(header.arm7_entry);
+        self.arm7.set_register(13, 0x0380_FD80);
+        Ok(())
+    }
+
+    /// Firmware-boot a `.nds` image: run the real BIOS + firmware from reset,
+    /// instead of direct boot's synthesized handoff. The ARM7 BIOS reads the
+    /// firmware over SPI, decrypts and runs the firmware boot code, and the
+    /// firmware boots the cartridge — the full handshake retail games (Gen 4/5
+    /// Pokémon) rely on and which direct boot cannot satisfy. Requires the BIOS
+    /// images (`load_bios`) and a firmware dump (`load_firmware`).
+    pub fn firmware_boot(&mut self, rom: &[u8]) -> Result<(), crate::boot::BootError> {
+        crate::boot::Header::parse(rom)?; // validate the image up front
+        self.machine.cart.insert(rom);
+        // The ARM9 powers up with high exception vectors (VINITHI): its reset
+        // vector is the BIOS at 0xFFFF0000. The ARM7 resets from its BIOS at 0.
+        self.machine.cp15.write(0, 1, 0, 0, 1 << 13);
+        self.arm9.reset_to(0xFFFF_0000);
+        self.arm9.set_exception_base(0xFFFF_0000);
+        self.arm7.reset_to(0x0000_0000);
         Ok(())
     }
 
@@ -1691,6 +1828,20 @@ impl System {
     /// A snapshot of a 2D engine's register file, for debugging (0 = A, 1 = B).
     pub fn engine_registers(&self, engine: usize) -> video2d::Registers {
         self.machine.ppu.engine_registers(engine)
+    }
+
+    /// Debug: the recent inter-core IPC traffic — `(sender_index, kind, value)`
+    /// with kind 0 = FIFO send, 1 = SYNC write, oldest first. Reveals the
+    /// steady-state ARM9<->ARM7 conversation (which core is waiting on what).
+    pub fn ipc_recent(&self) -> Vec<(u8, u8, u32, u32)> {
+        self.machine.ipc.recent()
+    }
+
+    /// Debug: take and clear the logged IPC traffic, to stream the full ordered
+    /// history by polling (the ring in [`ipc_recent`](Self::ipc_recent) only
+    /// keeps the most recent events).
+    pub fn ipc_drain(&mut self) -> Vec<(u8, u8, u32, u32)> {
+        self.machine.ipc.drain()
     }
 
     /// Debug: per-layer pixel coverage `[bg0, bg1, bg2, bg3, obj]` for a 2D engine —
@@ -2297,9 +2448,19 @@ mod tests {
         // ROMCTRL: 0x200-byte block (field 1), start.
         system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (1 << 24), 4);
 
-        // The whole block streamed into Main RAM, byte-for-byte from ROM[0x8000..].
+        // The cart holds Busy while it clocks out the command and gap: no data has
+        // reached Main RAM yet, the block reads back as still in progress, and no
+        // IRQ is pending.
+        assert_eq!(system.memory().main[..0x200], [0u8; 0x200]);
+        assert_ne!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
+        assert_eq!(system.interrupts(Core::Arm9).iflags(), 0);
+        // Advance the shared timeline past the transfer delay (well under a
+        // scanline); the scheduled completion drives the DMA (the block streams into
+        // Main RAM, byte-for-byte from ROM[0x8000..]), clears Busy, and raises the
+        // transfer IRQ.
+        let fire = system.now() + 4260;
+        system.run_until(fire);
         assert_eq!(&system.memory().main[..0x200], &rom[0x8000..0x8200]);
-        // The block completed: busy clear and the transfer-complete IRQ pending.
         assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
         assert_eq!(
             system.interrupts(Core::Arm9).iflags(),
@@ -2321,7 +2482,14 @@ mod tests {
         // 4-byte block (field 7), start.
         system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (7 << 24), 4);
 
-        // DRQ set, one manual word available, matching ROM[0x8000..0x8004].
+        // Busy is set immediately, but the cart withholds data during the command+
+        // gap latency: DRQ is still low, so a polling reader spins.
+        assert_ne!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 31), 0);
+        assert_eq!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 23), 0);
+        // Advance past the latency; the scheduled completion releases the data.
+        let fire = system.now() + 4260;
+        system.run_until(fire);
+        // DRQ now set, one manual word available, matching ROM[0x8000..0x8004].
         assert_ne!(system.io_read(Core::Arm9, 0x0400_01A4, 4) & (1 << 23), 0);
         assert_eq!(system.io_read(Core::Arm9, 0x0410_0010, 4), 0x0403_0201);
         // Block drained: no longer busy.
