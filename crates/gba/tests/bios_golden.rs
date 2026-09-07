@@ -233,11 +233,17 @@ fn invoke_swi(sys: &mut System, num: u8, r0: u32, r1: u32) {
 
 /// As [`invoke_swi`], also preloading r2 (used by the memory SWIs).
 fn invoke_swi3(sys: &mut System, num: u8, r0: u32, r1: u32, r2: u32) {
+    invoke_swi4(sys, num, r0, r1, r2, 0);
+}
+
+/// As [`invoke_swi3`], also preloading r3 (used by ObjAffineSet's stride).
+fn invoke_swi4(sys: &mut System, num: u8, r0: u32, r1: u32, r2: u32, r3: u32) {
     let swi = 0xEF00_0000 | ((num as u32) << 16);
     put_iwram(sys, 0x0300_0000, &[swi, 0xEAFF_FFFE]);
     sys.cpu.set_register(0, r0);
     sys.cpu.set_register(1, r1);
     sys.cpu.set_register(2, r2);
+    sys.cpu.set_register(3, r3);
     sys.cpu.set_pc(0x0300_0000);
 }
 
@@ -768,6 +774,94 @@ fn bit_unpack_applies_offset_and_zero_flag() {
     let src4 = [0x21u8, 0x43];
     let want4 = ref_bit_unpack(&src4, 4, 8, 0x10, false);
     assert_eq!(run_bit_unpack(&src4, 4, 8, 0x10), want4);
+}
+
+// --- BgAffineSet (0x0E) / ObjAffineSet (0x0F) ------------------------------
+//
+// Reference uses the same Q14 sine table and integer formulas as the BIOS, so
+// the comparison is exact. (Like ArcTan, the values are an independent
+// approximation and are not compared against a real BIOS's own sine table.)
+
+fn sintab_q14(i: usize) -> i32 {
+    ((2.0 * std::f64::consts::PI * (i & 255) as f64 / 256.0).sin() * 16384.0).round() as i32
+}
+
+/// The affine matrix PA/PB/PC/PD (untruncated 8.8, as the BIOS keeps them for
+/// the start-coordinate math; the stored halfwords are these truncated to i16).
+fn affine_matrix(sx: i16, sy: i16, angle: u16) -> (i32, i32, i32, i32) {
+    let idx = (angle >> 8) as usize;
+    let (cos, sin) = (sintab_q14(idx + 64), sintab_q14(idx));
+    (
+        (sx as i32 * cos) >> 14,
+        -((sx as i32 * sin) >> 14),
+        (sy as i32 * sin) >> 14,
+        (sy as i32 * cos) >> 14,
+    )
+}
+
+fn ewram_i32(sys: &System, off: usize) -> i32 {
+    ewram_word(sys, off) as i32
+}
+
+#[test]
+fn obj_affine_set_computes_the_matrix() {
+    let cases: [(i16, i16, u16); 6] = [
+        (0x100, 0x100, 0x0000), // identity
+        (0x100, 0x100, 0x4000), // 90 degrees
+        (0x100, 0x100, 0x2000), // 45 degrees
+        (0x100, 0x80, 0x8000),  // 180, sy = 0.5
+        (0x80, 0x100, 0xC000),  // 270, sx = 0.5
+        (0x100, 0x100, 0x1234), // arbitrary (upper 8 bits = 0x12)
+    ];
+    for &(sx, sy, angle) in &cases {
+        for &offset in &[2u32, 8] {
+            let mut sys = booted(gba::default_bios());
+            let mut src = Vec::new();
+            src.extend_from_slice(&sx.to_le_bytes());
+            src.extend_from_slice(&sy.to_le_bytes());
+            src.extend_from_slice(&angle.to_le_bytes());
+            put_ewram_bytes(&mut sys, 0, &src);
+            invoke_swi4(&mut sys, 0x0F, SRC, DST, 1, offset); // r2 = count, r3 = stride
+            assert!(run_until_swi_returns(&mut sys, 5000));
+            let (pa, pb, pc, pd) = affine_matrix(sx, sy, angle);
+            let o = offset as usize;
+            let got = |k: usize| ewram_half(&sys, DST_OFF + k * o) as i16;
+            assert_eq!((got(0), got(1), got(2), got(3)), (pa as i16, pb as i16, pc as i16, pd as i16), "angle {angle:#06x} offset {offset}");
+        }
+    }
+}
+
+#[test]
+fn bg_affine_set_computes_matrix_and_start() {
+    let (cx, cy) = (120i32 << 8, 80i32 << 8); // centre in 24.8
+    let (scrx, scry) = (120i16, 80i16);
+    let cases: [(i16, i16, u16); 4] =
+        [(0x100, 0x100, 0), (0x100, 0x100, 0x4000), (0x100, 0x80, 0x2000), (0x200, 0x100, 0x1234)];
+    for &(sx, sy, angle) in &cases {
+        let mut sys = booted(gba::default_bios());
+        let mut src = Vec::new();
+        src.extend_from_slice(&cx.to_le_bytes());
+        src.extend_from_slice(&cy.to_le_bytes());
+        src.extend_from_slice(&scrx.to_le_bytes());
+        src.extend_from_slice(&scry.to_le_bytes());
+        src.extend_from_slice(&sx.to_le_bytes());
+        src.extend_from_slice(&sy.to_le_bytes());
+        src.extend_from_slice(&angle.to_le_bytes());
+        put_ewram_bytes(&mut sys, 0, &src);
+        invoke_swi3(&mut sys, 0x0E, SRC, DST, 1);
+        assert!(run_until_swi_returns(&mut sys, 5000));
+
+        let (pa, pb, pc, pd) = affine_matrix(sx, sy, angle);
+        assert_eq!(ewram_half(&sys, DST_OFF) as i16, pa as i16, "PA angle {angle:#06x}");
+        assert_eq!(ewram_half(&sys, DST_OFF + 2) as i16, pb as i16, "PB");
+        assert_eq!(ewram_half(&sys, DST_OFF + 4) as i16, pc as i16, "PC");
+        assert_eq!(ewram_half(&sys, DST_OFF + 6) as i16, pd as i16, "PD");
+        // startx = cx - PA*scrx - PB*scry ; starty = cy - PC*scrx - PD*scry
+        let startx = cx - pa * scrx as i32 - pb * scry as i32;
+        let starty = cy - pc * scrx as i32 - pd * scry as i32;
+        assert_eq!(ewram_i32(&sys, DST_OFF + 8), startx, "startx angle {angle:#06x}");
+        assert_eq!(ewram_i32(&sys, DST_OFF + 12), starty, "starty angle {angle:#06x}");
+    }
 }
 
 // --- Opt-in: equivalence against a real BIOS -------------------------------

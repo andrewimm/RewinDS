@@ -122,8 +122,8 @@ swi_table:
     b swi_cpu_set           @ 0x0B CpuSet
     b swi_cpu_fast_set      @ 0x0C CpuFastSet
     b swi_stub              @ 0x0D GetBiosChecksum
-    b swi_stub              @ 0x0E BgAffineSet
-    b swi_stub              @ 0x0F ObjAffineSet
+    b swi_bg_affine_set     @ 0x0E BgAffineSet
+    b swi_obj_affine_set    @ 0x0F ObjAffineSet
     b swi_bit_unpack        @ 0x10 BitUnPack
     b swi_lz77_wram         @ 0x11 LZ77UnCompWram
     b swi_lz77_vram         @ 0x12 LZ77UnCompVram
@@ -767,6 +767,161 @@ swi_huff:
 .Lhuf_done:
     ldmfd sp!, {r4-r11, lr}
     b     swi_return
+
+@ ---------------------------------------------------------------------------
+@ BIOS rotation/scaling functions (GBATEK "BIOS Rotation/Scaling Functions").
+@ Both build the 2x2 affine matrix from a scale (sx, sy, 8.8) and rotation:
+@   PA =  sx*cos   PB = -sx*sin   PC =  sy*sin   PD =  sy*cos   (all 8.8)
+@ Only the angle's upper 8 bits select an entry in a 256-step sine table (Q14,
+@ derived from first principles); cos(x) = sin(x + 90 degrees). The real BIOS's
+@ own table lives only in its ROM, so these are independent, not bit-identical.
+@ ---------------------------------------------------------------------------
+
+@ SWI 0x0F ObjAffineSet: write the four OBJ affine parameters per source entry.
+@   r0 = source (s16 sx, s16 sy, u16 angle), r1 = destination,
+@   r2 = count, r3 = byte stride between the four parameters (2 or 8 for OAM).
+swi_obj_affine_set:
+    stmfd sp!, {r4-r11, lr}
+    ldr   r11, .Loas_taboff
+.Loas_pc:
+    add   r11, pc, r11         @ r11 = sine table (pc reads as .Loas_pc + 8)
+.Loas_loop:
+    cmp   r2, #0
+    beq   .Loas_done
+    ldrsh r4, [r0], #2         @ sx (8.8)
+    ldrsh r5, [r0], #2         @ sy (8.8)
+    ldrh  r6, [r0], #2         @ angle
+    mov   r6, r6, lsr #8       @ upper 8 bits -> table index
+    add   r12, r6, #64
+    and   r12, r12, #0xFF
+    mov   r12, r12, lsl #1         @ byte offset (armv4t ldrsh has no scaled index)
+    ldrsh r12, [r11, r12]          @ cos = sin(index + 64)
+    and   r6, r6, #0xFF
+    mov   r6, r6, lsl #1
+    ldrsh r6, [r11, r6]            @ sin
+    mul   r7, r4, r12
+    mov   r7, r7, asr #14      @ PA =  sx*cos
+    mul   r8, r4, r6
+    mov   r8, r8, asr #14
+    rsb   r8, r8, #0           @ PB = -sx*sin
+    mul   r9, r5, r6
+    mov   r9, r9, asr #14      @ PC =  sy*sin
+    mul   r10, r5, r12
+    mov   r10, r10, asr #14    @ PD =  sy*cos
+    strh  r7, [r1]
+    strh  r8, [r1, r3]
+    add   r12, r3, r3
+    strh  r9, [r1, r12]        @ + 2*stride
+    add   r12, r12, r3
+    strh  r10, [r1, r12]       @ + 3*stride
+    add   r1, r1, r3, lsl #2   @ next entry starts 4 parameters on
+    sub   r2, r2, #1
+    b     .Loas_loop
+.Loas_done:
+    ldmfd sp!, {r4-r11, lr}
+    b     swi_return
+.Loas_taboff:
+    .word .Laffine_sintab - (.Loas_pc + 8)
+
+@ SWI 0x0E BgAffineSet: build the BG affine matrix and the start coordinates.
+@   r0 = source: s32 cx, s32 cy (24.8 centre), s16 scrx, s16 scry (display
+@        centre), s16 sx, s16 sy (8.8), u16 angle.
+@   r1 = destination: s16 PA, PB, PC, PD, then s32 startx, starty.
+@   r2 = count.
+swi_bg_affine_set:
+    stmfd sp!, {r4-r11, lr}
+    ldr   r11, .Lbas_taboff
+.Lbas_pc:
+    add   r11, pc, r11
+.Lbas_loop:
+    cmp   r2, #0
+    beq   .Lbas_done
+    ldr   r7, [r0], #4         @ cx (24.8)
+    ldr   r8, [r0], #4         @ cy (24.8)
+    stmfd sp!, {r7, r8}        @ stash centre across the matrix computation
+    ldrsh r3, [r0], #2         @ scrx (kept in r3)
+    ldrsh lr, [r0], #2         @ scry (kept in lr)
+    ldrsh r4, [r0], #2         @ sx
+    ldrsh r5, [r0], #2         @ sy
+    ldrh  r6, [r0], #2         @ angle
+    mov   r6, r6, lsr #8
+    add   r12, r6, #64
+    and   r12, r12, #0xFF
+    mov   r12, r12, lsl #1
+    ldrsh r12, [r11, r12]          @ cos
+    and   r6, r6, #0xFF
+    mov   r6, r6, lsl #1
+    ldrsh r6, [r11, r6]            @ sin
+    mul   r7, r4, r12
+    mov   r7, r7, asr #14      @ PA
+    mul   r8, r4, r6
+    mov   r8, r8, asr #14
+    rsb   r8, r8, #0           @ PB
+    mul   r9, r5, r6
+    mov   r9, r9, asr #14      @ PC
+    mul   r10, r5, r12
+    mov   r10, r10, asr #14    @ PD
+    strh  r7, [r1]
+    strh  r8, [r1, #2]
+    strh  r9, [r1, #4]
+    strh  r10, [r1, #6]
+    @ startx = cx - PA*scrx - PB*scry ; starty = cy - PC*scrx - PD*scry
+    mul   r4, r7, r3           @ PA*scrx
+    mul   r5, r8, lr           @ PB*scry
+    ldmfd sp!, {r6, r12}       @ r6 = cx, r12 = cy
+    sub   r6, r6, r4
+    sub   r6, r6, r5
+    str   r6, [r1, #8]         @ startx
+    mul   r4, r9, r3           @ PC*scrx
+    mul   r5, r10, lr          @ PD*scry
+    sub   r12, r12, r4
+    sub   r12, r12, r5
+    str   r12, [r1, #12]       @ starty
+    add   r1, r1, #16
+    sub   r2, r2, #1
+    b     .Lbas_loop
+.Lbas_done:
+    ldmfd sp!, {r4-r11, lr}
+    b     swi_return
+.Lbas_taboff:
+    .word .Laffine_sintab - (.Lbas_pc + 8)
+
+@ 256-step sine table, Q14 (round(sin(2*PI*i/256) * 16384)). cos is read 64
+@ entries (90 degrees) ahead. Pure mathematical constants.
+.balign 2
+.Laffine_sintab:
+    .hword 0, 402, 804, 1205, 1606, 2006, 2404, 2801
+    .hword 3196, 3590, 3981, 4370, 4756, 5139, 5520, 5897
+    .hword 6270, 6639, 7005, 7366, 7723, 8076, 8423, 8765
+    .hword 9102, 9434, 9760, 10080, 10394, 10702, 11003, 11297
+    .hword 11585, 11866, 12140, 12406, 12665, 12916, 13160, 13395
+    .hword 13623, 13842, 14053, 14256, 14449, 14635, 14811, 14978
+    .hword 15137, 15286, 15426, 15557, 15679, 15791, 15893, 15986
+    .hword 16069, 16143, 16207, 16261, 16305, 16340, 16364, 16379
+    .hword 16384, 16379, 16364, 16340, 16305, 16261, 16207, 16143
+    .hword 16069, 15986, 15893, 15791, 15679, 15557, 15426, 15286
+    .hword 15137, 14978, 14811, 14635, 14449, 14256, 14053, 13842
+    .hword 13623, 13395, 13160, 12916, 12665, 12406, 12140, 11866
+    .hword 11585, 11297, 11003, 10702, 10394, 10080, 9760, 9434
+    .hword 9102, 8765, 8423, 8076, 7723, 7366, 7005, 6639
+    .hword 6270, 5897, 5520, 5139, 4756, 4370, 3981, 3590
+    .hword 3196, 2801, 2404, 2006, 1606, 1205, 804, 402
+    .hword 0, -402, -804, -1205, -1606, -2006, -2404, -2801
+    .hword -3196, -3590, -3981, -4370, -4756, -5139, -5520, -5897
+    .hword -6270, -6639, -7005, -7366, -7723, -8076, -8423, -8765
+    .hword -9102, -9434, -9760, -10080, -10394, -10702, -11003, -11297
+    .hword -11585, -11866, -12140, -12406, -12665, -12916, -13160, -13395
+    .hword -13623, -13842, -14053, -14256, -14449, -14635, -14811, -14978
+    .hword -15137, -15286, -15426, -15557, -15679, -15791, -15893, -15986
+    .hword -16069, -16143, -16207, -16261, -16305, -16340, -16364, -16379
+    .hword -16384, -16379, -16364, -16340, -16305, -16261, -16207, -16143
+    .hword -16069, -15986, -15893, -15791, -15679, -15557, -15426, -15286
+    .hword -15137, -14978, -14811, -14635, -14449, -14256, -14053, -13842
+    .hword -13623, -13395, -13160, -12916, -12665, -12406, -12140, -11866
+    .hword -11585, -11297, -11003, -10702, -10394, -10080, -9760, -9434
+    .hword -9102, -8765, -8423, -8076, -7723, -7366, -7005, -6639
+    .hword -6270, -5897, -5520, -5139, -4756, -4370, -3981, -3590
+    .hword -3196, -2801, -2404, -2006, -1606, -1205, -804, -402
 
 @ Reset SWIs are not yet implemented; return as no-ops for now. (SoftReset does
 @ not return on hardware — that behavior comes with the real implementation.)

@@ -46,9 +46,10 @@ The `gba` crate embeds it via `gba::default_bios()`.
   jump-table framework. Implemented: `Halt` (0x02), `IntrWait` (0x04),
   `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
   `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), `CpuFastSet` (0x0C),
-  `BitUnPack` (0x10), `LZ77UnComp` Wram/Vram (0x11/0x12), `HuffUnComp` (0x13),
-  `RLUnComp` Wram/Vram (0x14/0x15), `Diff8bitUnFilter` Wram/Vram (0x16/0x17),
-  and `Diff16bitUnFilter` (0x18). Every other SWI currently returns as a no-op.
+  `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F), `BitUnPack` (0x10), `LZ77UnComp`
+  Wram/Vram (0x11/0x12), `HuffUnComp` (0x13), `RLUnComp` Wram/Vram (0x14/0x15),
+  `Diff8bitUnFilter` Wram/Vram (0x16/0x17), and `Diff16bitUnFilter` (0x18).
+  Every other SWI currently returns as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
@@ -77,11 +78,19 @@ buffers halfword stores (Vram). LZ77 back-references read from the destination
 as they are written; in Vram mode the last byte is still buffered, so `disp=0`
 back-references are unsupported, exactly as the hardware documents.
 
+`BgAffineSet` and `ObjAffineSet` build the affine matrix
+(PA=sx·cos, PB=−sx·sin, PC=sy·sin, PD=sy·cos) from a 256-step Q14 sine table
+(pure `sin(2π·i/256)` constants; cos is read 64 entries ahead). Only the angle's
+upper 8 bits select an entry, as the BIOS documents. `BgAffineSet` also derives
+the start coordinates. Like `ArcTan`, these are independent approximations — the
+real BIOS's own sine table is disassembly-only — so they are not bit-identical
+to it (its address is loaded reloc-free via a same-section label-difference
+literal, since a 512-byte table is out of `adr` range).
+
 ## Not yet implemented
 
-`SoftReset`/`RegisterRamReset` and the affine SWIs (`BgAffineSet`,
-`ObjAffineSet`), plus the boot logo intro. See the crate memory / project notes
-for the roadmap.
+`SoftReset`/`RegisterRamReset`, the sound-driver SWIs, and the boot logo intro.
+See the crate memory / project notes for the roadmap.
 
 ## Tests
 
