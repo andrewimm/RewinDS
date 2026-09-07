@@ -112,8 +112,8 @@ swi_table:
     b swi_reg_ram_reset     @ 0x01 RegisterRamReset
     b swi_halt              @ 0x02 Halt
     b swi_stub              @ 0x03 Stop/Sleep
-    b swi_stub              @ 0x04 IntrWait
-    b swi_stub              @ 0x05 VBlankIntrWait
+    b swi_intr_wait         @ 0x04 IntrWait
+    b swi_vblank_intr_wait  @ 0x05 VBlankIntrWait
     b swi_div               @ 0x06 Div
     b swi_div_arm           @ 0x07 DivArm
     b swi_stub              @ 0x08 Sqrt
@@ -173,6 +173,56 @@ swi_halt:
     mov   r1, #0
     strb  r1, [r0]
     ldmfd sp!, {r0, r1}
+    b     swi_return
+    .pool
+
+@ SWI 0x05 VBlankIntrWait: wait for a new V-Blank interrupt. Equivalent to
+@ IntrWait with r0=1 (discard old) and r1=1 (the V-Blank flag); fall into it.
+swi_vblank_intr_wait:
+    mov   r0, #1
+    mov   r1, #1
+    @ fall through to swi_intr_wait
+
+@ SWI 0x04 IntrWait: halt until one of the requested interrupt(s) occurs.
+@   in: r0 = 0 return at once if a wanted flag is already set,
+@             1 discard old flags and wait for a new one
+@       r1 = interrupt flag(s) to wait for (IE/IF format)
+@ The BIOS Interrupt Check Flags live at 0x03007FF8 (16-bit). The user IRQ
+@ handler is responsible for ORing acknowledged interrupts into that word; this
+@ function polls it across halts and clears the awaited bits before returning.
+@ Interrupts are force-enabled (IME=1 and the CPSR I-bit cleared) so the wait can
+@ actually be serviced; the caller's CPSR — including its I-bit — is restored by
+@ the normal SWI return.
+swi_intr_wait:
+    stmfd sp!, {r4, r5}
+    ldr   r4, =0x04000301       @ HALTCNT
+    ldr   r5, =0x03007FF8       @ BIOS Interrupt Check Flags (16-bit)
+    mov   r2, #0x04000000
+    mov   r3, #1
+    str   r3, [r2, #0x208]      @ IME = 1
+    mrs   r2, cpsr
+    bic   r2, r2, #0x80         @ clear the CPSR I-bit: accept IRQs during the wait
+    msr   cpsr_c, r2
+    cmp   r0, #0
+    bne   .Liw_discard
+    ldrh  r2, [r5]              @ r0==0: consume an already-pending wanted flag
+    ands  r3, r2, r1
+    bne   .Liw_consume
+    b     .Liw_halt
+.Liw_discard:
+    ldrh  r2, [r5]             @ r0!=0: drop old flags so we wait for a fresh one
+    bic   r2, r2, r1
+    strh  r2, [r5]
+.Liw_halt:
+    mov   r3, #0
+    strb  r3, [r4]             @ Halt; the serviced IRQ resumes at the next insn
+    ldrh  r2, [r5]
+    ands  r3, r2, r1
+    beq   .Liw_halt
+.Liw_consume:
+    bic   r2, r2, r1           @ clear the awaited flag(s) on the way out
+    strh  r2, [r5]
+    ldmfd sp!, {r4, r5}
     b     swi_return
     .pool
 

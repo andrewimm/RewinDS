@@ -43,17 +43,23 @@ The `gba` crate embeds it via `gba::default_bios()`.
 - **Boot**: set up the privileged-mode stacks at their documented tops and hand
   off to the cartridge entry point in System / ARM state.
 - **SWI dispatcher**: the full comment-field decode (ARM and Thumb) and
-  jump-table framework. Worked examples: `Div` (0x06), `DivArm` (0x07), and
-  `Halt` (0x02). Every other SWI currently returns as a no-op.
+  jump-table framework. Implemented: `Halt` (0x02), `IntrWait` (0x04),
+  `VBlankIntrWait` (0x05), `Div` (0x06), and `DivArm` (0x07). Every other SWI
+  currently returns as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
+`IntrWait`/`VBlankIntrWait` force interrupts on (IME=1 and the CPSR I-bit
+cleared) and halt-poll the BIOS Interrupt Check Flags at `0x03007FF8`, which the
+user IRQ handler is responsible for posting to; the awaited bits are cleared
+before returning. The caller's CPSR (I-bit included) is restored by the normal
+SWI return.
+
 ## Not yet implemented
 
-`IntrWait`/`VBlankIntrWait` (need the System-mode switch and IRQ re-enable),
-`SoftReset`/`RegisterRamReset`, the arithmetic (`Sqrt`, `ArcTan*`), memory
-(`CpuSet`, `CpuFastSet`), decompression, and affine SWIs, plus the boot logo
-intro. See the crate memory / project notes for the roadmap.
+`SoftReset`/`RegisterRamReset`, the remaining arithmetic (`Sqrt`, `ArcTan*`),
+memory (`CpuSet`, `CpuFastSet`), decompression, and affine SWIs, plus the boot
+logo intro. See the crate memory / project notes for the roadmap.
 
 ## Tests
 

@@ -11,7 +11,38 @@
 //!      commercial BIOS — the real image is exercised only as a black box.
 
 use arm::cpu::Mode;
-use gba::System;
+use gba::{IrqSource, System, TimerId};
+
+/// A generic user IRQ handler (assembled from clang, verified by disassembly):
+/// acknowledge all pending `IF` and set every BIOS interrupt flag at
+/// `0x03007FF8`, then `bx lr`. That is all IntrWait needs to observe a wake-up.
+const USER_HANDLER: &[u32] = &[
+    0xE3E0_0000, // mvn  r0, #0            ; 0xFFFFFFFF
+    0xE3A0_1301, // mov  r1, #0x04000000
+    0xE281_1C02, // add  r1, r1, #0x200
+    0xE1C1_00B2, // strh r0, [r1, #2]      ; IF = 0xFFFF (write-1-clear)
+    0xE3A0_2403, // mov  r2, #0x03000000
+    0xE282_2C7F, // add  r2, r2, #0x7F00
+    0xE282_20F8, // add  r2, r2, #0xF8     ; r2 = 0x03007FF8
+    0xE1C2_00B0, // strh r0, [r2]          ; BIOS flags = 0xFFFF
+    0xE12F_FF1E, // bx   lr
+];
+
+const BIOS_FLAGS: u32 = 0x0300_7FF8; // BIOS Interrupt Check Flags (16-bit)
+
+/// Timer control bits.
+const TIMER_START: u16 = 1 << 7;
+const TIMER_IRQ: u16 = 1 << 6;
+
+fn bios_flags(sys: &System) -> u16 {
+    let off = (BIOS_FLAGS - 0x0300_0000) as usize;
+    u16::from_le_bytes(sys.gba.bus.memory.iwram[off..off + 2].try_into().unwrap())
+}
+
+fn set_bios_flags(sys: &mut System, value: u16) {
+    let off = (BIOS_FLAGS - 0x0300_0000) as usize;
+    sys.gba.bus.memory.iwram[off..off + 2].copy_from_slice(&value.to_le_bytes());
+}
 
 // GBATEK "BIOS RAM Usage": the System/User stack initialises to the top of its
 // reserved area (SP_svc=0x03007FE0 and SP_irq=0x03007FA0 are exercised
@@ -195,6 +226,78 @@ fn irq_handler_forwards_to_user_handler_and_returns() {
     assert_eq!(marker, 0x42, "user IRQ handler ran");
     assert_eq!(sys.cpu.register(15), interrupted, "resumed the interrupted code");
     assert_eq!(sys.cpu.mode(), Some(Mode::System), "CPSR restored on return");
+}
+
+/// Place `[swi #num ; b .]` at 0x03000000, preload r0/r1, and point PC at it.
+fn invoke_swi(sys: &mut System, num: u8, r0: u32, r1: u32) {
+    let swi = 0xEF00_0000 | ((num as u32) << 16);
+    put_iwram(sys, 0x0300_0000, &[swi, 0xEAFF_FFFE]);
+    sys.cpu.set_register(0, r0);
+    sys.cpu.set_register(1, r1);
+    sys.cpu.set_pc(0x0300_0000);
+}
+
+/// Step until control returns to the instruction after the SWI stub.
+fn run_until_swi_returns(sys: &mut System, budget: u32) -> bool {
+    for _ in 0..budget {
+        if sys.cpu.register(15) == 0x0300_0004 {
+            return true;
+        }
+        sys.step();
+    }
+    false
+}
+
+#[test]
+fn intr_wait_returns_immediately_when_flag_already_set() {
+    // r0=0: if a wanted flag is already set in the BIOS flags, consume it and
+    // return without ever halting.
+    let mut sys = booted(gba::default_bios());
+    let mask = IrqSource::Timer0.mask();
+    set_bios_flags(&mut sys, mask | 0x0100); // wanted bit plus an unrelated one
+    invoke_swi(&mut sys, 0x04, 0, mask as u32);
+    assert!(run_until_swi_returns(&mut sys, 5000), "IntrWait(discard=0) did not return");
+    assert_eq!(bios_flags(&sys) & mask, 0, "awaited flag cleared");
+    assert_eq!(bios_flags(&sys) & 0x0100, 0x0100, "unrelated flag preserved");
+    assert!(sys.gba.bus.io.irq.ime(), "IntrWait force-enables IME");
+}
+
+#[test]
+fn intr_wait_halts_then_returns_when_irq_fires() {
+    // r0=1: halt until a *new* interrupt sets the awaited flag. Drive it with a
+    // Timer0 IRQ; the user handler acks IF and posts the BIOS flags.
+    let mut sys = booted(gba::default_bios());
+    put_iwram(&mut sys, 0x0300_0100, USER_HANDLER);
+    put_iwram(&mut sys, USER_IRQ_PTR, &[0x0300_0100]);
+    let mask = IrqSource::Timer0.mask();
+    sys.gba.bus.io.irq.set_ie(mask);
+    let now = sys.scheduler.now();
+    // A long period (0x8000 ticks): one overflow arrives during the wait, and
+    // the next is far past IntrWait's return window (so it can't re-post the flag
+    // before we observe the cleared state).
+    sys.gba.bus.io.timers.write_reload(TimerId::Timer0, 0x8000);
+    sys.gba.bus.io.timers.write_control(
+        TimerId::Timer0,
+        TIMER_START | TIMER_IRQ,
+        now,
+        &mut sys.scheduler,
+    );
+    invoke_swi(&mut sys, 0x04, 1, mask as u32);
+    assert!(run_until_swi_returns(&mut sys, 200_000), "IntrWait did not wake and return");
+    assert_eq!(bios_flags(&sys) & mask, 0, "awaited flag cleared on return");
+}
+
+#[test]
+fn vblank_intr_wait_returns_after_a_vblank() {
+    // VBlankIntrWait forces r0=1,r1=1 and waits for a fresh VBlank IRQ.
+    let mut sys = booted(gba::default_bios());
+    put_iwram(&mut sys, 0x0300_0100, USER_HANDLER);
+    put_iwram(&mut sys, USER_IRQ_PTR, &[0x0300_0100]);
+    sys.gba.bus.io.irq.set_ie(IrqSource::VBlank.mask());
+    sys.gba.bus.io.video.write_dispstat(1 << 3); // enable the VBlank IRQ
+    invoke_swi(&mut sys, 0x05, 0, 0); // r0/r1 are ignored by VBlankIntrWait
+    assert!(run_until_swi_returns(&mut sys, 2_000_000), "VBlankIntrWait did not return");
+    assert_eq!(bios_flags(&sys) & IrqSource::VBlank.mask(), 0, "VBlank flag cleared");
 }
 
 // --- Opt-in: equivalence against a real BIOS -------------------------------
