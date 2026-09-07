@@ -84,39 +84,37 @@ fn in_rom(pc: u32) -> bool {
     (ROM_ENTRY..0x0E00_0000).contains(&pc)
 }
 
-fn booted(bios: &[u8]) -> System {
+fn booted_with_rom(bios: &[u8], rom: Vec<u8>) -> System {
     let mut sys = System::new();
     sys.gba.bus.load_bios(bios);
-    sys.gba.bus.load_rom(spin_cart());
+    sys.gba.bus.load_rom(rom);
     sys.cpu.set_pc(0);
     assert!(boot_to_rom(&mut sys), "BIOS never handed off to ROM");
     sys
 }
 
-/// Invoke `swi_number` after booting `bios`, with r0/r1 preloaded, and run until
-/// the SWI returns to its caller. Returns (r0, r1, r3).
-fn run_swi(bios: &[u8], swi_number: u8, r0: u32, r1: u32) -> (u32, u32, u32) {
-    let mut sys = booted(bios);
-    // A SWI followed by a spin, placed in IWRAM.
-    let swi = 0xEF00_0000 | ((swi_number as u32) << 16);
-    put_iwram(&mut sys, 0x0300_0000, &[swi, 0xEAFF_FFFE]);
-    sys.cpu.set_register(0, r0);
-    sys.cpu.set_register(1, r1);
-    sys.cpu.set_pc(0x0300_0000);
+/// Boot `bios` far enough that the privileged stacks are set up. Our BIOS hands
+/// off from a bare cartridge immediately; a real BIOS needs a valid logo, so
+/// real-BIOS callers must boot through a real ROM (see `booted_with_rom`).
+fn booted(bios: &[u8]) -> System {
+    booted_with_rom(bios, spin_cart())
+}
 
-    // Run until control returns to the instruction after the SWI.
-    for _ in 0..5000 {
-        if sys.cpu.register(15) == 0x0300_0004 {
-            break;
-        }
-        sys.step();
-    }
-    assert_eq!(
-        sys.cpu.register(15),
-        0x0300_0004,
+/// Invoke `swi_number` on an already-booted system (stacks established), with
+/// r0/r1 preloaded, and run until the SWI returns. Returns (r0, r1, r3).
+fn run_swi_on(sys: &mut System, swi_number: u8, r0: u32, r1: u32) -> (u32, u32, u32) {
+    invoke_swi(sys, swi_number, r0, r1);
+    assert!(
+        run_until_swi_returns(sys, 5000),
         "SWI {swi_number:#x} did not return to its caller"
     );
     (sys.cpu.register(0), sys.cpu.register(1), sys.cpu.register(3))
+}
+
+/// Invoke `swi_number` after booting `bios` from a bare cartridge.
+fn run_swi(bios: &[u8], swi_number: u8, r0: u32, r1: u32) -> (u32, u32, u32) {
+    let mut sys = booted(bios);
+    run_swi_on(&mut sys, swi_number, r0, r1)
 }
 
 // --- Always-run: documented behavior of our BIOS ---------------------------
@@ -230,11 +228,33 @@ fn irq_handler_forwards_to_user_handler_and_returns() {
 
 /// Place `[swi #num ; b .]` at 0x03000000, preload r0/r1, and point PC at it.
 fn invoke_swi(sys: &mut System, num: u8, r0: u32, r1: u32) {
+    invoke_swi3(sys, num, r0, r1, 0);
+}
+
+/// As [`invoke_swi`], also preloading r2 (used by the memory SWIs).
+fn invoke_swi3(sys: &mut System, num: u8, r0: u32, r1: u32, r2: u32) {
     let swi = 0xEF00_0000 | ((num as u32) << 16);
     put_iwram(sys, 0x0300_0000, &[swi, 0xEAFF_FFFE]);
     sys.cpu.set_register(0, r0);
     sys.cpu.set_register(1, r1);
+    sys.cpu.set_register(2, r2);
     sys.cpu.set_pc(0x0300_0000);
+}
+
+const EWRAM_BASE: u32 = 0x0200_0000;
+
+fn put_ewram(sys: &mut System, off: usize, words: &[u32]) {
+    for (i, w) in words.iter().enumerate() {
+        sys.gba.bus.memory.ewram[off + i * 4..off + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+}
+
+fn ewram_word(sys: &System, off: usize) -> u32 {
+    u32::from_le_bytes(sys.gba.bus.memory.ewram[off..off + 4].try_into().unwrap())
+}
+
+fn ewram_half(sys: &System, off: usize) -> u16 {
+    u16::from_le_bytes(sys.gba.bus.memory.ewram[off..off + 2].try_into().unwrap())
 }
 
 /// Step until control returns to the instruction after the SWI stub.
@@ -300,24 +320,149 @@ fn vblank_intr_wait_returns_after_a_vblank() {
     assert_eq!(bios_flags(&sys) & IrqSource::VBlank.mask(), 0, "VBlank flag cleared");
 }
 
+// --- CpuSet (0x0B) / CpuFastSet (0x0C) -------------------------------------
+
+const CPUSET_FILL: u32 = 1 << 24; // fixed source address
+const CPUSET_32BIT: u32 = 1 << 26; // datasize (CpuSet only)
+const SRC: u32 = EWRAM_BASE; // ewram offset 0
+const DST: u32 = EWRAM_BASE + 0x1000; // ewram offset 0x1000
+const DST_OFF: usize = 0x1000;
+
+#[test]
+fn cpu_set_copies_words() {
+    let mut sys = booted(gba::default_bios());
+    let src = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    put_ewram(&mut sys, 0, &src);
+    invoke_swi3(&mut sys, 0x0B, SRC, DST, 4 | CPUSET_32BIT);
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    for (i, w) in src.iter().enumerate() {
+        assert_eq!(ewram_word(&sys, DST_OFF + i * 4), *w, "word {i}");
+    }
+}
+
+#[test]
+fn cpu_set_fills_words() {
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, 0, &[0xDEAD_BEEF]);
+    put_ewram(&mut sys, DST_OFF, &[0; 4]); // sentinel
+    invoke_swi3(&mut sys, 0x0B, SRC, DST, 3 | CPUSET_32BIT | CPUSET_FILL);
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    assert_eq!(ewram_word(&sys, DST_OFF), 0xDEAD_BEEF);
+    assert_eq!(ewram_word(&sys, DST_OFF + 4), 0xDEAD_BEEF);
+    assert_eq!(ewram_word(&sys, DST_OFF + 8), 0xDEAD_BEEF);
+    assert_eq!(ewram_word(&sys, DST_OFF + 12), 0, "beyond count untouched");
+}
+
+#[test]
+fn cpu_set_copies_halfwords() {
+    let mut sys = booted(gba::default_bios());
+    // Halfwords AAAA, BBBB, CCCC, DDDD packed into two words.
+    put_ewram(&mut sys, 0, &[0xBBBB_AAAA, 0xDDDD_CCCC]);
+    invoke_swi3(&mut sys, 0x0B, SRC, DST, 4); // 16-bit, copy
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    assert_eq!(ewram_half(&sys, DST_OFF), 0xAAAA);
+    assert_eq!(ewram_half(&sys, DST_OFF + 2), 0xBBBB);
+    assert_eq!(ewram_half(&sys, DST_OFF + 4), 0xCCCC);
+    assert_eq!(ewram_half(&sys, DST_OFF + 6), 0xDDDD);
+}
+
+#[test]
+fn cpu_set_fills_halfwords() {
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, 0, &[0x0000_1357]); // low halfword 0x1357 is the fill value
+    put_ewram(&mut sys, DST_OFF, &[0; 2]);
+    invoke_swi3(&mut sys, 0x0B, SRC, DST, 3 | CPUSET_FILL); // 16-bit fill, 3 halfwords
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    assert_eq!(ewram_half(&sys, DST_OFF), 0x1357);
+    assert_eq!(ewram_half(&sys, DST_OFF + 2), 0x1357);
+    assert_eq!(ewram_half(&sys, DST_OFF + 4), 0x1357);
+    assert_eq!(ewram_half(&sys, DST_OFF + 6), 0, "beyond count untouched");
+}
+
+#[test]
+fn cpu_fast_set_copies_and_rounds_word_count_up_to_eight() {
+    let mut sys = booted(gba::default_bios());
+    let src: Vec<u32> = (0..16).map(|i| 0x1000_0000 + i).collect();
+    put_ewram(&mut sys, 0, &src);
+    put_ewram(&mut sys, DST_OFF, &[0; 16]); // sentinel
+    // Request 10 words; the GBA rounds up to 16 (two 8-word blocks).
+    invoke_swi3(&mut sys, 0x0C, SRC, DST, 10);
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    for (i, w) in src.iter().enumerate() {
+        assert_eq!(ewram_word(&sys, DST_OFF + i * 4), *w, "word {i} (incl. round-up 10->16)");
+    }
+}
+
+#[test]
+fn cpu_fast_set_fills() {
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, 0, &[0xCAFE_F00D]);
+    put_ewram(&mut sys, DST_OFF, &[0; 8]);
+    invoke_swi3(&mut sys, 0x0C, SRC, DST, 3 | CPUSET_FILL); // 3 -> rounds up to 8, fill
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    for i in 0..8 {
+        assert_eq!(ewram_word(&sys, DST_OFF + i * 4), 0xCAFE_F00D, "word {i}");
+    }
+}
+
+#[test]
+fn cpu_set_rejects_a_bios_source() {
+    // GBA silently does nothing when the source reaches into the BIOS area.
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, DST_OFF, &[0x5555_5555; 4]);
+    invoke_swi3(&mut sys, 0x0B, 0x0000_0000, DST, 4 | CPUSET_32BIT);
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    for i in 0..4 {
+        assert_eq!(ewram_word(&sys, DST_OFF + i * 4), 0x5555_5555, "word {i} untouched");
+    }
+}
+
 // --- Opt-in: equivalence against a real BIOS -------------------------------
 
 fn real_bios() -> Option<Vec<u8>> {
     std::env::var("REWINDS_BIOS").ok().map(|p| std::fs::read(p).expect("read REWINDS_BIOS"))
 }
 
+fn real_rom() -> Option<Vec<u8>> {
+    std::env::var("REWINDS_ROM").ok().map(|p| std::fs::read(p).expect("read REWINDS_ROM"))
+}
+
 #[test]
 fn div_matches_real_bios() {
-    let Some(real) = real_bios() else {
-        eprintln!("skipping: set REWINDS_BIOS to a real BIOS image to run this");
+    let (Some(real), Some(rom)) = (real_bios(), real_rom()) else {
+        eprintln!("skipping: set REWINDS_BIOS and REWINDS_ROM to run this");
         return;
     };
+    // A real BIOS only hands off from a valid ROM; boot both through it, then run
+    // the SWI from our own stub (the game code the ROM contains is irrelevant).
     let cases: &[(i32, i32)] = &[(-1234, 10), (100, 7), (-100, 7), (100, -7), (12345, 678)];
     for &(num, den) in cases {
-        let ours = run_swi(gba::default_bios(), 0x06, num as u32, den as u32);
-        let theirs = run_swi(&real, 0x06, num as u32, den as u32);
-        assert_eq!(ours, theirs, "Div {num}/{den}: ours {ours:?} vs real {theirs:?}");
+        let mut ours = booted_with_rom(gba::default_bios(), rom.clone());
+        let mut theirs = booted_with_rom(&real, rom.clone());
+        let a = run_swi_on(&mut ours, 0x06, num as u32, den as u32);
+        let b = run_swi_on(&mut theirs, 0x06, num as u32, den as u32);
+        assert_eq!(a, b, "Div {num}/{den}: ours {a:?} vs real {b:?}");
     }
+}
+
+#[test]
+fn cpu_set_matches_real_bios() {
+    let (Some(real), Some(rom)) = (real_bios(), real_rom()) else {
+        eprintln!("skipping: set REWINDS_BIOS and REWINDS_ROM to run this");
+        return;
+    };
+    // Compare a 32-bit CpuSet copy's result in memory between the two BIOSes.
+    let src = [0x0BAD_F00Du32, 0x1234_5678, 0xFEED_FACE, 0x0000_0001, 0xFFFF_FFFF];
+    let copy = |bios: &[u8]| -> Vec<u32> {
+        let mut sys = booted_with_rom(bios, rom.clone());
+        put_ewram(&mut sys, 0, &src);
+        put_ewram(&mut sys, DST_OFF, &[0; 5]);
+        invoke_swi3(&mut sys, 0x0B, SRC, DST, 5 | CPUSET_32BIT);
+        assert!(run_until_swi_returns(&mut sys, 5000));
+        (0..5).map(|i| ewram_word(&sys, DST_OFF + i * 4)).collect()
+    };
+    assert_eq!(copy(gba::default_bios()), copy(&real));
+    assert_eq!(copy(gba::default_bios()), src.to_vec());
 }
 
 #[test]

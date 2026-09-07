@@ -119,8 +119,8 @@ swi_table:
     b swi_stub              @ 0x08 Sqrt
     b swi_stub              @ 0x09 ArcTan
     b swi_stub              @ 0x0A ArcTan2
-    b swi_stub              @ 0x0B CpuSet
-    b swi_stub              @ 0x0C CpuFastSet
+    b swi_cpu_set           @ 0x0B CpuSet
+    b swi_cpu_fast_set      @ 0x0C CpuFastSet
     b swi_stub              @ 0x0D GetBiosChecksum
     b swi_stub              @ 0x0E BgAffineSet
     b swi_stub              @ 0x0F ObjAffineSet
@@ -273,6 +273,80 @@ swi_div:
     tst   r5, #2
     rsbne r1, r1, #0
     ldmfd sp!, {r2, r5}
+    b     swi_return
+
+@ SWI 0x0B CpuSet: copy or fill memory in 4-byte or 2-byte units.
+@   r0 = source, r1 = destination, r2 = length/mode:
+@        bits 0-20 = unit count, bit 24 = fixed source (fill), bit 26 = 32-bit.
+@ No return value; clobbers the scratch registers. GBA silently does nothing if
+@ the source reaches into the BIOS area.
+swi_cpu_set:
+    mov   r3, r2, lsl #11
+    movs  r3, r3, lsr #11       @ r3 = unit count (bits 0-20); Z set if zero
+    beq   swi_return
+    cmp   r0, #0x4000           @ reject a source in the BIOS region
+    blo   swi_return
+    tst   r2, #(1 << 26)        @ 32-bit units?
+    bne   .Lcpuset_word
+    tst   r2, #(1 << 24)        @ 16-bit: fixed source (fill)?
+    bne   .Lcpuset_half_fill
+.Lcpuset_half_copy:
+    ldrh  r12, [r0], #2
+    strh  r12, [r1], #2
+    subs  r3, r3, #1
+    bne   .Lcpuset_half_copy
+    b     swi_return
+.Lcpuset_half_fill:
+    ldrh  r12, [r0]
+.Lcpuset_half_fill_loop:
+    strh  r12, [r1], #2
+    subs  r3, r3, #1
+    bne   .Lcpuset_half_fill_loop
+    b     swi_return
+.Lcpuset_word:
+    tst   r2, #(1 << 24)        @ 32-bit: fixed source (fill)?
+    bne   .Lcpuset_word_fill
+.Lcpuset_word_copy:
+    ldr   r12, [r0], #4
+    str   r12, [r1], #4
+    subs  r3, r3, #1
+    bne   .Lcpuset_word_copy
+    b     swi_return
+.Lcpuset_word_fill:
+    ldr   r12, [r0]
+.Lcpuset_word_fill_loop:
+    str   r12, [r1], #4
+    subs  r3, r3, #1
+    bne   .Lcpuset_word_fill_loop
+    b     swi_return
+
+@ SWI 0x0C CpuFastSet: copy or fill memory in 32-byte (8-word) blocks.
+@   r0 = source, r1 = destination, r2 = length/mode:
+@        bits 0-20 = word count (rounded up to a multiple of 8), bit 24 = fill.
+@ Real hardware moves whole 8-word blocks; the observable result is identical to
+@ the word-at-a-time loop used here.
+swi_cpu_fast_set:
+    mov   r3, r2, lsl #11
+    movs  r3, r3, lsr #11       @ r3 = word count (bits 0-20)
+    beq   swi_return
+    cmp   r0, #0x4000
+    blo   swi_return
+    add   r3, r3, #7
+    bic   r3, r3, #7            @ round up to a multiple of 8 words
+    tst   r2, #(1 << 24)
+    bne   .Lcfs_fill
+.Lcfs_copy:
+    ldr   r12, [r0], #4
+    str   r12, [r1], #4
+    subs  r3, r3, #1
+    bne   .Lcfs_copy
+    b     swi_return
+.Lcfs_fill:
+    ldr   r12, [r0]
+.Lcfs_fill_loop:
+    str   r12, [r1], #4
+    subs  r3, r3, #1
+    bne   .Lcfs_fill_loop
     b     swi_return
 
 @ Reset SWIs are not yet implemented; return as no-ops for now. (SoftReset does
