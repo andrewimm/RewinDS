@@ -628,13 +628,11 @@ impl Machine {
             0x0400_0300 => self.postflg[c] as u32,
             0x0410_0000 => self.ipc.recv(core, &mut self.interrupts),
             0x0410_0010 => {
-                // Gamecard data port: stream a word; the last word of a block
-                // completes the transfer and raises the IRQ (manual-read path).
-                let word = self.cart.read_data();
-                if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
-                    self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
-                }
-                word
+                // Gamecard data port: stream one buffered word. The transfer-complete
+                // IRQ is raised when the block finishes clocking out of the cartridge
+                // (the `CartTransferComplete` event), not here — a manual reader simply
+                // drains the already-available words.
+                self.cart.read_data()
             }
             0x0400_0240 if core == Core::Arm7 => self.vram.vramstat() as u32,
             0x0400_0241 if core == Core::Arm7 => self.memory.wramcnt as u32,
@@ -924,7 +922,13 @@ impl EventHandler<NdsEvent> for Machine {
                         }
                     }
                 }
-                if self.cart.take_completion() && self.cart.transfer_irq_enabled() {
+                // The gamecard raises the transfer-complete IRQ when the block finishes
+                // clocking out of the cartridge (this event), if the requester enabled it
+                // (AUXSPICNT bit 14) — independently of whether a DMA or the CPU has read
+                // the data out yet. A blocking reader (no DMA, the CPU asleep on this IRQ)
+                // relies on it; the data stays buffered for the woken handler to read.
+                self.cart.take_completion();
+                if self.cart.transfer_irq_enabled() {
                     self.interrupts[c].request(crate::interrupt::IrqSource::Gamecard);
                 }
             }
@@ -2583,6 +2587,41 @@ mod tests {
             system.interrupts(Core::Arm9).iflags(),
             IrqSource::Gamecard.mask()
         );
+    }
+
+    #[test]
+    fn cart_transfer_end_raises_irq_without_a_reader() {
+        use crate::IrqSource;
+        // A gamecard transfer raises the transfer-complete IRQ when the block finishes
+        // clocking out of the cartridge — not when the data is read out. A reader that
+        // enables the IRQ (AUXSPICNT bit 14) and then sleeps on it, with neither a DMA
+        // nor a polling loop draining the block (e.g. a small chip-ID read), still gets
+        // woken; the data stays buffered for the handler to read afterward.
+        let mut system = System::new();
+        let mut rom = vec![0u8; 0x9000];
+        rom[0x8000..0x8004].copy_from_slice(&[0xC2, 0x0F, 0x00, 0x00]);
+        system.machine.cart.insert(&rom);
+
+        system.io_write(Core::Arm9, 0x0400_01A0, (1 << 15) | (1 << 14), 2); // AUXSPICNT: slot + IRQ
+        system.io_write(Core::Arm9, 0x0400_0210, IrqSource::Gamecard.mask(), 4); // IE
+        system.io_write(Core::Arm9, 0x0400_0208, 1, 4); // IME
+
+        // A 4-byte block (field 7), start — no DMA armed, and we never read the port.
+        let command = 0xB7u32 | (0x80 << 24);
+        system.io_write(Core::Arm9, 0x0400_01A8, command, 4);
+        system.io_write(Core::Arm9, 0x0400_01AC, 0, 4);
+        system.io_write(Core::Arm9, 0x0400_01A4, (1 << 31) | (7 << 24), 4);
+
+        assert_eq!(system.interrupts(Core::Arm9).iflags(), 0, "no IRQ before completion");
+        let fire = system.now() + 4260;
+        system.run_until(fire);
+        // The transfer completed and raised the IRQ even though nothing drained it.
+        assert_eq!(
+            system.interrupts(Core::Arm9).iflags(),
+            IrqSource::Gamecard.mask()
+        );
+        // The buffered word is still there to be read afterward.
+        assert_eq!(system.io_read(Core::Arm9, 0x0410_0010, 4), 0x0000_0FC2);
     }
 
     #[test]

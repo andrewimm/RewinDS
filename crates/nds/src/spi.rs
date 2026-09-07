@@ -45,6 +45,11 @@ pub struct Spi {
     address: u32,
     /// How many bytes of the current command have been clocked (command + address).
     phase: u32,
+    /// Firmware-flash Write Enable Latch (status-register bit 1). Set by `WREN`
+    /// (`0x06`), cleared by `WRDI` (`0x04`) and by a completed program/erase. A game
+    /// saving settings issues `WREN` then polls `RDSR` (`0x05`) until this reads back,
+    /// so the latch must actually toggle or the poll loops forever.
+    flash_wel: bool,
     /// Power-management (PMIC) registers, and its per-command index state.
     pmic: [u8; 8],
     pmic_index: u8,
@@ -74,6 +79,7 @@ impl Spi {
             command: 0,
             address: 0,
             phase: 0,
+            flash_wel: false,
             pmic: pmic_reset(),
             pmic_index: 0,
             pmic_reading: false,
@@ -137,6 +143,11 @@ impl Spi {
 
     /// End the current command (chip-select released).
     fn deselect(&mut self) {
+        // A completed program/erase consumes the write-enable latch (real flash clears
+        // `WEL` on write completion).
+        if matches!(self.command, 0x0A | 0x02) && self.phase >= 3 {
+            self.flash_wel = false;
+        }
         self.command = 0;
         self.address = 0;
         self.phase = 0;
@@ -192,6 +203,13 @@ impl Spi {
         if self.command == 0 {
             self.command = value;
             self.phase = 0;
+            // `WREN`/`WRDI` carry no data — the write-enable latch toggles on the
+            // command byte itself.
+            match value {
+                0x06 => self.flash_wel = true,  // WREN: set write-enable latch
+                0x04 => self.flash_wel = false, // WRDI: clear it
+                _ => {}
+            }
             return 0;
         }
         match self.command {
@@ -206,7 +224,22 @@ impl Spi {
                     byte
                 }
             }
-            0x05 => 0,    // RDSR: status = ready, not write-protected
+            // PP (page program): three big-endian address bytes, then a run of data
+            // bytes written into the flash image. Only permitted while the latch is set.
+            0x0A | 0x02 => {
+                if self.phase < 3 {
+                    self.address = (self.address << 8) | value as u32;
+                    self.phase += 1;
+                } else if self.flash_wel {
+                    let idx = self.address as usize & (self.flash.len() - 1);
+                    self.flash[idx] = value;
+                    self.address += 1;
+                }
+                0
+            }
+            // RDSR: status register — bit 0 `WIP` (writes complete instantly, so 0),
+            // bit 1 `WEL` (the write-enable latch a saving game polls for).
+            0x05 => (self.flash_wel as u8) << 1,
             0x9F => 0x00, // RDID: no meaningful JEDEC id
             _ => 0,
         }
@@ -248,6 +281,40 @@ mod tests {
         // adc.x1 at settings + 0x58 must be non-zero (matches user_settings()).
         let cal = read_at(&mut spi, offset + 0x58, 2);
         assert_eq!(u16::from_le_bytes([cal[0], cal[1]]), 0x0200);
+    }
+
+    /// A game saving settings enables writes with `WREN`, polls `RDSR` until the
+    /// write-enable latch (bit 1) reads back, programs the flash, and sees the latch
+    /// clear on completion. If `RDSR` never reflected the latch the poll would hang.
+    #[test]
+    fn firmware_write_enable_latch_toggles_and_programs() {
+        let mut spi = Spi::new();
+        let hold = (DEVICE_FIRMWARE << 8) | (1 << 11) | (1 << 15);
+        let cmd = |spi: &mut Spi, bytes: &[u16]| -> u8 {
+            spi.write_cnt(hold);
+            let mut last = 0;
+            for &b in bytes {
+                spi.write_data(b);
+                last = spi.read_data() as u8;
+            }
+            spi.write_cnt(0); // end the command
+            last
+        };
+        // RDSR (0x05) reads WEL clear at power-on.
+        assert_eq!(cmd(&mut spi, &[0x05, 0]) & 2, 0);
+        // WREN (0x06) sets the latch; RDSR now reports bit 1.
+        cmd(&mut spi, &[0x06]);
+        assert_eq!(cmd(&mut spi, &[0x05, 0]) & 2, 2);
+        // WRDI (0x04) clears it again.
+        cmd(&mut spi, &[0x04]);
+        assert_eq!(cmd(&mut spi, &[0x05, 0]) & 2, 0);
+        // With the latch set, a page program (0x02 + 3-byte address + data) writes the
+        // flash and consumes the latch on completion.
+        cmd(&mut spi, &[0x06]);
+        cmd(&mut spi, &[0x02, 0x00, 0x01, 0x00, 0xAB, 0xCD]);
+        assert_eq!(cmd(&mut spi, &[0x05, 0]) & 2, 0, "WEL clears after a program");
+        let back = cmd(&mut spi, &[0x03, 0x00, 0x01, 0x00, 0, 0]);
+        assert_eq!(back, 0xCD, "second programmed byte reads back");
     }
 
     /// Drive the touchscreen X and Y channels and reconstruct the 12-bit ADC value
