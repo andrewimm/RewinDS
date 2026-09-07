@@ -44,8 +44,11 @@ final class AppModel: ObservableObject {
             return
         }
         let images = bios.bootImages(for: console, rom: data)
+        // Build the new machine before touching the current one, so a failed switch
+        // leaves the running game untouched.
         let core = try EmulatorCore(images: images, forceConsole: console)
         let session = EmulatorSession(core: core, romId: romId)
+        if case let .game(old) = route { old.teardown() }
         session.start()
         route = .game(session)
     }

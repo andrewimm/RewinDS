@@ -7,7 +7,6 @@ struct GBALayout: View {
     @ObservedObject var session: EmulatorSession
     let shell: Shell
     let registry: ControlRegistry
-    let onSave: () -> Void
     let onMenu: () -> Void
 
     var body: some View {
@@ -65,11 +64,10 @@ struct GBALayout: View {
                 }
             }
 
-            // Save / Menu sit above the touch overlay in the very bottom corners.
+            // Menu sits above the touch overlay in the bottom-right corner.
             VStack {
                 Spacer()
                 HStack {
-                    ToolbarActionButton(systemImage: "square.and.arrow.down", title: "SAVE", shell: shell, action: onSave)
                     Spacer()
                     ToolbarActionButton(systemImage: "line.3.horizontal", title: "MENU", shell: shell, action: onMenu)
                 }

@@ -1,13 +1,12 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Manage the BIOS/firmware the emulator needs. These are never shipped in source; the
-/// user imports their own dumps here (stored privately in app-support), and imports take
+/// The BIOS/firmware list — reused by the Settings sheet (from the library) and the
+/// in-game menu's "System Files" page. These are never shipped in source; the user
+/// imports their own dumps here (stored privately in app-support), and imports take
 /// precedence over any copy the developer bundled from `dev-assets/`.
-struct SettingsView: View {
+struct SystemFilesList: View {
     @StateObject private var bios = BIOSStore.shared
-    @Environment(\.dismiss) private var dismiss
-
     @State private var importingRole: SystemFile?
 
     private var biosTypes: [UTType] {
@@ -15,24 +14,15 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    ForEach(SystemFile.allCases) { file in
-                        row(file)
-                    }
-                } header: {
-                    Text("System files")
-                } footer: {
-                    Text("BIOS and firmware dumps are never included in the app's source. Add your own here — imported files stay private to the app and override any bundled copy.")
+        List {
+            Section {
+                ForEach(SystemFile.allCases) { file in
+                    row(file)
                 }
-            }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
+            } header: {
+                Text("System files")
+            } footer: {
+                Text("BIOS and firmware dumps are never included in the app's source. Add your own here — imported files stay private to the app and override any bundled copy.")
             }
         }
         .fileImporter(
@@ -94,5 +84,23 @@ struct SettingsView: View {
     private func statusColor(_ file: SystemFile) -> Color {
         if bios.isAvailable(file) { return .green }
         return file.required ? .orange : .secondary
+    }
+}
+
+/// Settings sheet shown from the library.
+struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            SystemFilesList()
+                .navigationTitle("Settings")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+        }
     }
 }

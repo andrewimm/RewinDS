@@ -1,13 +1,12 @@
 import SwiftUI
 
-/// The portrait DS shell: a top bar (Save / RewinDS / Menu), the two stacked screens
-/// with a hinge divider (the lower one touch-enabled), then L/R, the D-pad and X/Y/A/B
-/// diamond, and small START/SELECT keys.
+/// The portrait DS shell: a top bar (RewinDS / Menu), the two stacked screens with a
+/// hinge divider (the lower one touch-enabled), then L/R, the D-pad and X/Y/A/B diamond,
+/// and small START/SELECT keys.
 struct DSLayout: View {
     @ObservedObject var session: EmulatorSession
     let shell: Shell
     let registry: ControlRegistry
-    let onSave: () -> Void
     let onRewind: () -> Void
     let onMenu: () -> Void
 
@@ -17,73 +16,76 @@ struct DSLayout: View {
         ZStack {
             shell.background.ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                topBar
-                    .padding(.horizontal, 22)
-                    .padding(.top, 4)
-                    .padding(.bottom, 10)
+            GeometryReader { geo in
+                // Reserve the top bar and controls, then give the two 4:3 screens the
+                // largest matching size that fits the remaining height (or the width).
+                let topBarH: CGFloat = 40
+                let controlsReserve: CGFloat = 244
+                let gap: CGFloat = 12
+                let sideMargin: CGFloat = 8
+                let budget = geo.size.height - topBarH - controlsReserve - gap
+                let byHeight = max(budget / 2, 80)
+                let byWidth = (geo.size.width - 2 * sideMargin) * 3.0 / 4.0
+                let screenH = min(byHeight, byWidth)
+                let screenW = screenH * 4.0 / 3.0
 
-                // Screens sit outside the controller cluster: disjoint touch surfaces, so
-                // the touchscreen and the buttons work at the same time without overlap.
                 VStack(spacing: 0) {
-                    GameScreen(session: session, index: 0, aspect: dsAspect, shell: shell)
-                    hinge
-                    GameScreen(session: session, index: 1, aspect: dsAspect, shell: shell, touch: true)
-                }
-                .padding(.horizontal, 16)
+                    topBar
+                        .frame(height: topBarH)
+                        .padding(.horizontal, 22)
 
-                Spacer(minLength: 12)
+                    Spacer(minLength: 4)
 
-                ControllerCluster(registry: registry, session: session) {
-                    controls
+                    // Screens sit outside the controller cluster: disjoint touch surfaces,
+                    // so the touchscreen and buttons work at once. A small gap keeps the
+                    // two-screen feel without a hinge decoration.
+                    VStack(spacing: gap) {
+                        GameScreen(session: session, index: 0, aspect: dsAspect, shell: shell)
+                            .frame(width: screenW, height: screenH)
+                        GameScreen(session: session, index: 1, aspect: dsAspect, shell: shell, touch: true)
+                            .frame(width: screenW, height: screenH)
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    Spacer(minLength: 4)
+
+                    ControllerCluster(registry: registry, session: session) {
+                        controls
+                    }
+                    .padding(.bottom, 8)
                 }
-                .padding(.bottom, 8)
             }
         }
     }
 
     private var topBar: some View {
-        HStack {
-            ToolbarActionButton(systemImage: "square.and.arrow.down", title: "SAVE", shell: shell, action: onSave)
-            Spacer()
-            RewinDSWordmark(shell: shell, action: onRewind)
-            Spacer()
-            ToolbarActionButton(systemImage: "line.3.horizontal", title: "MENU", shell: shell, action: onMenu)
+        ZStack {
+            RewinDSWordmark(shell: shell, action: onRewind) // stays centered
+            HStack {
+                Spacer()
+                ToolbarActionButton(systemImage: "line.3.horizontal", title: "MENU", shell: shell, action: onMenu)
+            }
         }
-    }
-
-    private var hinge: some View {
-        HStack(spacing: 8) {
-            Rectangle().fill(shell.face.opacity(0.25)).frame(height: 1)
-            Capsule().fill(shell.faceEdge).frame(width: 22, height: 5)
-            Text("MIC")
-                .font(.system(size: 9, weight: .semibold))
-                .tracking(1)
-                .foregroundStyle(shell.caption)
-            Rectangle().fill(shell.face.opacity(0.25)).frame(height: 1)
-        }
-        .padding(.vertical, 10)
     }
 
     private var controls: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 14) {
             HStack {
-                ShoulderKey(button: .l, label: "L", shell: shell, width: 116, height: 40)
+                ShoulderKey(button: .l, label: "L", shell: shell, width: 108, height: 36)
                 Spacer()
-                ShoulderKey(button: .r, label: "R", shell: shell, width: 116, height: 40)
+                ShoulderKey(button: .r, label: "R", shell: shell, width: 108, height: 36)
             }
 
             HStack(alignment: .center) {
-                DPadView(shell: shell, size: 142)
+                DPadView(shell: shell, size: 128)
                 Spacer()
-                DSFaceButtons(shell: shell)
+                DSFaceButtons(shell: shell, diameter: 52, spread: 44)
             }
 
             HStack(spacing: 46) {
                 MiniKey(button: .start, label: "START", shell: shell)
                 MiniKey(button: .select, label: "SELECT", shell: shell)
             }
-            .padding(.top, 2)
         }
         .padding(.horizontal, 26)
     }

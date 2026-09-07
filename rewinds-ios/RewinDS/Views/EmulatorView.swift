@@ -23,11 +23,11 @@ struct EmulatorView: View {
             case .gba:
                 GBALayout(
                     session: session, shell: shell, registry: registry,
-                    onSave: save, onMenu: openMenu)
+                    onMenu: openMenu)
             case .nds:
                 DSLayout(
                     session: session, shell: shell, registry: registry,
-                    onSave: save, onRewind: rewind, onMenu: openMenu)
+                    onRewind: rewind, onMenu: openMenu)
             }
         }
         .overlay(alignment: .bottomLeading) {
@@ -54,19 +54,10 @@ struct EmulatorView: View {
         }
         .overlay {
             if showMenu {
-                PauseMenu(
-                    shell: shell,
-                    onResume: resumeGame,
-                    onSave: { session.saveNow() },
-                    onQuit: { model.exitGame() })
-                .transition(.opacity)
+                GameMenu(shell: shell, session: session, onResume: resumeGame)
+                    .transition(.opacity)
             }
         }
-    }
-
-    private func save() {
-        session.saveNow()
-        flash("Saved")
     }
 
     private func openMenu() {
@@ -91,65 +82,5 @@ struct EmulatorView: View {
             try? await Task.sleep(for: .seconds(1.3))
             withAnimation(.easeOut(duration: 0.25)) { toast = nil }
         }
-    }
-}
-
-/// The in-game pause overlay. Emulation is already frozen by the session while this is
-/// up; tapping the dimmed backdrop or Resume returns to the game.
-private struct PauseMenu: View {
-    let shell: Shell
-    let onResume: () -> Void
-    let onSave: () -> Void
-    let onQuit: () -> Void
-
-    @State private var savedConfirm = false
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.55)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onResume)
-
-            VStack(spacing: 12) {
-                Text("Paused")
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(.white)
-                    .padding(.bottom, 4)
-
-                button("Resume", "play.fill", tint: shell.accent, action: onResume)
-                button(savedConfirm ? "Saved ✓" : "Save", "square.and.arrow.down",
-                       tint: .white.opacity(0.16)) {
-                    onSave()
-                    withAnimation { savedConfirm = true }
-                    Task {
-                        try? await Task.sleep(for: .seconds(1.2))
-                        withAnimation { savedConfirm = false }
-                    }
-                }
-                button("Quit to Library", "rectangle.portrait.and.arrow.right",
-                       tint: .red.opacity(0.85), action: onQuit)
-            }
-            .padding(22)
-            .frame(maxWidth: 300)
-            .background(shell.background, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .strokeBorder(.white.opacity(0.08)))
-            .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
-            .padding(40)
-        }
-    }
-
-    private func button(_ title: String, _ icon: String, tint: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: icon)
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(tint)
-        .foregroundStyle(.white)
     }
 }

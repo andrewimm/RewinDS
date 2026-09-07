@@ -32,16 +32,10 @@ struct RewinDSWordmark: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 1) {
-                Text("NINTENDO DS")
-                    .font(.system(size: 11, weight: .semibold))
-                    .tracking(1.5)
-                    .foregroundStyle(shell.faceLabel)
-                Text("RewinDS")
-                    .font(.system(size: 15, weight: .heavy, design: .rounded))
-                    .foregroundStyle(shell.accent)
-            }
-            .contentShape(Rectangle())
+            Text("RewinDS")
+                .font(.system(size: 16, weight: .heavy, design: .rounded))
+                .foregroundStyle(shell.accent)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }

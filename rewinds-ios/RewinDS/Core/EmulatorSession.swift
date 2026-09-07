@@ -133,13 +133,6 @@ final class EmulatorSession: NSObject, ObservableObject {
     func openMenu() { setPause(.menu, true) }
     func closeMenu() { setPause(.menu, false) }
 
-    /// Write the battery save to disk now (the Save toolbar action).
-    func saveNow() {
-        coreLock.lock()
-        saveStore.flushIfDirty(core, romId: romId)
-        coreLock.unlock()
-    }
-
     /// The current frame count (for the dev HUD); takes the core lock so it's race-free.
     func currentFrame() -> UInt64 {
         coreLock.lock(); defer { coreLock.unlock() }
