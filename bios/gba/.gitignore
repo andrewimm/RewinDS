@@ -1,0 +1,4 @@
+# Build intermediates (see build.sh). gba_bios.bin is checked in.
+bios.o
+extract_text
+extract_text.dSYM/

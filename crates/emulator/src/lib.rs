@@ -177,7 +177,12 @@ impl Emulator {
             .ok_or(LoadError::UnknownConsole)?;
         match console {
             Console::Gba => {
-                let bios = cfg.bios.ok_or(LoadError::MissingBios)?;
+                // A real BIOS image is optional: without one, fall back to the
+                // built-in freely redistributable replacement.
+                let bios: &[u8] = match cfg.bios {
+                    Some(bios) => bios,
+                    None => gba::default_bios(),
+                };
                 let mut system = gba::System::new();
                 system.gba.bus.load_bios(bios);
                 if let Some(rom) = cfg.rom {
@@ -650,15 +655,18 @@ mod tests {
     }
 
     #[test]
-    fn gba_without_bios_is_an_error() {
-        let result = Emulator::load(Load {
+    fn gba_without_bios_falls_back_to_the_builtin() {
+        // No BIOS supplied: the GBA boots on the built-in replacement image.
+        let mut emu = Emulator::load(Load {
             console: Some(Console::Gba),
             rom: None,
             bios: None,
             bios7: None,
             firmware: None,
-        });
-        assert!(matches!(result, Err(LoadError::MissingBios)));
+        })
+        .expect("GBA boots without a supplied BIOS");
+        assert_eq!(emu.console(), Console::Gba);
+        emu.run_frame();
     }
 
     #[test]
