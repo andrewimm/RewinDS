@@ -43,7 +43,8 @@ The `gba` crate embeds it via `gba::default_bios()`.
 - **Boot**: set up the privileged-mode stacks at their documented tops and hand
   off to the cartridge entry point in System / ARM state.
 - **SWI dispatcher**: the full comment-field decode (ARM and Thumb) and
-  jump-table framework. Implemented: `Halt` (0x02), `IntrWait` (0x04),
+  jump-table framework. Implemented: `SoftReset` (0x00), `RegisterRamReset`
+  (0x01), `Halt` (0x02), `IntrWait` (0x04),
   `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
   `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), `CpuFastSet` (0x0C),
   `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F), `BitUnPack` (0x10), `LZ77UnComp`
@@ -87,10 +88,20 @@ real BIOS's own sine table is disassembly-only — so they are not bit-identical
 to it (its address is loaded reloc-free via a same-section label-difference
 literal, since a 512-byte table is out of `adr` range).
 
+`SoftReset` reads the return flag at `0x03007FFA` (0 -> ROM `0x08000000`,
+non-zero -> RAM `0x02000000`), clears the `0x200`-byte BIOS RAM area, re-inits
+the privileged stacks, zeroes r0-r12 and the exception banks, enters System
+mode, and jumps to the target (it never returns). `RegisterRamReset` clears the
+memory areas its flags select (on-board/on-chip WRAM, palette, VRAM, OAM),
+resets the SIO/sound/other I/O register blocks, and always forces the screen
+blank (`DISPCNT = 0x0080`). The on-chip WRAM clear preserves the last `0x200`
+bytes, as documented.
+
 ## Not yet implemented
 
-`SoftReset`/`RegisterRamReset`, the sound-driver SWIs, and the boot logo intro.
-See the crate memory / project notes for the roadmap.
+The sound-driver SWIs (`SoundBias`, `SoundDriver*`, `MidiKey2Freq`, `MultiBoot`),
+`GetBiosChecksum`, and the boot logo intro. See the crate memory / project notes
+for the roadmap.
 
 ## Tests
 

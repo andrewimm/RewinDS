@@ -923,10 +923,125 @@ swi_bg_affine_set:
     .hword -6270, -5897, -5520, -5139, -4756, -4370, -3981, -3590
     .hword -3196, -2801, -2404, -2006, -1606, -1205, -804, -402
 
-@ Reset SWIs are not yet implemented; return as no-ops for now. (SoftReset does
-@ not return on hardware — that behavior comes with the real implementation.)
+@ SWI 0x00 SoftReset. Clears the 0x200-byte BIOS RAM area, re-initialises the
+@ privileged stacks, zeroes r0-r12 and the exception banks, enters System mode,
+@ and jumps to the return address. The 8-bit flag at 0x03007FFA selects it:
+@ 0 -> ROM (0x08000000), non-zero -> RAM (0x02000000), both in ARM state. This
+@ does not return to the caller.
 swi_soft_reset:
-    b swi_return
+    ldr   r1, =0x03007FFA
+    ldrb  r0, [r1]             @ read the return flag before clearing RAM
+    cmp   r0, #0
+    ldreq r10, =0x08000000
+    ldrne r10, =0x02000000     @ r10 = return target (survives the clear)
+    ldr   r1, =0x03007E00
+    mov   r2, #0
+    mov   r3, #0x200
+.Lsr_clear:
+    strb  r2, [r1], #1         @ clear 0x03007E00..0x03007FFF
+    subs  r3, r3, #1
+    bne   .Lsr_clear
+    msr   cpsr_c, #0xD2        @ IRQ mode: stack, LR_irq = 0, SPSR_irq = 0
+    ldr   sp, =0x03007FA0
+    mov   lr, #0
+    msr   spsr_fsxc, lr
+    msr   cpsr_c, #0xD3        @ Supervisor mode: stack, LR_svc = 0, SPSR_svc = 0
+    ldr   sp, =0x03007FE0
+    mov   lr, #0
+    msr   spsr_fsxc, lr
+    msr   cpsr_c, #0xDF        @ System mode
+    ldr   sp, =0x03007F00
+    mov   lr, r10             @ return address into LR, then zero r0-r12
+    mov   r0, #0
+    mov   r1, #0
+    mov   r2, #0
+    mov   r3, #0
+    mov   r4, #0
+    mov   r5, #0
+    mov   r6, #0
+    mov   r7, #0
+    mov   r8, #0
+    mov   r9, #0
+    mov   r10, #0
+    mov   r11, #0
+    mov   r12, #0
+    bx    lr
+    .pool
+
+@ Clear words in [r4, r5) to zero (r6 must hold 0), inline (a BL to a local
+@ label would emit a relocation). Used for both the RAM areas and I/O blocks.
+.macro CLEAR_RANGE
+.Lcr\@:
+    cmp   r4, r5
+    strlo r6, [r4], #4
+    blo   .Lcr\@
+.endm
+
+@ SWI 0x01 RegisterRamReset. Clears the memory areas and resets the I/O register
+@ blocks selected by the flags in r0, and always forces the screen blank
+@ (DISPCNT = 0x0080). No return value.
+@   r0 bit0 256K WRAM, bit1 32K WRAM (minus last 0x200), bit2 palette,
+@      bit3 VRAM, bit4 OAM, bit5 SIO regs, bit6 sound regs, bit7 other regs.
 swi_reg_ram_reset:
-    b swi_return
+    stmfd sp!, {r4, r5, r6}
+    mov   r6, #0
+    tst   r0, #0x01            @ 256K on-board WRAM
+    beq   .Lrrr_1
+    ldr   r4, =0x02000000
+    ldr   r5, =0x02040000
+    CLEAR_RANGE
+.Lrrr_1:
+    tst   r0, #0x02            @ 32K on-chip WRAM, excluding the last 0x200 bytes
+    beq   .Lrrr_2
+    ldr   r4, =0x03000000
+    ldr   r5, =0x03007E00
+    CLEAR_RANGE
+.Lrrr_2:
+    tst   r0, #0x04            @ palette
+    beq   .Lrrr_3
+    ldr   r4, =0x05000000
+    ldr   r5, =0x05000400
+    CLEAR_RANGE
+.Lrrr_3:
+    tst   r0, #0x08            @ VRAM
+    beq   .Lrrr_4
+    ldr   r4, =0x06000000
+    ldr   r5, =0x06018000
+    CLEAR_RANGE
+.Lrrr_4:
+    tst   r0, #0x10            @ OAM
+    beq   .Lrrr_5
+    ldr   r4, =0x07000000
+    ldr   r5, =0x07000400
+    CLEAR_RANGE
+.Lrrr_5:
+    tst   r0, #0x20            @ SIO registers
+    beq   .Lrrr_6
+    ldr   r4, =0x04000120
+    ldr   r5, =0x04000130
+    CLEAR_RANGE
+.Lrrr_6:
+    tst   r0, #0x40            @ sound registers
+    beq   .Lrrr_7
+    ldr   r4, =0x04000060
+    ldr   r5, =0x040000A8
+    CLEAR_RANGE
+.Lrrr_7:
+    tst   r0, #0x80            @ other registers (display, DMA, timers, IRQ)
+    beq   .Lrrr_blank
+    ldr   r4, =0x04000000
+    ldr   r5, =0x04000058
+    CLEAR_RANGE
+    ldr   r4, =0x040000B0
+    ldr   r5, =0x04000110
+    CLEAR_RANGE
+    ldr   r4, =0x04000200
+    ldr   r5, =0x0400020C
+    CLEAR_RANGE
+.Lrrr_blank:
+    ldr   r4, =0x04000000      @ always force blank: DISPCNT = 0x0080
+    mov   r5, #0x80
+    strh  r5, [r4]
+    ldmfd sp!, {r4, r5, r6}
+    b     swi_return
     .pool

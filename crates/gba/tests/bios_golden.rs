@@ -864,6 +864,108 @@ fn bg_affine_set_computes_matrix_and_start() {
     }
 }
 
+// --- SoftReset (0x00) / RegisterRamReset (0x01) ----------------------------
+
+#[test]
+fn soft_reset_returns_to_rom_and_clears_state() {
+    let mut sys = booted(gba::default_bios());
+    // Dirty the BIOS RAM area and the general registers; flag 0 -> return to ROM.
+    sys.gba.bus.memory.iwram[0x7E00] = 0xAA;
+    sys.gba.bus.memory.iwram[0x7FFC] = 0xBB;
+    sys.gba.bus.memory.iwram[0x7FFA] = 0x00;
+    for i in 0..13 {
+        sys.cpu.set_register(i, 0xDEAD_0000 + i as u32);
+    }
+    put_iwram(&mut sys, 0x0300_0000, &[0xEF00_0000, 0xEAFF_FFFE]); // swi #0 ; b .
+    sys.cpu.set_pc(0x0300_0000);
+    let mut reached = false;
+    for _ in 0..2000 {
+        if in_rom(sys.cpu.register(15)) {
+            reached = true;
+            break;
+        }
+        sys.step();
+    }
+    assert!(reached, "SoftReset did not jump to the ROM entry");
+    assert_eq!(sys.cpu.mode(), Some(Mode::System));
+    assert_eq!(sys.cpu.register(13), SP_USR, "SP_usr");
+    for i in 0..13 {
+        assert_eq!(sys.cpu.register(i), 0, "r{i} zeroed");
+    }
+    assert_eq!(sys.gba.bus.memory.iwram[0x7E00], 0, "BIOS RAM cleared");
+    assert_eq!(sys.gba.bus.memory.iwram[0x7FFC], 0, "BIOS RAM cleared");
+}
+
+#[test]
+fn soft_reset_to_ram_enters_at_ewram() {
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, 0, &[0xEAFF_FFFE]); // b . at 0x02000000
+    sys.gba.bus.memory.iwram[0x7FFA] = 0x01; // flag non-zero -> return to RAM
+    put_iwram(&mut sys, 0x0300_0000, &[0xEF00_0000, 0xEAFF_FFFE]);
+    sys.cpu.set_pc(0x0300_0000);
+    let mut reached = false;
+    for _ in 0..2000 {
+        if sys.cpu.register(15) == 0x0200_0000 {
+            reached = true;
+            break;
+        }
+        sys.step();
+    }
+    assert!(reached, "SoftReset did not enter RAM");
+    assert_eq!(sys.cpu.mode(), Some(Mode::System));
+}
+
+#[test]
+fn register_ram_reset_clears_ewram_and_forces_blank() {
+    let mut sys = booted(gba::default_bios());
+    put_ewram(&mut sys, 0, &[0xDEAD_BEEF; 8]);
+    put_ewram(&mut sys, 0x3_FFFC, &[0x1234_5678]); // last word of the 256K region
+    sys.gba.bus.io.video.write_dispcnt(0x1234);
+    invoke_swi(&mut sys, 0x01, 0x01, 0); // r0 = flags: clear on-board WRAM
+    assert!(run_until_swi_returns(&mut sys, 500_000));
+    assert_eq!(ewram_word(&sys, 0), 0);
+    assert_eq!(ewram_word(&sys, 0x3_FFFC), 0);
+    assert_eq!(sys.gba.bus.io.video.read_dispcnt(), 0x0080, "forced blank");
+}
+
+#[test]
+fn register_ram_reset_clears_iwram_but_preserves_the_last_512_bytes() {
+    let mut sys = booted(gba::default_bios());
+    // Run the invoking stub from EWRAM so clearing IWRAM does not erase it.
+    sys.gba.bus.memory.iwram[0x0100] = 0xAA; // cleared
+    sys.gba.bus.memory.iwram[0x7F00] = 0xBB; // in the excluded last 0x200 bytes
+    put_ewram(&mut sys, 0x100, &[0xEF01_0000, 0xEAFF_FFFE]); // swi #1 ; b .
+    sys.cpu.set_register(0, 0x02); // clear on-chip WRAM
+    sys.cpu.set_pc(0x0200_0100);
+    let mut returned = false;
+    for _ in 0..500_000 {
+        if sys.cpu.register(15) == 0x0200_0104 {
+            returned = true;
+            break;
+        }
+        sys.step();
+    }
+    assert!(returned, "RegisterRamReset did not return");
+    assert_eq!(sys.gba.bus.memory.iwram[0x0100], 0, "IWRAM cleared");
+    assert_eq!(sys.gba.bus.memory.iwram[0x7F00], 0xBB, "last 0x200 bytes preserved");
+}
+
+#[test]
+fn register_ram_reset_clears_palette_vram_and_oam() {
+    let mut sys = booted(gba::default_bios());
+    sys.gba.bus.memory.palette[0] = 0xFF;
+    sys.gba.bus.memory.palette[0x3FF] = 0xFF;
+    sys.gba.bus.memory.vram[0] = 0xFF;
+    sys.gba.bus.memory.vram[0x17FFF] = 0xFF;
+    sys.gba.bus.memory.oam[0] = 0xFF;
+    sys.gba.bus.memory.oam[0x3FF] = 0xFF;
+    invoke_swi(&mut sys, 0x01, 0x04 | 0x08 | 0x10, 0); // palette + VRAM + OAM
+    assert!(run_until_swi_returns(&mut sys, 500_000));
+    assert!(sys.gba.bus.memory.palette.iter().all(|&b| b == 0), "palette cleared");
+    assert!(sys.gba.bus.memory.vram.iter().all(|&b| b == 0), "VRAM cleared");
+    assert!(sys.gba.bus.memory.oam.iter().all(|&b| b == 0), "OAM cleared");
+}
+
 // --- Opt-in: equivalence against a real BIOS -------------------------------
 
 fn real_bios() -> Option<Vec<u8>> {
