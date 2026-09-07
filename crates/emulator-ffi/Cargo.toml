@@ -1,0 +1,15 @@
+[package]
+name = "emulator-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "extern-C boundary over the emulator facade, packaged as a static library for native hosts (the iOS app today)"
+
+[lib]
+# The C boundary is the host boundary: a native app links the static archive and
+# calls the `rewinds_*` symbols. `staticlib` is what an iOS XCFramework wraps;
+# `cdylib` lets a desktop host `dlopen` the same surface.
+name = "rewinds_core"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+emulator = { path = "../emulator" }

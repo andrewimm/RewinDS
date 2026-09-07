@@ -14,3 +14,14 @@ docs/
 
 # One-off / local scripts (not part of any checked-in library)
 scratch/
+
+# iOS app: generated project + build artifacts (regenerate with xcodegen / build-core.sh)
+rewinds-ios/*.xcodeproj/
+rewinds-ios/Frameworks/RewindsCore.xcframework/
+rewinds-ios/build/
+rewinds-ios/DerivedData/
+*.xcuserstate
+
+# Copyrighted BIOS/firmware and local test ROMs the developer drops in (never committed)
+rewinds-ios/dev-assets/*
+!rewinds-ios/dev-assets/README.md
