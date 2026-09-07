@@ -25,3 +25,6 @@ rewinds-ios/DerivedData/
 # Copyrighted BIOS/firmware and local test ROMs the developer drops in (never committed)
 rewinds-ios/dev-assets/*
 !rewinds-ios/dev-assets/README.md
+
+# Local signing override (your Apple Developer Team ID) — never committed
+rewinds-ios/Signing.local.xcconfig

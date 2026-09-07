@@ -15,10 +15,15 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
-    # Fill in a team to build for a physical device; the simulator needs none.
-    DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "1"
+
+# Device signing: Signing.xcconfig (committed, no Team ID) optionally includes
+# Signing.local.xcconfig (gitignored) where you put `DEVELOPMENT_TEAM = <your id>`, so no
+# Team ID lands in source control. The simulator needs no team.
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
 
 targets:
   RewinDS:

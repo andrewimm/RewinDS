@@ -1,0 +1,6 @@
+// Committed base signing config — no Team ID here.
+// To build for a device, create Signing.local.xcconfig (gitignored) next to this file:
+//     DEVELOPMENT_TEAM = YOUR_TEAM_ID
+// The simulator needs no team, so an absent local override is fine.
+DEVELOPMENT_TEAM =
+#include? "Signing.local.xcconfig"
