@@ -116,9 +116,9 @@ swi_table:
     b swi_vblank_intr_wait  @ 0x05 VBlankIntrWait
     b swi_div               @ 0x06 Div
     b swi_div_arm           @ 0x07 DivArm
-    b swi_stub              @ 0x08 Sqrt
-    b swi_stub              @ 0x09 ArcTan
-    b swi_stub              @ 0x0A ArcTan2
+    b swi_sqrt              @ 0x08 Sqrt
+    b swi_arc_tan           @ 0x09 ArcTan
+    b swi_arc_tan2          @ 0x0A ArcTan2
     b swi_cpu_set           @ 0x0B CpuSet
     b swi_cpu_fast_set      @ 0x0C CpuFastSet
     b swi_stub              @ 0x0D GetBiosChecksum
@@ -348,6 +348,129 @@ swi_cpu_fast_set:
     subs  r3, r3, #1
     bne   .Lcfs_fill_loop
     b     swi_return
+
+@ SWI 0x08 Sqrt: unsigned integer square root, floor(sqrt(r0)).
+@   in:  r0 = unsigned 32-bit number
+@   out: r0 = unsigned 16-bit result
+@ Standard restoring bit-by-bit method (res, bit, remainder).
+swi_sqrt:
+    mov   r1, #0               @ result
+    mov   r2, #0x40000000      @ bit = 1 << 30
+.Lsqrt_align:
+    cmp   r2, r0               @ shrink bit down to <= n
+    bls   .Lsqrt_loop
+    movs  r2, r2, lsr #2
+    bne   .Lsqrt_align
+.Lsqrt_loop:
+    cmp   r2, #0
+    beq   .Lsqrt_done
+    add   r3, r1, r2           @ res + bit
+    cmp   r0, r3
+    bhs   .Lsqrt_setbit
+    mov   r1, r1, lsr #1       @ res >>= 1
+    b     .Lsqrt_shift
+.Lsqrt_setbit:
+    sub   r0, r0, r3           @ n -= res + bit
+    add   r1, r2, r1, lsr #1   @ res = (res >> 1) + bit
+.Lsqrt_shift:
+    mov   r2, r2, lsr #2       @ bit >>= 2
+    b     .Lsqrt_loop
+.Lsqrt_done:
+    mov   r0, r1
+    b     swi_return
+
+@ SWI 0x09 ArcTan: arctangent of a 1.14 signed fixed-point tangent.
+@   in:  r0 = tan (bit15 sign, bit14 integer, bits13-0 fraction)
+@   out: r0 = angle in 0xC000..0x4000 (-PI/2..PI/2), full circle = 0x10000
+@ atan(t) = atan2(t, 1.0); 1.0 is 0x4000 in 1.14. See .Lcordic.
+swi_arc_tan:
+    mov   r1, r0, lsl #16
+    mov   r1, r1, asr #16      @ y = sign-extended tangent
+    mov   r0, #0x4000          @ x = 1.0 (1.14)
+    adr   lr, .Lat_ret         @ (BL to a local label emits a relocation; set LR
+    b     .Lcordic             @  by hand and branch so .text stays relocatable)
+.Lat_ret:
+    mov   r0, r0, lsl #16
+    mov   r0, r0, lsr #16      @ present as 16-bit (negatives wrap to 0xC000..)
+    b     swi_return
+
+@ SWI 0x0A ArcTan2: full-circle arctangent of a 1.14 signed vector.
+@   in:  r0 = X, r1 = Y (both bit15 sign, bit14 integer, bits13-0 fraction)
+@   out: r0 = angle 0x0000..0xFFFF for 0 <= THETA < 2*PI
+@ The CORDIC core needs X > 0; fold the X < 0 half-plane by rotating PI, and
+@ handle the X == 0 axis explicitly.
+swi_arc_tan2:
+    mov   r0, r0, lsl #16
+    mov   r0, r0, asr #16      @ sign-extend X
+    mov   r1, r1, lsl #16
+    mov   r1, r1, asr #16      @ sign-extend Y
+    cmp   r0, #0
+    bgt   .Lat2_call           @ X > 0: CORDIC directly
+    blt   .Lat2_negx           @ X < 0: rotate by PI
+    @ X == 0: +PI/2, -PI/2, or 0 on the Y sign
+    cmp   r1, #0
+    moveq r0, #0
+    beq   .Lat2_finish
+    movgt r0, #0x4000
+    bgt   .Lat2_finish
+    mov   r0, #0xC000
+    b     .Lat2_finish
+.Lat2_negx:
+    rsb   r0, r0, #0           @ X = -X
+    rsb   r1, r1, #0           @ Y = -Y
+    adr   lr, .Lat2_negx_ret
+    b     .Lcordic
+.Lat2_negx_ret:
+    add   r0, r0, #0x8000      @ + PI
+    b     .Lat2_finish
+.Lat2_call:
+    adr   lr, .Lat2_finish     @ CORDIC returns straight into the finish path
+    b     .Lcordic
+.Lat2_finish:
+    mov   r0, r0, lsl #16
+    mov   r0, r0, lsr #16      @ present as 16-bit 0x0000..0xFFFF
+    b     swi_return
+
+@ CORDIC vectoring core (internal, reached by BL). Computes the signed 16-bit
+@ angle atan2(y, x) for x > 0. Vectoring mode accumulates angle regardless of
+@ magnitude scaling, so no gain correction is needed; the table entries are the
+@ pure constants round(atan(2^-i) * 0x10000 / 2PI). Preserves LR.
+@   in:  r0 = x (signed, must be > 0), r1 = y (signed)
+@   out: r0 = angle (signed)
+.Lcordic:
+    cmp   r1, #0
+    moveq r0, #0
+    bxeq  lr                   @ y == 0 -> angle 0
+    stmfd sp!, {r4, r5, r6}
+    mov   r2, #0               @ angle accumulator
+    mov   r4, #0               @ iteration i
+    adr   r5, .Lcordic_table
+.Lcordic_loop:
+    ldr   r6, [r5, r4, lsl #2] @ atan_table[i]
+    cmp   r6, #0               @ remaining entries are 0: converged
+    beq   .Lcordic_done
+    mov   r3, r0               @ old x
+    cmp   r1, #0
+    ble   .Lcordic_neg
+    add   r0, r0, r1, asr r4   @ x += y >> i
+    sub   r1, r1, r3, asr r4   @ y -= oldx >> i
+    add   r2, r2, r6           @ angle += table[i]
+    b     .Lcordic_next
+.Lcordic_neg:
+    sub   r0, r0, r1, asr r4   @ x -= y >> i
+    add   r1, r1, r3, asr r4   @ y += oldx >> i
+    sub   r2, r2, r6           @ angle -= table[i]
+.Lcordic_next:
+    add   r4, r4, #1
+    cmp   r4, #16
+    blo   .Lcordic_loop
+.Lcordic_done:
+    mov   r0, r2
+    ldmfd sp!, {r4, r5, r6}
+    bx    lr
+.Lcordic_table:
+    .word 0x2000, 0x12E4, 0x09FB, 0x0511, 0x028B, 0x0146, 0x00A3, 0x0051
+    .word 0x0029, 0x0014, 0x000A, 0x0005, 0x0003, 0x0001, 0x0001, 0x0000
 
 @ Reset SWIs are not yet implemented; return as no-ops for now. (SoftReset does
 @ not return on hardware — that behavior comes with the real implementation.)

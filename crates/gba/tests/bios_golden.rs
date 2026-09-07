@@ -417,6 +417,84 @@ fn cpu_set_rejects_a_bios_source() {
     }
 }
 
+// --- Sqrt (0x08) / ArcTan (0x09) / ArcTan2 (0x0A) --------------------------
+
+/// Exact floor(sqrt(n)) reference.
+fn isqrt(n: u32) -> u32 {
+    let mut x = (n as f64).sqrt() as u64;
+    while (x + 1) * (x + 1) <= n as u64 {
+        x += 1;
+    }
+    while x * x > n as u64 {
+        x -= 1;
+    }
+    x as u32
+}
+
+/// Radians → the GBA's 16-bit angle unit (full circle = 0x10000).
+fn angle16(rad: f64) -> u16 {
+    let u = (rad / std::f64::consts::TAU * 65536.0).round() as i64;
+    (u & 0xFFFF) as u16
+}
+
+/// Signed circular distance between two 16-bit angles.
+fn circ_diff(a: u16, b: u16) -> i32 {
+    (a.wrapping_sub(b) as i16) as i32
+}
+
+#[test]
+fn sqrt_matches_integer_sqrt() {
+    let cases = [
+        0u32, 1, 2, 3, 4, 8, 15, 16, 17, 99, 255, 256, 1000, 65535, 65536, 123_456_789,
+        0x4000_0000, 0x7FFF_FFFF, 0xFFFF_FFFF,
+    ];
+    for n in cases {
+        let (r, _, _) = run_swi(gba::default_bios(), 0x08, n, 0);
+        assert_eq!(r, isqrt(n), "sqrt({n})");
+    }
+}
+
+#[test]
+fn arctan_approximates_arctangent() {
+    // ArcTan input is 1.14 fixed-point tangent. Our CORDIC result should track
+    // the true arctangent to within a couple of angle units.
+    const TOL: i32 = 8;
+    let tans: [i16; 11] =
+        [0, 0x0800, -0x0800, 0x1000, -0x1000, 0x2000, -0x2000, 0x4000, -0x4000, 0x6000, 0x7FFF];
+    for t in tans {
+        let (r, _, _) = run_swi(gba::default_bios(), 0x09, (t as u16) as u32, 0);
+        let want = angle16((t as f64 / 16384.0).atan());
+        let d = circ_diff(r as u16, want).abs();
+        assert!(d <= TOL, "arctan({t}): got {:#06X} want ~{:#06X} (off {d})", r, want);
+    }
+}
+
+#[test]
+fn arctan2_covers_the_full_circle() {
+    const TOL: i32 = 8;
+    // 1.0 = 0x4000 in 1.14; the eight octants plus a few off-axis vectors.
+    let vecs: [(i16, i16); 12] = [
+        (0x4000, 0),
+        (0x4000, 0x4000),
+        (0, 0x4000),
+        (-0x4000, 0x4000),
+        (-0x4000, 0),
+        (-0x4000, -0x4000),
+        (0, -0x4000),
+        (0x4000, -0x4000),
+        (0x4000, 0x2000),
+        (0x2000, 0x4000),
+        (-0x4000, 0x2000),
+        (0x4000, -0x2000),
+    ];
+    for (x, y) in vecs {
+        let (r, _, _) = run_swi(gba::default_bios(), 0x0A, (x as u16) as u32, (y as u16) as u32);
+        let want = angle16((y as f64).atan2(x as f64));
+        let d = circ_diff(r as u16, want).abs();
+        assert!(d <= TOL, "atan2({y},{x}): got {:#06X} want ~{:#06X} (off {d})", r, want);
+    }
+}
+
 // --- Opt-in: equivalence against a real BIOS -------------------------------
 
 fn real_bios() -> Option<Vec<u8>> {
@@ -463,6 +541,25 @@ fn cpu_set_matches_real_bios() {
     };
     assert_eq!(copy(gba::default_bios()), copy(&real));
     assert_eq!(copy(gba::default_bios()), src.to_vec());
+}
+
+#[test]
+fn sqrt_matches_real_bios() {
+    let (Some(real), Some(rom)) = (real_bios(), real_rom()) else {
+        eprintln!("skipping: set REWINDS_BIOS and REWINDS_ROM to run this");
+        return;
+    };
+    // Sqrt is an exact integer function, so it can match bit-for-bit. (ArcTan and
+    // ArcTan2 are deliberately independent approximations — see the always-run
+    // tests — so they are not compared against the real BIOS here.)
+    let cases = [0u32, 2, 15, 16, 255, 65535, 0xDEAD_BEEF, 0xFFFF_FFFF];
+    for n in cases {
+        let mut ours = booted_with_rom(gba::default_bios(), rom.clone());
+        let mut theirs = booted_with_rom(&real, rom.clone());
+        let a = run_swi_on(&mut ours, 0x08, n, 0).0;
+        let b = run_swi_on(&mut theirs, 0x08, n, 0).0;
+        assert_eq!(a, b, "sqrt({n}): ours {a} vs real {b}");
+    }
 }
 
 #[test]

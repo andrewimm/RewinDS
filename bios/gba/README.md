@@ -44,8 +44,9 @@ The `gba` crate embeds it via `gba::default_bios()`.
   off to the cartridge entry point in System / ARM state.
 - **SWI dispatcher**: the full comment-field decode (ARM and Thumb) and
   jump-table framework. Implemented: `Halt` (0x02), `IntrWait` (0x04),
-  `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `CpuSet` (0x0B), and
-  `CpuFastSet` (0x0C). Every other SWI currently returns as a no-op.
+  `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
+  `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), and `CpuFastSet` (0x0C).
+  Every other SWI currently returns as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
@@ -60,11 +61,18 @@ SWI return.
 reaches into the BIOS area, as the GBA does. `CpuFastSet` moves words rather than
 literal 8-word blocks — the result is byte-identical.
 
+`Sqrt` is an exact integer square root (bit-identical to a real BIOS). `ArcTan`
+and `ArcTan2` are **independent CORDIC approximations** derived from first
+principles — the docs specify only the interface and note the real BIOS's own
+inaccuracy, and its polynomial constants live only in the disassembly (off
+limits). They meet the documented range/format and track the true angle to
+within a few units, but are *not* bit-identical to the real BIOS. CORDIC's angle
+table holds the pure constants `round(atan(2^-i) * 0x10000 / 2PI)`.
+
 ## Not yet implemented
 
-`SoftReset`/`RegisterRamReset`, the remaining arithmetic (`Sqrt`, `ArcTan*`),
-decompression, and affine SWIs, plus the boot logo intro. See the crate memory /
-project notes for the roadmap.
+`SoftReset`/`RegisterRamReset`, decompression, and affine SWIs, plus the boot
+logo intro. See the crate memory / project notes for the roadmap.
 
 ## Tests
 
