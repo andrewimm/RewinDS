@@ -1,0 +1,41 @@
+# Continuous integration: workspace tests, clippy, and a guard that the
+# committed GBA BIOS image stays in sync with its assembly source.
+#
+# Runs on macOS: the desktop host (`rewinds`) uses native audio/window backends
+# (cpal + minifb) that need no extra system packages there, and the BIOS is
+# reassembled with the same Apple clang family that produced the committed image
+# (clang's exact encoding can vary between toolchains, so a byte diff is only
+# meaningful against a matching one).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo test
+        run: cargo test --workspace
+
+  clippy:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  bios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild the GBA BIOS and verify it matches the committed image
+        run: |
+          bash bios/gba/build.sh
+          git diff --exit-code bios/gba/gba_bios.bin \
+            || { echo "::error::gba_bios.bin is stale — run bios/gba/build.sh and commit the result"; exit 1; }

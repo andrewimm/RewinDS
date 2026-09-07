@@ -7,7 +7,7 @@ use emulator::{Console, Emulator, Load};
 fn nonwhite_fraction(rgba: &[u8]) -> f32 {
     let mut nonwhite = 0usize;
     let px = rgba.len() / 4;
-    for c in rgba.chunks_exact(4) {
+    for c in rgba.as_chunks::<4>().0 {
         // "White" = all three channels near max.
         if !(c[0] > 240 && c[1] > 240 && c[2] > 240) {
             nonwhite += 1;
@@ -371,9 +371,7 @@ fn main() {
         // iterations — directly comparable to desmume's transition log.
         // Long boot-progress monitor: is HeartGold still advancing (new non-poll IPC
         // transitions appearing) or plateaued at a later stall?
-        let mut loopn = 0u64;
         let mut trans = 0u64;
-        let mut last: u32 = 0;
         for i in 0..15000u32 {
             emu.run_frame();
             let nds = emu.as_nds_mut().unwrap();
@@ -382,11 +380,9 @@ fn main() {
                     continue;
                 }
                 if (core == 0 && value == 0x1ab) || (core == 1 && value == 0x6b) {
-                    loopn += 1;
                     continue;
                 }
                 trans += 1;
-                last = value;
                 if std::env::var_os("IPCSEQ").is_some() && trans <= 60 {
                     let c = if core == 0 { 9 } else { 7 };
                     println!("IPC {c} {value:08X}  (#{trans})");

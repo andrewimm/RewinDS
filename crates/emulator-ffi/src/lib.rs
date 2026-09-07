@@ -586,9 +586,9 @@ mod tests {
         unsafe { rewinds_destroy(emu) };
     }
 
-    /// A GBA load with no BIOS reports the mapped error code and returns null.
+    /// A GBA load with no BIOS succeeds on the built-in replacement BIOS.
     #[test]
-    fn gba_without_bios_reports_error_code() {
+    fn gba_without_bios_uses_the_builtin() {
         let cfg = RewindsLoad {
             console: REWINDS_CONSOLE_GBA,
             rom: null(),
@@ -600,10 +600,11 @@ mod tests {
             firmware: null(),
             firmware_len: 0,
         };
-        let mut err = REWINDS_OK;
+        let mut err = REWINDS_ERR_MISSING_BIOS; // sentinel: load should overwrite with OK
         let emu = unsafe { rewinds_load(&cfg, &mut err) };
-        assert!(emu.is_null());
-        assert_eq!(err, REWINDS_ERR_MISSING_BIOS);
+        assert!(!emu.is_null());
+        assert_eq!(err, REWINDS_OK);
+        unsafe { rewinds_destroy(emu) };
     }
 
     /// Null handles are inert everywhere (no panic, sane defaults).

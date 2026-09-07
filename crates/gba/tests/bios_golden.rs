@@ -4,10 +4,9 @@
 //!   1. Always-run checks that our BIOS obeys the *documented* contract (GBATEK):
 //!      boot hand-off state, the Div/DivArm/Halt SWIs, and IRQ forwarding.
 //!   2. Opt-in equivalence checks that run the *same* scenarios on a real BIOS
-//!      and compare observable results. These need images the repo can't ship:
-//!        REWINDS_BIOS=/path/to/gba_bios.bin   (a real BIOS)
-//!        REWINDS_ROM=/path/to/game.gba        (a real ROM, for boot hand-off)
-//!      Expected behavior is derived from the docs, never by disassembling the
+//!      and compare observable results. These need images the repo can't ship
+//!      (`REWINDS_BIOS=/path/to/gba_bios.bin`, `REWINDS_ROM=/path/to/game.gba`);
+//!      expected behavior is derived from the docs, never by disassembling the
 //!      commercial BIOS — the real image is exercised only as a black box.
 
 use arm::cpu::Mode;
@@ -608,7 +607,7 @@ fn ref_rle(src: &[u8]) -> Vec<u8> {
             let n = (f & 0x7F) as usize + 3;
             let byte = src[i];
             i += 1;
-            out.extend(std::iter::repeat(byte).take(n));
+            out.extend(std::iter::repeat_n(byte, n));
         } else {
             let n = (f & 0x7F) as usize + 1;
             out.extend_from_slice(&src[i..i + n]);
@@ -667,7 +666,7 @@ fn ref_bit_unpack(src: &[u8], srcw: u32, dstw: u32, offset: u32, zeroflag: bool)
 
 fn ref_huff(src: &[u8]) -> Vec<u8> {
     let header = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-    let datasize = (header & 0xF) as u32;
+    let datasize = header & 0xF;
     let total = (header >> 8) as usize;
     let treesize = src[4] as usize;
     let tree_base = 4usize;
@@ -1029,8 +1028,10 @@ fn get_bios_checksum_sums_the_image() {
     // inside the BIOS, so the read-protection returns the real bytes. We return
     // our own image's checksum (a real BIOS would give 0xBAAE187F).
     let expected = gba::default_bios()
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .fold(0u32, |a, w| a.wrapping_add(w));
     let mut sys = booted(gba::default_bios());
     invoke_swi(&mut sys, 0x0D, 0, 0);
