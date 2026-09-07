@@ -257,6 +257,18 @@ fn ewram_half(sys: &System, off: usize) -> u16 {
     u16::from_le_bytes(sys.gba.bus.memory.ewram[off..off + 2].try_into().unwrap())
 }
 
+fn put_ewram_bytes(sys: &mut System, off: usize, bytes: &[u8]) {
+    sys.gba.bus.memory.ewram[off..off + bytes.len()].copy_from_slice(bytes);
+}
+
+fn ewram_bytes(sys: &System, off: usize, len: usize) -> Vec<u8> {
+    sys.gba.bus.memory.ewram[off..off + len].to_vec()
+}
+
+fn ewram_halfs(sys: &System, off: usize, count: usize) -> Vec<u16> {
+    (0..count).map(|i| ewram_half(sys, off + i * 2)).collect()
+}
+
 /// Step until control returns to the instruction after the SWI stub.
 fn run_until_swi_returns(sys: &mut System, budget: u32) -> bool {
     for _ in 0..budget {
@@ -495,6 +507,269 @@ fn arctan2_covers_the_full_circle() {
     }
 }
 
+// --- Decompressors (0x10 BitUnPack, 0x11/0x12 LZ77, 0x14/0x15 RLE,
+//     0x16/0x17 Diff8, 0x18 Diff16) --------------------------------------------
+//
+// Trusted reference decoders (kept deliberately simple) decode the same crafted
+// input the BIOS is given; the BIOS output must match them byte-for-byte.
+
+fn header_size(src: &[u8]) -> usize {
+    (u32::from_le_bytes([src[0], src[1], src[2], src[3]]) >> 8) as usize
+}
+
+fn ref_lz77(src: &[u8]) -> Vec<u8> {
+    let size = header_size(src);
+    let mut out = Vec::new();
+    let mut i = 4;
+    while out.len() < size {
+        let flags = src[i];
+        i += 1;
+        for b in 0..8 {
+            if out.len() >= size {
+                break;
+            }
+            if flags & (0x80 >> b) != 0 {
+                let (b0, b1) = (src[i], src[i + 1]);
+                i += 2;
+                let len = (b0 >> 4) as usize + 3;
+                let disp = ((((b0 & 0xF) as usize) << 8) | b1 as usize) + 1;
+                for _ in 0..len {
+                    if out.len() >= size {
+                        break;
+                    }
+                    let c = out[out.len() - disp];
+                    out.push(c);
+                }
+            } else {
+                out.push(src[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn ref_rle(src: &[u8]) -> Vec<u8> {
+    let size = header_size(src);
+    let mut out = Vec::new();
+    let mut i = 4;
+    while out.len() < size {
+        let f = src[i];
+        i += 1;
+        if f & 0x80 != 0 {
+            let n = (f & 0x7F) as usize + 3;
+            let byte = src[i];
+            i += 1;
+            out.extend(std::iter::repeat(byte).take(n));
+        } else {
+            let n = (f & 0x7F) as usize + 1;
+            out.extend_from_slice(&src[i..i + n]);
+            i += n;
+        }
+    }
+    out.truncate(size);
+    out
+}
+
+fn ref_diff8(src: &[u8]) -> Vec<u8> {
+    let size = header_size(src);
+    let mut acc = 0u8;
+    (0..size)
+        .map(|k| {
+            acc = acc.wrapping_add(src[4 + k]);
+            acc
+        })
+        .collect()
+}
+
+fn ref_diff16(src: &[u8]) -> Vec<u16> {
+    let n = header_size(src) / 2;
+    let mut acc = 0u16;
+    (0..n)
+        .map(|k| {
+            let d = u16::from_le_bytes([src[4 + k * 2], src[4 + k * 2 + 1]]);
+            acc = acc.wrapping_add(d);
+            acc
+        })
+        .collect()
+}
+
+fn ref_bit_unpack(src: &[u8], srcw: u32, dstw: u32, offset: u32, zeroflag: bool) -> Vec<u32> {
+    let mut words = Vec::new();
+    let (mut outbuf, mut outbits) = (0u32, 0u32);
+    let mask = (1u32 << srcw) - 1;
+    for &byte in src {
+        let (mut b, mut avail) = (byte as u32, 8i32);
+        while avail > 0 {
+            let unit = b & mask;
+            b >>= srcw;
+            avail -= srcw as i32;
+            let val = if unit != 0 || zeroflag { unit + offset } else { unit };
+            outbuf |= val << outbits;
+            outbits += dstw;
+            if outbits == 32 {
+                words.push(outbuf);
+                outbuf = 0;
+                outbits = 0;
+            }
+        }
+    }
+    words
+}
+
+fn ref_huff(src: &[u8]) -> Vec<u8> {
+    let header = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+    let datasize = (header & 0xF) as u32;
+    let total = (header >> 8) as usize;
+    let treesize = src[4] as usize;
+    let tree_base = 4usize;
+    let root = tree_base + 1;
+    let mut bs = tree_base + (treesize + 1) * 2;
+    let mask = (1u32 << datasize) - 1;
+    let mut node = root;
+    let (mut outbuf, mut outbits) = (0u32, 0u32);
+    let (mut word, mut bitcount) = (0u32, 0u32);
+    let mut out: Vec<u8> = Vec::new();
+    while out.len() < total {
+        if bitcount == 0 {
+            word = u32::from_le_bytes([src[bs], src[bs + 1], src[bs + 2], src[bs + 3]]);
+            bs += 4;
+            bitcount = 32;
+        }
+        let bit = (word >> 31) & 1;
+        word <<= 1;
+        bitcount -= 1;
+        let nb = src[node] as u32;
+        let base = (node & !1) + (nb & 0x3F) as usize * 2 + 2;
+        let (next, is_data) =
+            if bit == 0 { (base, nb & 0x80 != 0) } else { (base + 1, nb & 0x40 != 0) };
+        if is_data {
+            outbuf |= (src[next] as u32 & mask) << outbits;
+            outbits += datasize;
+            if outbits == 32 {
+                out.extend_from_slice(&outbuf.to_le_bytes());
+                outbuf = 0;
+                outbits = 0;
+            }
+            node = root;
+        } else {
+            node = next;
+        }
+    }
+    out.truncate(total);
+    out
+}
+
+/// Decompress `src` with `swi_number` (r2 = 0), returning `out_len` bytes.
+fn decompress(swi_number: u8, src: &[u8], out_len: usize) -> Vec<u8> {
+    let mut sys = booted(gba::default_bios());
+    put_ewram_bytes(&mut sys, 0, src);
+    invoke_swi3(&mut sys, swi_number, SRC, DST, 0);
+    assert!(run_until_swi_returns(&mut sys, 100_000), "decompress SWI {swi_number:#x} hung");
+    ewram_bytes(&sys, DST_OFF, out_len)
+}
+
+#[test]
+fn lz77_decompresses_literals_and_back_references() {
+    // "AB" then a back-reference producing "ABABABAB".
+    let src = [0x10, 0x08, 0, 0, 0x20, 0x41, 0x42, 0x30, 0x01];
+    let expected = ref_lz77(&src);
+    assert_eq!(expected, b"ABABABAB");
+    assert_eq!(decompress(0x11, &src, expected.len()), expected); // Wram
+    assert_eq!(decompress(0x12, &src, expected.len()), expected); // Vram
+}
+
+#[test]
+fn rle_decompresses_runs_and_literals() {
+    // 0x82: compressed run of 5 × 0xAA; 0x02: literal 1,2,3.
+    let src = [0x30, 0x08, 0, 0, 0x82, 0xAA, 0x02, 0x01, 0x02, 0x03];
+    let expected = ref_rle(&src);
+    assert_eq!(expected, vec![0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 1, 2, 3]);
+    assert_eq!(decompress(0x14, &src, expected.len()), expected); // Wram
+    assert_eq!(decompress(0x15, &src, expected.len()), expected); // Vram
+}
+
+#[test]
+fn diff8_unfilters_a_delta_stream() {
+    // Header size 6, then Data0=10 and +1 differences.
+    let src = [0x81, 0x06, 0, 0, 10, 1, 1, 1, 1, 1];
+    let expected = ref_diff8(&src);
+    assert_eq!(expected, vec![10, 11, 12, 13, 14, 15]);
+    assert_eq!(decompress(0x16, &src, expected.len()), expected); // Wram
+    assert_eq!(decompress(0x17, &src, expected.len()), expected); // Vram
+}
+
+#[test]
+fn diff16_unfilters_a_16bit_delta_stream() {
+    // Header size 8 bytes (4 halfwords); Data0=100, +5, -2, +7.
+    let src = [0x82, 0x08, 0, 0, 100, 0, 5, 0, 0xFE, 0xFF, 7, 0];
+    let expected = ref_diff16(&src);
+    assert_eq!(expected, vec![100, 105, 103, 110]);
+    let mut sys = booted(gba::default_bios());
+    put_ewram_bytes(&mut sys, 0, &src);
+    invoke_swi3(&mut sys, 0x18, SRC, DST, 0);
+    assert!(run_until_swi_returns(&mut sys, 100_000));
+    assert_eq!(ewram_halfs(&sys, DST_OFF, expected.len()), expected);
+}
+
+fn run_bit_unpack(src: &[u8], srcw: u8, dstw: u8, offset_word: u32) -> Vec<u32> {
+    let mut sys = booted(gba::default_bios());
+    put_ewram_bytes(&mut sys, 0, src);
+    // UnPack info block at ewram 0x800: u16 len, u8 srcw, u8 dstw, u32 offset.
+    let mut info = Vec::new();
+    info.extend_from_slice(&(src.len() as u16).to_le_bytes());
+    info.push(srcw);
+    info.push(dstw);
+    info.extend_from_slice(&offset_word.to_le_bytes());
+    put_ewram_bytes(&mut sys, 0x800, &info);
+    invoke_swi3(&mut sys, 0x10, SRC, DST, EWRAM_BASE + 0x800);
+    assert!(run_until_swi_returns(&mut sys, 100_000));
+    let out_words = ref_bit_unpack(src, srcw as u32, dstw as u32, offset_word & 0x7FFF_FFFF, offset_word >> 31 != 0).len();
+    (0..out_words).map(|i| ewram_word(&sys, DST_OFF + i * 4)).collect()
+}
+
+#[test]
+fn huffman_decompresses_a_tree_and_bitstream() {
+    // The GBATEK "Huff" example: root.0 -> data 'f'; root.1 -> a child whose
+    // node0/node1 are data 'H'/'u'. Bits (MSB first): H=10, u=11, f=0, f=0. The
+    // tree region is padded to 8 bytes so the bitstream word is 4-aligned.
+    let src = [
+        0x28, 0x04, 0, 0, // header: datasize 8, type 2, size 4
+        0x03, // tree-size byte -> bitstream at src + (3+1)*2 = src+8..
+        0x80, // root: offset 0, node0 is data
+        0x66, // 'f'
+        0xC0, // child: offset 0, node0 and node1 are data
+        0x48, // 'H'
+        0x75, // 'u'
+        0, 0, // padding to word-align the bitstream
+        0x00, 0x00, 0x00, 0xB0, // bitstream word 0xB0000000 = 1,0,1,1,0,0...
+    ];
+    let expected = ref_huff(&src);
+    assert_eq!(expected, b"Huff");
+    assert_eq!(decompress(0x13, &src, expected.len()), expected);
+}
+
+#[test]
+fn bit_unpack_widens_1bit_units_to_bytes() {
+    let src = [0xB1u8]; // bits LSB-first: 1,0,0,0,1,1,0,1
+    let want = ref_bit_unpack(&src, 1, 8, 0, false);
+    assert_eq!(want, vec![0x0000_0001, 0x0100_0101]);
+    assert_eq!(run_bit_unpack(&src, 1, 8, 0), want);
+}
+
+#[test]
+fn bit_unpack_applies_offset_and_zero_flag() {
+    let src = [0xB1u8];
+    // offset 0x30, zero-data flag set (bit31): every unit, including zeros, +0x30.
+    let offset_word = 0x30 | (1 << 31);
+    let want = ref_bit_unpack(&src, 1, 8, 0x30, true);
+    assert_eq!(run_bit_unpack(&src, 1, 8, offset_word), want);
+    // 4-bit source units widened to 8-bit with an offset, zero flag clear.
+    let src4 = [0x21u8, 0x43];
+    let want4 = ref_bit_unpack(&src4, 4, 8, 0x10, false);
+    assert_eq!(run_bit_unpack(&src4, 4, 8, 0x10), want4);
+}
+
 // --- Opt-in: equivalence against a real BIOS -------------------------------
 
 fn real_bios() -> Option<Vec<u8>> {
@@ -541,6 +816,32 @@ fn cpu_set_matches_real_bios() {
     };
     assert_eq!(copy(gba::default_bios()), copy(&real));
     assert_eq!(copy(gba::default_bios()), src.to_vec());
+}
+
+#[test]
+fn decompressors_match_real_bios() {
+    let (Some(real), Some(rom)) = (real_bios(), real_rom()) else {
+        eprintln!("skipping: set REWINDS_BIOS and REWINDS_ROM to run this");
+        return;
+    };
+    // Every decompressor is an exact algorithm, so it must match bit-for-bit.
+    let lz77 = vec![0x10u8, 0x08, 0, 0, 0x20, 0x41, 0x42, 0x30, 0x01];
+    let rle = vec![0x30u8, 0x08, 0, 0, 0x82, 0xAA, 0x02, 0x01, 0x02, 0x03];
+    let huff = vec![
+        0x28u8, 0x04, 0, 0, 0x03, 0x80, 0x66, 0xC0, 0x48, 0x75, 0, 0, 0x00, 0x00, 0x00, 0xB0,
+    ];
+    let cases: &[(u8, &[u8], usize)] = &[(0x11, &lz77, 8), (0x14, &rle, 8), (0x13, &huff, 4)];
+
+    let run = |bios: &[u8], swi: u8, src: &[u8], len: usize| -> Vec<u8> {
+        let mut sys = booted_with_rom(bios, rom.clone());
+        put_ewram_bytes(&mut sys, 0, src);
+        invoke_swi3(&mut sys, swi, SRC, DST, 0);
+        assert!(run_until_swi_returns(&mut sys, 100_000));
+        ewram_bytes(&sys, DST_OFF, len)
+    };
+    for &(swi, src, len) in cases {
+        assert_eq!(run(gba::default_bios(), swi, src, len), run(&real, swi, src, len), "SWI {swi:#x}");
+    }
 }
 
 #[test]

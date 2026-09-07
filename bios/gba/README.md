@@ -45,8 +45,10 @@ The `gba` crate embeds it via `gba::default_bios()`.
 - **SWI dispatcher**: the full comment-field decode (ARM and Thumb) and
   jump-table framework. Implemented: `Halt` (0x02), `IntrWait` (0x04),
   `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
-  `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), and `CpuFastSet` (0x0C).
-  Every other SWI currently returns as a no-op.
+  `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), `CpuFastSet` (0x0C),
+  `BitUnPack` (0x10), `LZ77UnComp` Wram/Vram (0x11/0x12), `HuffUnComp` (0x13),
+  `RLUnComp` Wram/Vram (0x14/0x15), `Diff8bitUnFilter` Wram/Vram (0x16/0x17),
+  and `Diff16bitUnFilter` (0x18). Every other SWI currently returns as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
@@ -69,10 +71,17 @@ limits). They meet the documented range/format and track the true angle to
 within a few units, but are *not* bit-identical to the real BIOS. CORDIC's angle
 table holds the pure constants `round(atan(2^-i) * 0x10000 / 2PI)`.
 
+The decompressors are exact (bit-identical to a real BIOS). The "Wram"/"Vram"
+pairs share one core; a byte-emit macro either does 8-bit stores (Wram) or
+buffers halfword stores (Vram). LZ77 back-references read from the destination
+as they are written; in Vram mode the last byte is still buffered, so `disp=0`
+back-references are unsupported, exactly as the hardware documents.
+
 ## Not yet implemented
 
-`SoftReset`/`RegisterRamReset`, decompression, and affine SWIs, plus the boot
-logo intro. See the crate memory / project notes for the roadmap.
+`SoftReset`/`RegisterRamReset` and the affine SWIs (`BgAffineSet`,
+`ObjAffineSet`), plus the boot logo intro. See the crate memory / project notes
+for the roadmap.
 
 ## Tests
 

@@ -124,15 +124,15 @@ swi_table:
     b swi_stub              @ 0x0D GetBiosChecksum
     b swi_stub              @ 0x0E BgAffineSet
     b swi_stub              @ 0x0F ObjAffineSet
-    b swi_stub              @ 0x10 BitUnPack
-    b swi_stub              @ 0x11 LZ77UnCompWram
-    b swi_stub              @ 0x12 LZ77UnCompVram
-    b swi_stub              @ 0x13 HuffUnComp
-    b swi_stub              @ 0x14 RLUnCompWram
-    b swi_stub              @ 0x15 RLUnCompVram
-    b swi_stub              @ 0x16 Diff8bitUnFilterWram
-    b swi_stub              @ 0x17 Diff8bitUnFilterVram
-    b swi_stub              @ 0x18 Diff16bitUnFilter
+    b swi_bit_unpack        @ 0x10 BitUnPack
+    b swi_lz77_wram         @ 0x11 LZ77UnCompWram
+    b swi_lz77_vram         @ 0x12 LZ77UnCompVram
+    b swi_huff              @ 0x13 HuffUnComp
+    b swi_rl_wram           @ 0x14 RLUnCompWram
+    b swi_rl_vram           @ 0x15 RLUnCompVram
+    b swi_diff8_wram        @ 0x16 Diff8bitUnFilterWram
+    b swi_diff8_vram        @ 0x17 Diff8bitUnFilterVram
+    b swi_diff16            @ 0x18 Diff16bitUnFilter
     b swi_stub              @ 0x19 SoundBias
     b swi_stub              @ 0x1A SoundDriverInit
     b swi_stub              @ 0x1B SoundDriverMode
@@ -471,6 +471,302 @@ swi_arc_tan2:
 .Lcordic_table:
     .word 0x2000, 0x12E4, 0x09FB, 0x0511, 0x028B, 0x0146, 0x00A3, 0x0051
     .word 0x0029, 0x0014, 0x000A, 0x0005, 0x0003, 0x0001, 0x0001, 0x0000
+
+@ ---------------------------------------------------------------------------
+@ BIOS decompression functions (GBATEK "BIOS Decompression Functions").
+@ The "Wram"/"Vram" pairs share one core, differing only in write width: the
+@ macro below emits one output byte either as an 8-bit store (Wram) or buffered
+@ into 16-bit halfword stores (Vram, since VRAM cannot take 8-bit writes). Emit
+@ state lives in fixed registers for the duration of a call:
+@   r11 = destination write pointer
+@   r10 = write mode (0 = 8-bit, 1 = 16-bit)
+@   r9  = pending low byte for 16-bit mode (-1 = none)
+@ r4-r10 are callee-saved, so each function stacks the ones it uses (r11/r12 are
+@ already saved by the SWI prologue).
+@ ---------------------------------------------------------------------------
+.macro EMIT_BYTE reg
+    cmp   r10, #0
+    strbeq \reg, [r11], #1
+    beq   .Lemit_done\@
+    cmn   r9, #1               @ pending low byte? (r9 == -1 -> none)
+    bne   .Lemit_flush\@
+    and   r9, \reg, #0xFF       @ hold the low byte until its pair arrives
+    b     .Lemit_done\@
+.Lemit_flush\@:
+    and   \reg, \reg, #0xFF
+    orr   \reg, r9, \reg, lsl #8
+    strh  \reg, [r11], #2
+    mvn   r9, #0               @ clear pending
+.Lemit_done\@:
+.endm
+
+@ SWI 0x11 LZ77UnCompWram / 0x12 LZ77UnCompVram.
+@   r0 = source (LZ77 stream), r1 = destination.
+swi_lz77_vram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #1
+    b     .Llz77_common
+swi_lz77_wram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #0
+.Llz77_common:
+    mvn   r9, #0               @ no pending byte
+    mov   r11, r1              @ dest write pointer
+    ldr   r2, [r0], #4         @ header
+    mov   r2, r2, lsr #8       @ bytes remaining to output
+.Llz77_block:
+    cmp   r2, #0
+    beq   .Llz77_done
+    ldrb  r3, [r0], #1         @ flag byte, MSB first
+    mov   r4, #8               @ eight blocks per flag byte
+.Llz77_bit:
+    cmp   r2, #0
+    beq   .Llz77_done
+    tst   r3, #0x80
+    bne   .Llz77_ref
+    ldrb  r12, [r0], #1        @ literal byte
+    EMIT_BYTE r12
+    sub   r2, r2, #1
+    b     .Llz77_next
+.Llz77_ref:
+    ldrb  r5, [r0], #1         @ length high nibble + disp MSBs
+    ldrb  r6, [r0], #1         @ disp LSBs
+    mov   r7, r5, lsr #4
+    add   r7, r7, #3           @ length = (b0 >> 4) + 3
+    and   r5, r5, #0x0F
+    orr   r5, r6, r5, lsl #8   @ disp
+    add   r5, r5, #1           @ back-reference is at output - (disp + 1)
+    cmn   r9, #1               @ a pending byte occupies one more logical position
+    moveq r8, r11
+    addne r8, r11, #1
+    sub   r8, r8, r5           @ r8 = back-reference read pointer
+.Llz77_copy:
+    cmp   r2, #0
+    beq   .Llz77_done
+    ldrb  r12, [r8], #1
+    EMIT_BYTE r12
+    sub   r2, r2, #1
+    subs  r7, r7, #1
+    bne   .Llz77_copy
+.Llz77_next:
+    mov   r3, r3, lsl #1       @ next flag bit into bit 7
+    subs  r4, r4, #1
+    bne   .Llz77_bit
+    b     .Llz77_block
+.Llz77_done:
+    ldmfd sp!, {r4-r10}
+    b     swi_return
+
+@ SWI 0x14 RLUnCompWram / 0x15 RLUnCompVram (run-length).
+@   r0 = source, r1 = destination.
+swi_rl_vram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #1
+    b     .Lrl_common
+swi_rl_wram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #0
+.Lrl_common:
+    mvn   r9, #0
+    mov   r11, r1
+    ldr   r2, [r0], #4
+    mov   r2, r2, lsr #8       @ bytes remaining
+.Lrl_loop:
+    cmp   r2, #0
+    beq   .Lrl_done
+    ldrb  r3, [r0], #1         @ flag
+    tst   r3, #0x80
+    bne   .Lrl_run
+    and   r4, r3, #0x7F
+    add   r4, r4, #1           @ uncompressed run of N+1 bytes
+.Lrl_lit:
+    cmp   r2, #0
+    beq   .Lrl_done
+    ldrb  r12, [r0], #1
+    EMIT_BYTE r12
+    sub   r2, r2, #1
+    subs  r4, r4, #1
+    bne   .Lrl_lit
+    b     .Lrl_loop
+.Lrl_run:
+    and   r4, r3, #0x7F
+    add   r4, r4, #3           @ compressed run of N+3 copies
+    ldrb  r5, [r0], #1         @ byte to repeat
+.Lrl_runloop:
+    cmp   r2, #0
+    beq   .Lrl_done
+    mov   r12, r5
+    EMIT_BYTE r12
+    sub   r2, r2, #1
+    subs  r4, r4, #1
+    bne   .Lrl_runloop
+    b     .Lrl_loop
+.Lrl_done:
+    ldmfd sp!, {r4-r10}
+    b     swi_return
+
+@ SWI 0x16 Diff8bitUnFilterWram / 0x17 Diff8bitUnFilterVram.
+@ Undoes a delta filter: out[0]=data[0]; out[i]=out[i-1]+data[i] (8-bit).
+@   r0 = source, r1 = destination.
+swi_diff8_vram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #1
+    b     .Ldiff8_common
+swi_diff8_wram:
+    stmfd sp!, {r4-r10}
+    mov   r10, #0
+.Ldiff8_common:
+    mvn   r9, #0
+    mov   r11, r1
+    ldr   r2, [r0], #4
+    mov   r2, r2, lsr #8       @ output size in bytes
+    mov   r3, #0               @ running accumulator
+.Ldiff8_loop:
+    cmp   r2, #0
+    beq   .Ldiff8_done
+    ldrb  r12, [r0], #1
+    add   r3, r3, r12
+    and   r3, r3, #0xFF
+    mov   r12, r3
+    EMIT_BYTE r12
+    sub   r2, r2, #1
+    b     .Ldiff8_loop
+.Ldiff8_done:
+    ldmfd sp!, {r4-r10}
+    b     swi_return
+
+@ SWI 0x18 Diff16bitUnFilter. Like Diff8 but in 16-bit units; output is always
+@ halfword writes, so it does not use the byte-emit path.
+@   r0 = source, r1 = destination.
+swi_diff16:
+    ldr   r2, [r0], #4
+    mov   r2, r2, lsr #8       @ output size in bytes
+    mov   r3, #0               @ running accumulator (16-bit)
+.Ldiff16_loop:
+    cmp   r2, #2
+    blo   .Ldiff16_done
+    ldrh  r12, [r0], #2
+    add   r3, r3, r12
+    mov   r3, r3, lsl #16
+    mov   r3, r3, lsr #16      @ wrap to 16 bits
+    strh  r3, [r1], #2
+    sub   r2, r2, #2
+    b     .Ldiff16_loop
+.Ldiff16_done:
+    b     swi_return
+
+@ SWI 0x10 BitUnPack: widen packed source units into wider destination units,
+@ optionally adding a fixed offset, writing 32-bit words.
+@   r0 = source, r1 = destination (word-aligned), r2 = pointer to unpack info:
+@     u16 source length (bytes), u8 source unit bits, u8 dest unit bits,
+@     u32 (bits0-30 offset added to units, bit31 add offset to zero units too).
+swi_bit_unpack:
+    stmfd sp!, {r4-r11}
+    ldrh  r3, [r2]             @ source length in bytes
+    ldrb  r4, [r2, #2]         @ source unit width (bits)
+    ldrb  r5, [r2, #3]         @ dest unit width (bits)
+    ldr   r6, [r2, #4]         @ offset + zero flag
+    mov   r7, r6, lsr #31      @ zero-data flag
+    bic   r6, r6, #0x80000000  @ data offset (bits 0-30)
+    mov   r10, #1
+    mov   r10, r10, lsl r4
+    sub   r10, r10, #1         @ source unit mask
+    mov   r8, #0               @ output accumulator
+    mov   r9, #0               @ bits filled in accumulator
+.Lbup_byte:
+    cmp   r3, #0
+    beq   .Lbup_done
+    ldrb  r11, [r0], #1
+    sub   r3, r3, #1
+    mov   lr, #8               @ bits available in this byte
+.Lbup_unit:
+    and   r12, r11, r10        @ next source unit
+    mov   r11, r11, lsr r4     @ consume its bits
+    cmp   r12, #0
+    bne   .Lbup_addoff
+    cmp   r7, #0
+    beq   .Lbup_placed         @ zero unit, no zero flag: leave as zero
+.Lbup_addoff:
+    add   r12, r12, r6
+.Lbup_placed:
+    orr   r8, r8, r12, lsl r9
+    add   r9, r9, r5
+    cmp   r9, #32
+    blo   .Lbup_nostore
+    str   r8, [r1], #4
+    mov   r8, #0
+    mov   r9, #0
+.Lbup_nostore:
+    subs  lr, lr, r4
+    bgt   .Lbup_unit
+    b     .Lbup_byte
+.Lbup_done:
+    ldmfd sp!, {r4-r11}
+    b     swi_return
+
+@ SWI 0x13 HuffUnComp. Walks the Huffman tree per bitstream bit; on reaching a
+@ data node the value is emitted (data-size bits) into a 32-bit output word.
+@   r0 = source (aligned by 4), r1 = destination (word-aligned).
+@ Header: bits0-3 data size (bits/unit), bits4-7 type (2), bits8-31 output bytes.
+@ Then a tree-size byte, the tree table (root first), and the 32-bit bitstream.
+@ Node byte: bits0-5 child offset, bit6 = node1 is data, bit7 = node0 is data;
+@ children live at ((node AND NOT 1) + offset*2 + 2) and +1. Bitstream MSB first.
+swi_huff:
+    stmfd sp!, {r4-r11, lr}
+    ldr   r5, [r0], #4         @ header
+    and   r7, r5, #0x0F        @ data size in bits per unit
+    mov   r8, r5, lsr #8       @ total output bytes
+    ldrb  r12, [r0]            @ tree-size byte (r0 now points at it: src+4)
+    add   r3, r0, #1           @ root node = tree base + 1
+    add   r4, r12, #1
+    add   r4, r0, r4, lsl #1   @ bitstream = tree base + (treesize + 1) * 2
+    mov   r2, r3               @ current node = root
+    mov   r6, #0               @ bits left in the current word (force a load)
+    mov   r9, #0               @ output bytes written
+    mov   r10, #0              @ output accumulator
+    mov   r11, #0              @ bits filled in accumulator
+    mov   lr, #1
+    mov   lr, lr, lsl r7
+    sub   lr, lr, #1           @ data-unit mask
+.Lhuf_loop:
+    cmp   r9, r8
+    bhs   .Lhuf_done
+    cmp   r6, #0
+    bne   .Lhuf_havebit
+    ldr   r5, [r4], #4         @ next 32-bit chunk of the bitstream
+    mov   r6, #32
+.Lhuf_havebit:
+    ldrb  r12, [r2]            @ node byte
+    and   r0, r12, #0x3F       @ child offset
+    bic   r2, r2, #1           @ (node AND NOT 1)
+    add   r2, r2, r0, lsl #1
+    add   r2, r2, #2           @ r2 = child0 address
+    movs  r5, r5, lsl #1       @ consume the next bit (MSB first) into carry
+    sub   r6, r6, #1
+    bcc   .Lhuf_bit0
+    add   r2, r2, #1           @ bit 1 -> child1
+    tst   r12, #0x40           @ node1 end flag
+    b     .Lhuf_after
+.Lhuf_bit0:
+    tst   r12, #0x80           @ node0 end flag
+.Lhuf_after:
+    beq   .Lhuf_loop           @ internal node: descend (r2 already the child)
+    ldrb  r0, [r2]             @ data node: read the value
+    and   r0, r0, lr           @ keep only data-size bits
+    orr   r10, r10, r0, lsl r11
+    add   r11, r11, r7
+    cmp   r11, #32
+    blo   .Lhuf_reset
+    str   r10, [r1], #4
+    mov   r10, #0
+    mov   r11, #0
+    add   r9, r9, #4
+.Lhuf_reset:
+    mov   r2, r3               @ back to the root for the next symbol
+    b     .Lhuf_loop
+.Lhuf_done:
+    ldmfd sp!, {r4-r11, lr}
+    b     swi_return
 
 @ Reset SWIs are not yet implemented; return as no-ops for now. (SoftReset does
 @ not return on hardware — that behavior comes with the real implementation.)
