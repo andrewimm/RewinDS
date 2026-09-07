@@ -493,6 +493,20 @@ impl Machine {
         scheduler.schedule_after(delay, NdsEvent::CartTransferComplete { core });
     }
 
+    /// Sample the 3D geometry command FIFO's interrupt line and raise the ARM9
+    /// `GxFifo` IRQ (IF bit 21) while it is asserted. The FIFO chooses its condition
+    /// through `GXSTAT` bits 30-31 (never / less-than-half-full / empty). The line is
+    /// **level-triggered**: software streams a display list by re-entering the handler
+    /// each time the FIFO drops below the threshold, so this is sampled every ARM9
+    /// instruction boundary (in `step_core`) rather than once — a single edge would run
+    /// the handler once and stall mid-list. Our FIFO drains synchronously, so once a
+    /// firing condition is armed it stays asserted until software clears the mode.
+    pub(crate) fn poll_gxfifo_irq(&mut self) {
+        if self.gpu3d.fifo_irq_asserted() {
+            self.interrupts[Core::Arm9.index()].request(crate::interrupt::IrqSource::GxFifo);
+        }
+    }
+
     /// Route a write to the gamecard registers (`40001A0h`..`40001BFh`). ROMCTRL is
     /// read-modify-written so any access width works; a start bit launches the
     /// transfer. The command buffer takes byte writes; the KEY2 seed ports are
@@ -1464,6 +1478,12 @@ impl System {
         };
         let c = core.index();
         let other = c ^ 1;
+        // The geometry command FIFO's IRQ line (GXSTAT bits 30-31) is level-triggered:
+        // sample it each ARM9 boundary so IF bit 21 tracks the live condition and a
+        // display-list-streaming handler is re-entered until the queue drains.
+        if core == Core::Arm9 {
+            self.machine.poll_gxfifo_irq();
+        }
         // Causality gate: only vector once this core's clock has reached the time a
         // cross-core interrupt was raised (see `Interrupts::note_asserted_at`).
         let asserted = self.machine.interrupts[c].line_ready(self.machine.clock[c]);
@@ -2541,6 +2561,35 @@ mod tests {
             system.interrupts(Core::Arm9).iflags(),
             IrqSource::Gamecard.mask()
         );
+    }
+
+    #[test]
+    fn geometry_fifo_irq_raised_while_gxstat_condition_holds() {
+        use crate::IrqSource;
+        // Software streams a 3D display list by arming the GXFIFO IRQ (GXSTAT bits
+        // 30-31) and re-entering its handler each time the FIFO drops below the
+        // threshold. The line is level-triggered — the interrupt controller samples it
+        // — so once armed and satisfied it keeps raising IF bit 21 until software
+        // clears the mode. A missing wire here hangs any 3D game's display flush.
+        let mut system = System::new();
+        let gxfifo = IrqSource::GxFifo.mask();
+
+        // No IRQ mode armed (power-on GXSTAT = 0): the line is idle.
+        system.machine.poll_gxfifo_irq();
+        assert_eq!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
+
+        // Arm the "FIFO empty" condition (bits 30-31 = 2). The FIFO powers up empty,
+        // so the line asserts and sampling it raises the ARM9 geometry IRQ.
+        system.io_write(Core::Arm9, 0x0400_0600, 2 << 30, 4);
+        system.machine.poll_gxfifo_irq();
+        assert_ne!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
+
+        // Even after the handler acknowledges it, the level re-asserts while the
+        // condition and mode hold (this is what lets a chunked streamer re-enter).
+        system.machine.interrupts[Core::Arm9.index()].acknowledge(gxfifo);
+        assert_eq!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
+        system.machine.poll_gxfifo_irq();
+        assert_ne!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
     }
 
     #[test]
