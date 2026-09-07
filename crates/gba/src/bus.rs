@@ -76,6 +76,9 @@ pub struct Bus {
     /// Whether the CPU is currently executing inside the BIOS (tracked from the
     /// last instruction fetch).
     executing_bios: bool,
+    /// The last value the CPU pipeline prefetched. Reads of unmapped/inaccessible
+    /// addresses return "open bus" — this latched value — rather than zero.
+    open_bus: u32,
 }
 
 impl Bus {
@@ -132,7 +135,7 @@ impl Bus {
                 *watch.entry(addr).or_insert(0) += 1;
             }
         }
-        match addr >> 24 {
+        let result = match addr >> 24 {
             0x00 if (addr as usize) < BIOS_SIZE => {
                 if access.kind == AccessKind::Instruction {
                     // A BIOS opcode fetch: latch it for later open-bus reads. The
@@ -148,7 +151,7 @@ impl Bus {
                     BusResult::plain(read_le(&self.memory.bios, addr as usize, width), 1)
                 } else {
                     // Outside code sees only the most recently fetched BIOS opcode.
-                    BusResult::plain(bios_open_bus(self.bios_last_fetch, addr, width), 1)
+                    BusResult::plain(open_bus_slice(self.bios_last_fetch, addr, width), 1)
                 }
             }
             0x02 => {
@@ -163,8 +166,12 @@ impl Bus {
                 if let Some(off) = io_offset(addr) {
                     let value = self.io.read(off, width, scheduler.now());
                     BusResult::plain(value, fixed_cycles(1, 1, width))
+                } else if is_memctrl(addr) {
+                    // The internal memory control register, mirrored every 64K.
+                    let value = open_bus_slice(self.io.control.memctrl(), addr, width);
+                    BusResult::plain(value, fixed_cycles(1, 1, width))
                 } else {
-                    BusResult::plain(OPEN_BUS, 1)
+                    BusResult::plain(open_bus_slice(self.open_bus, addr, width), 1)
                 }
             }
             0x05 => {
@@ -194,35 +201,45 @@ impl Bus {
                     }
                     self.rom_cycles(addr >> 24, width, access.sequence)
                 };
-                if !rom_accessible(access.master) {
-                    return BusResult::plain(OPEN_BUS, cycles);
-                }
-                // EEPROM answers as a bit-serial device in the upper GamePak window.
-                if self.cartridge.is_eeprom_at(addr) {
-                    return BusResult::plain(u32::from(self.cartridge.eeprom_read()), cycles);
-                }
-                // The cartridge GPIO/RTC overlays three ROM-region addresses.
-                if let Some(v) = self.cartridge.gpio_read(addr) {
-                    return BusResult::plain(u32::from(v), cycles);
-                }
-                let off = (addr & 0x01FF_FFFF) as usize;
-                let value = if off + width.bytes() as usize <= self.cartridge.rom.len() {
-                    read_le(&self.cartridge.rom, off, width)
+                let value = if !rom_accessible(access.master) {
+                    open_bus_slice(self.open_bus, addr, width)
+                } else if self.cartridge.is_eeprom_at(addr) {
+                    // EEPROM answers as a bit-serial device in the upper GamePak window.
+                    u32::from(self.cartridge.eeprom_read())
+                } else if let Some(v) = self.cartridge.gpio_read(addr) {
+                    // The cartridge GPIO/RTC overlays three ROM-region addresses.
+                    u32::from(v)
                 } else {
-                    rom_open_bus(addr, width)
+                    let off = (addr & 0x01FF_FFFF) as usize;
+                    if off + width.bytes() as usize <= self.cartridge.rom.len() {
+                        read_le(&self.cartridge.rom, off, width)
+                    } else {
+                        rom_open_bus(addr, width)
+                    }
                 };
                 BusResult::plain(value, cycles)
             }
             0x0E | 0x0F => {
                 let cycles = self.sram_cycles();
-                if !sram_accessible(access.master) {
-                    return BusResult::plain(OPEN_BUS, cycles);
-                }
-                let byte = self.cartridge.backup.read8(addr);
-                BusResult::plain(sram_replicate(byte, width), cycles)
+                let value = if !sram_accessible(access.master) {
+                    open_bus_slice(self.open_bus, addr, width)
+                } else {
+                    sram_replicate(self.cartridge.backup.read8(addr), width)
+                };
+                BusResult::plain(value, cycles)
             }
-            _ => BusResult::plain(OPEN_BUS, 1),
+            _ => BusResult::plain(open_bus_slice(self.open_bus, addr, width), 1),
+        };
+        // Latch the value the CPU pipeline just prefetched, so later reads of
+        // unmapped addresses return open bus. A Thumb (16-bit) fetch appears on
+        // the 32-bit bus with its halfword mirrored into both halves.
+        if access.kind == AccessKind::Instruction {
+            self.open_bus = match width {
+                AccessWidth::Half => result.value | (result.value << 16),
+                _ => result.value,
+            };
         }
+        result
     }
 
     fn write(&mut self, addr: u32, value: u32, width: AccessWidth, access: Access, scheduler: &mut Scheduler<EventKind>) -> BusResult<()> {
@@ -252,6 +269,9 @@ impl Bus {
             0x04 => {
                 let changed = if let Some(off) = io_offset(addr) {
                     self.io.write(off, width, value, scheduler)
+                } else if is_memctrl(addr) {
+                    self.io.control.write_memctrl(addr, width, value);
+                    false
                 } else {
                     false
                 };
@@ -481,8 +501,26 @@ impl Bus {
         }
     }
 
+    /// DMA3 "Video Capture" (Special timing). With the repeat bit set it moves
+    /// one scanline's worth of units per line: transfers run for VCOUNT 2..=161
+    /// (behaving like an H-blank DMA) and the enable bit is cleared at VCOUNT 162.
+    pub fn trigger_video_capture(&mut self, vcount: u16, scheduler: &mut Scheduler<EventKind>) {
+        let channel = &self.io.dma.channels[3];
+        if !(channel.enabled && channel.timing() == DmaTiming::Special) {
+            return;
+        }
+        if vcount == 162 {
+            let channel = &mut self.io.dma.channels[3];
+            channel.enabled = false;
+            channel.control &= !(1 << 15);
+        } else if (2..=161).contains(&vcount) {
+            self.run_dma_channel(3, scheduler);
+        }
+    }
+
     /// Perform channel `i`'s transfer as a bus master. The whole transfer runs at
-    /// the current instant; guest cycles are not yet charged (see [`crate::dma`]).
+    /// the current instant; its cycle cost is accumulated into the CPU stall (see
+    /// [`crate::dma`]).
     fn run_dma_channel(&mut self, i: usize, scheduler: &mut Scheduler<EventKind>) {
         let channel = self.io.dma.channels[i]; // snapshot of config
         let is_32bit = channel.is_32bit();
@@ -548,9 +586,11 @@ fn dma_irq_source(i: usize) -> IrqSource {
     }
 }
 
-/// Value returned for reads of unmapped addresses. Real open-bus returns the
-/// last value on the bus; this is a placeholder until that is tracked.
-const OPEN_BUS: u32 = 0;
+/// Whether `addr` targets the internal memory control register `0x04000800`,
+/// which is mirrored every 64K across the whole I/O area.
+fn is_memctrl(addr: u32) -> bool {
+    (0x800..0x804).contains(&(addr & 0xFFFF))
+}
 
 /// The gamepak wait-state region (0/1/2) for a ROM address region.
 fn ws_index(region: u32) -> u32 {
@@ -642,7 +682,10 @@ fn rom_open_bus(addr: u32, width: AccessWidth) -> u32 {
 
 /// A protected BIOS read returns the latched last-fetched opcode. A sub-word read
 /// takes the corresponding byte/halfword lane of that 32-bit value.
-fn bios_open_bus(latch: u32, addr: u32, width: AccessWidth) -> u32 {
+/// Extract the width-sized slice of a latched 32-bit bus value at `addr` — used
+/// for BIOS read-protection, the general open-bus latch, and the memory-control
+/// register mirror.
+fn open_bus_slice(latch: u32, addr: u32, width: AccessWidth) -> u32 {
     match width {
         AccessWidth::Byte => (latch >> (8 * (addr & 3))) & 0xFF,
         AccessWidth::Half => (latch >> (8 * (addr & 2))) & 0xFFFF,
@@ -679,6 +722,69 @@ mod tests {
     }
 
     const CPU: Access = Access::cpu_data();
+    const CODE: Access = Access::cpu(AccessKind::Instruction, AccessSequence::NonSequential);
+
+    #[test]
+    fn open_bus_returns_the_last_prefetched_value() {
+        let (mut b, mut s) = bus();
+        // Prime the pipeline latch with an instruction fetch, then read an
+        // unmapped region (0x01xxxxxx): it returns the latched value, not zero.
+        b.write32(0x0300_0000, 0xDEAD_BEEF, CPU, &mut s);
+        assert_eq!(b.read32(0x0300_0000, CODE, &mut s).value, 0xDEAD_BEEF);
+        assert_eq!(b.read32(0x0100_0000, CPU, &mut s).value, 0xDEAD_BEEF);
+        assert_eq!(b.read16(0x0100_0000, CPU, &mut s).value, 0xBEEF);
+        assert_eq!(b.read16(0x0100_0002, CPU, &mut s).value, 0xDEAD);
+        assert_eq!(b.read8(0x0100_0003, CPU, &mut s).value, 0xDE);
+    }
+
+    #[test]
+    fn video_capture_dma_transfers_per_scanline_then_stops() {
+        let (mut b, mut s) = bus();
+        // A ramp in EWRAM to capture into VRAM.
+        for i in 0..16u32 {
+            b.write16(0x0200_0000 + i * 2, 0xA000 + i as u16, CPU, &mut s);
+        }
+        // DMA3 video capture: src/dst incrementing, 2 halfwords/scanline, repeat,
+        // Special start timing (3), enabled.
+        b.write32(0x0400_00D4, 0x0200_0000, CPU, &mut s); // DMA3SAD
+        b.write32(0x0400_00D8, 0x0600_0000, CPU, &mut s); // DMA3DAD
+        b.write16(0x0400_00DC, 2, CPU, &mut s); // DMA3CNT_L (units per line)
+        b.write16(0x0400_00DE, (1 << 15) | (1 << 9) | (3 << 12), CPU, &mut s); // CNT_H
+        assert!(b.io.dma.channels[3].enabled);
+
+        // Nothing before VCOUNT 2.
+        b.trigger_video_capture(1, &mut s);
+        assert_eq!(b.read16(0x0600_0000, CPU, &mut s).value, 0);
+
+        // Lines 2 and 3 each move two halfwords, advancing source and dest.
+        b.trigger_video_capture(2, &mut s);
+        b.trigger_video_capture(3, &mut s);
+        assert_eq!(b.read16(0x0600_0000, CPU, &mut s).value, 0xA000);
+        assert_eq!(b.read16(0x0600_0002, CPU, &mut s).value, 0xA001);
+        assert_eq!(b.read16(0x0600_0004, CPU, &mut s).value, 0xA002);
+        assert_eq!(b.read16(0x0600_0006, CPU, &mut s).value, 0xA003);
+        assert!(b.io.dma.channels[3].enabled); // repeat keeps it armed
+
+        // VCOUNT 162 stops the capture (enable bit cleared).
+        b.trigger_video_capture(162, &mut s);
+        assert!(!b.io.dma.channels[3].enabled);
+        assert_eq!(b.io.dma.channels[3].control & (1 << 15), 0);
+    }
+
+    #[test]
+    fn internal_memory_control_reads_default_and_persists_writes() {
+        let (mut b, mut s) = bus();
+        // Powers up to 0x0D000020, at 0x04000800 and its 64K mirrors.
+        assert_eq!(b.read32(0x0400_0800, CPU, &mut s).value, 0x0D00_0020);
+        assert_eq!(b.read32(0x0401_0800, CPU, &mut s).value, 0x0D00_0020);
+        // Writable, and the high halfword reads back on its own.
+        b.write32(0x0400_0800, 0x0E00_0020, CPU, &mut s);
+        assert_eq!(b.read32(0x04F0_0800, CPU, &mut s).value, 0x0E00_0020);
+        assert_eq!(b.read16(0x0400_0802, CPU, &mut s).value, 0x0E00);
+        // A halfword write merges into the low half only.
+        b.write16(0x0400_0800, 0x1234, CPU, &mut s);
+        assert_eq!(b.read32(0x0400_0800, CPU, &mut s).value, 0x0E00_1234);
+    }
 
     #[test]
     fn ram_round_trips_all_widths() {

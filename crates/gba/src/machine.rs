@@ -86,10 +86,16 @@ impl EventHandler<EventKind> for Gba {
                 // A blank transition can trigger DMA. HBlank DMA fires only on
                 // visible scanlines; VBlank DMA fires as line 160 begins.
                 match event {
-                    PpuEvent::HBlank if self.bus.io.video.vcount() < VBLANK_LINE => {
-                        // Draw the scanline that just finished, then run its HBlank DMA.
-                        self.bus.render_ppu_scanline();
-                        self.bus.trigger_dma(DmaTiming::HBlank, ctx.scheduler);
+                    PpuEvent::HBlank => {
+                        let vcount = self.bus.io.video.vcount();
+                        if vcount < VBLANK_LINE {
+                            // Draw the scanline that just finished, then its HBlank DMA.
+                            self.bus.render_ppu_scanline();
+                            self.bus.trigger_dma(DmaTiming::HBlank, ctx.scheduler);
+                        }
+                        // DMA3 video capture runs per scanline across 2..=161,
+                        // including the first vblank lines the guard above skips.
+                        self.bus.trigger_video_capture(vcount, ctx.scheduler);
                     }
                     PpuEvent::LineStart if self.bus.io.video.vcount() == VBLANK_LINE => {
                         // The frame is complete as the vertical blank begins.

@@ -33,12 +33,26 @@ pub enum PowerState {
 const STOP_WAKE_MASK: u16 =
     IrqSource::Keypad.mask() | IrqSource::GamePak.mask() | IrqSource::Serial.mask();
 
-/// System-control registers: `HALTCNT` power state, `WAITCNT`, `POSTFLG`.
-#[derive(Clone, Copy, Debug, Default)]
+/// System-control registers: `HALTCNT` power state, `WAITCNT`, `POSTFLG`, and
+/// the internal memory control register (`4000800h`).
+#[derive(Clone, Copy, Debug)]
 pub struct SystemControl {
     power: PowerState,
     waitcnt: u16,
     postflg: u8,
+    memctrl: u32,
+}
+
+impl Default for SystemControl {
+    fn default() -> Self {
+        Self {
+            power: PowerState::default(),
+            waitcnt: 0,
+            postflg: 0,
+            // `4000800h` powers up to this value on hardware.
+            memctrl: 0x0D00_0020,
+        }
+    }
 }
 
 impl SystemControl {
@@ -49,6 +63,29 @@ impl SystemControl {
     /// `WAITCNT` (`4000204h`) — the gamepak wait-state configuration.
     pub fn waitcnt(&self) -> u16 {
         self.waitcnt
+    }
+
+    /// The internal memory control register (`4000800h`, and its 64K mirrors).
+    /// Stored and read back faithfully; the WRAM wait-state effect it controls is
+    /// not yet applied to EWRAM timing.
+    pub fn memctrl(&self) -> u32 {
+        self.memctrl
+    }
+
+    /// Write the memory control register, merging `width` bytes at `addr`'s byte
+    /// offset within the 32-bit register.
+    pub fn write_memctrl(&mut self, addr: u32, width: AccessWidth, value: u32) {
+        match width {
+            AccessWidth::Word => self.memctrl = value,
+            AccessWidth::Half => {
+                let shift = 8 * (addr & 2);
+                self.memctrl = (self.memctrl & !(0xFFFF << shift)) | ((value & 0xFFFF) << shift);
+            }
+            AccessWidth::Byte => {
+                let shift = 8 * (addr & 3);
+                self.memctrl = (self.memctrl & !(0xFF << shift)) | ((value & 0xFF) << shift);
+            }
+        }
     }
 
     /// Write `HALTCNT`: bit 7 selects Halt (0) or Stop (1).

@@ -7,10 +7,11 @@
 //! lives on the [`Bus`](crate::bus::Bus), which owns both the memory and this
 //! state and so can read config here while driving bus accesses.
 //!
-//! This first implementation performs a whole transfer at the instant it is
-//! triggered (the scheduler design explicitly permits that initially). Cycle
-//! costs are therefore not yet charged against the timeline, and the Sound-FIFO
-//! and video-capture "special" timings are not yet handled.
+//! A transfer runs in full at the instant it is triggered (the scheduler design
+//! permits that), and its read+write+internal cycle cost is charged to the CPU
+//! timeline as a stall (see `dma_stall_cycles` on the bus). All four start
+//! timings are handled: immediate, V-blank, H-blank, and the per-channel
+//! "special" modes (DMA1/2 sound FIFO, DMA3 video capture).
 
 /// When a channel's transfer is (re)started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub enum DmaTiming {
     Immediate,
     VBlank,
     HBlank,
-    /// DMA1/2 Sound FIFO, DMA3 video capture — not yet modeled.
+    /// DMA1/2 sound FIFO, or DMA3 video capture.
     Special,
 }
 
