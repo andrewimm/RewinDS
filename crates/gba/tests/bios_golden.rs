@@ -966,6 +966,22 @@ fn register_ram_reset_clears_palette_vram_and_oam() {
     assert!(sys.gba.bus.memory.oam.iter().all(|&b| b == 0), "OAM cleared");
 }
 
+#[test]
+fn get_bios_checksum_sums_the_image() {
+    // GetBiosChecksum reads the BIOS in 32-bit units and adds them up. It runs
+    // inside the BIOS, so the read-protection returns the real bytes. We return
+    // our own image's checksum (a real BIOS would give 0xBAAE187F).
+    let expected = gba::default_bios()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .fold(0u32, |a, w| a.wrapping_add(w));
+    let mut sys = booted(gba::default_bios());
+    invoke_swi(&mut sys, 0x0D, 0, 0);
+    // ~4096 iterations, so give the loop more than run_swi's small budget.
+    assert!(run_until_swi_returns(&mut sys, 100_000), "GetBiosChecksum did not return");
+    assert_eq!(sys.cpu.register(0), expected);
+}
+
 // --- Opt-in: equivalence against a real BIOS -------------------------------
 
 fn real_bios() -> Option<Vec<u8>> {

@@ -121,7 +121,7 @@ swi_table:
     b swi_arc_tan2          @ 0x0A ArcTan2
     b swi_cpu_set           @ 0x0B CpuSet
     b swi_cpu_fast_set      @ 0x0C CpuFastSet
-    b swi_stub              @ 0x0D GetBiosChecksum
+    b swi_get_bios_checksum @ 0x0D GetBiosChecksum
     b swi_bg_affine_set     @ 0x0E BgAffineSet
     b swi_obj_affine_set    @ 0x0F ObjAffineSet
     b swi_bit_unpack        @ 0x10 BitUnPack
@@ -348,6 +348,22 @@ swi_cpu_fast_set:
     subs  r3, r3, #1
     bne   .Lcfs_fill_loop
     b     swi_return
+
+@ SWI 0x0D GetBiosChecksum (undocumented): sum the whole 16 KiB BIOS as 32-bit
+@ words. Running inside the BIOS, its reads see the real bytes. Returns our own
+@ image's checksum (not Nintendo's 0xBAAE187F), consistent with this BIOS.
+@   out: r0 = checksum
+swi_get_bios_checksum:
+    mov   r0, #0
+    mov   r1, #0               @ read from 0x00000000
+    ldr   r2, =0x4000          @ up to 16 KiB
+.Lgbc_loop:
+    ldr   r3, [r1], #4
+    add   r0, r0, r3
+    cmp   r1, r2
+    blo   .Lgbc_loop
+    b     swi_return
+    .pool
 
 @ SWI 0x08 Sqrt: unsigned integer square root, floor(sqrt(r0)).
 @   in:  r0 = unsigned 32-bit number

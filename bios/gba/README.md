@@ -47,7 +47,8 @@ The `gba` crate embeds it via `gba::default_bios()`.
   (0x01), `Halt` (0x02), `IntrWait` (0x04),
   `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
   `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), `CpuFastSet` (0x0C),
-  `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F), `BitUnPack` (0x10), `LZ77UnComp`
+  `GetBiosChecksum` (0x0D), `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F),
+  `BitUnPack` (0x10), `LZ77UnComp`
   Wram/Vram (0x11/0x12), `HuffUnComp` (0x13), `RLUnComp` Wram/Vram (0x14/0x15),
   `Diff8bitUnFilter` Wram/Vram (0x16/0x17), and `Diff16bitUnFilter` (0x18).
   Every other SWI currently returns as a no-op.
@@ -97,11 +98,15 @@ resets the SIO/sound/other I/O register blocks, and always forces the screen
 blank (`DISPCNT = 0x0080`). The on-chip WRAM clear preserves the last `0x200`
 bytes, as documented.
 
+`GetBiosChecksum` sums the whole 16 KiB image as 32-bit words (running inside
+the BIOS, so its reads see the real bytes). It returns *this* image's checksum,
+not a real BIOS's `0xBAAE187F` — hardcoding that would be dishonest and
+inconsistent with the bytes actually present.
+
 ## Not yet implemented
 
 The sound-driver SWIs (`SoundBias`, `SoundDriver*`, `MidiKey2Freq`, `MultiBoot`),
-`GetBiosChecksum`, and the boot logo intro. See the crate memory / project notes
-for the roadmap.
+and the boot logo intro. See the crate memory / project notes for the roadmap.
 
 ## Tests
 
