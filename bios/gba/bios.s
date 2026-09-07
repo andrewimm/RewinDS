@@ -111,7 +111,7 @@ swi_table:
     b swi_soft_reset        @ 0x00 SoftReset
     b swi_reg_ram_reset     @ 0x01 RegisterRamReset
     b swi_halt              @ 0x02 Halt
-    b swi_stub              @ 0x03 Stop/Sleep
+    b swi_stop              @ 0x03 Stop/Sleep
     b swi_intr_wait         @ 0x04 IntrWait
     b swi_vblank_intr_wait  @ 0x05 VBlankIntrWait
     b swi_div               @ 0x06 Div
@@ -147,7 +147,7 @@ swi_table:
     b swi_stub              @ 0x24 SoundWhatever4
     b swi_stub              @ 0x25 MultiBoot
     b swi_stub              @ 0x26 HardReset
-    b swi_stub              @ 0x27 CustomHalt
+    b swi_custom_halt       @ 0x27 CustomHalt
     b swi_stub              @ 0x28 SoundDriverVSyncOff
     b swi_stub              @ 0x29 SoundDriverVSyncOn
     b swi_stub              @ 0x2A SoundGetJumpList
@@ -173,6 +173,27 @@ swi_halt:
     mov   r1, #0
     strb  r1, [r0]
     ldmfd sp!, {r0, r1}
+    b     swi_return
+    .pool
+
+@ SWI 0x03 Stop/Sleep: very-low-power mode via HALTCNT bit 7 (value 0x80). Woken
+@ only by Joypad, Game Pak, or SIO interrupts. No parameters, no return value.
+swi_stop:
+    stmfd sp!, {r0, r1}
+    ldr   r0, =0x04000301
+    mov   r1, #0x80
+    strb  r1, [r0]
+    ldmfd sp!, {r0, r1}
+    b     swi_return
+    .pool
+
+@ SWI 0x27 CustomHalt (undocumented): write the low byte of r2 to HALTCNT
+@ (0x00 = Halt, 0x80 = Stop). No return value.
+swi_custom_halt:
+    stmfd sp!, {r0}
+    ldr   r0, =0x04000301
+    strb  r2, [r0]
+    ldmfd sp!, {r0}
     b     swi_return
     .pool
 

@@ -44,14 +44,15 @@ The `gba` crate embeds it via `gba::default_bios()`.
   off to the cartridge entry point in System / ARM state.
 - **SWI dispatcher**: the full comment-field decode (ARM and Thumb) and
   jump-table framework. Implemented: `SoftReset` (0x00), `RegisterRamReset`
-  (0x01), `Halt` (0x02), `IntrWait` (0x04),
+  (0x01), `Halt` (0x02), `Stop` (0x03), `IntrWait` (0x04),
   `VBlankIntrWait` (0x05), `Div` (0x06), `DivArm` (0x07), `Sqrt` (0x08),
   `ArcTan` (0x09), `ArcTan2` (0x0A), `CpuSet` (0x0B), `CpuFastSet` (0x0C),
   `GetBiosChecksum` (0x0D), `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F),
   `BitUnPack` (0x10), `LZ77UnComp`
   Wram/Vram (0x11/0x12), `HuffUnComp` (0x13), `RLUnComp` Wram/Vram (0x14/0x15),
-  `Diff8bitUnFilter` Wram/Vram (0x16/0x17), `Diff16bitUnFilter` (0x18), and
-  `SoundBias` (0x19). Every other SWI currently returns as a no-op.
+  `Diff8bitUnFilter` Wram/Vram (0x16/0x17), `Diff16bitUnFilter` (0x18),
+  `SoundBias` (0x19), and `CustomHalt` (0x27). Every other SWI currently returns
+  as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
@@ -108,13 +109,22 @@ amplitude-resolution bits. The hardware ramps to the target with small delays to
 avoid an audible click; only the final register value is observable, so it is
 set directly.
 
-## Not yet implemented
+The halt family is complete: `Halt` (0x00 to HALTCNT), `Stop` (0x80 to HALTCNT,
+woken only by Joypad/Game Pak/SIO), and `CustomHalt` (the low byte of r2).
 
-The MP2K sound-driver SWIs (`SoundDriverInit`/`Mode`/`Main`/`VSync`,
-`SoundChannelClear`, `MidiKey2Freq`, `MultiBoot`, 0x1A–0x2A), which need the
-driver's work-area structures, and the boot logo intro. Most commercial games
-ship their own sound engine and never call these. See the crate memory / project
-notes for the roadmap.
+## Not yet implemented (deliberately stubbed — safe no-ops)
+
+- **MP2K sound driver** (`SoundDriverInit`/`Mode`/`Main`/`VSync`/`VSyncOff`/
+  `VSyncOn`, `SoundChannelClear`, `SoundWhatever0..4`, `SoundGetJumpList`, and
+  `MidiKey2Freq`, 0x1A–0x24, 0x28–0x2A) — these need the driver's `SoundArea`
+  work-area structures, and commercial games ship their own sound engine.
+- **`MultiBoot`** (0x25) — the single-cartridge multiplayer boot protocol (drives
+  the serial link to upload a program to slave GBAs).
+- **`HardReset`** (0x26) — a full ~2-second reboot.
+- **The boot logo intro** — cosmetic; skipping it also lets homebrew with an
+  invalid logo boot (real hardware would lock up).
+
+See the crate memory / project notes for the roadmap.
 
 ## Tests
 

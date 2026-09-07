@@ -189,6 +189,48 @@ fn halt_swi_enters_low_power() {
 }
 
 #[test]
+fn stop_and_custom_halt_enter_the_right_power_state() {
+    use gba::PowerState;
+    // Stop (0x03) -> Stopped.
+    let mut sys = booted(gba::default_bios());
+    put_iwram(&mut sys, 0x0300_0000, &[0xEF03_0000, 0xEAFF_FFFE]);
+    sys.cpu.set_pc(0x0300_0000);
+    for _ in 0..200 {
+        if sys.gba.power_state() == PowerState::Stopped {
+            break;
+        }
+        sys.step();
+    }
+    assert_eq!(sys.gba.power_state(), PowerState::Stopped, "Stop -> Stopped");
+
+    // CustomHalt (0x27) with r2 = 0 -> Halted.
+    let mut sys = booted(gba::default_bios());
+    put_iwram(&mut sys, 0x0300_0000, &[0xEF27_0000, 0xEAFF_FFFE]);
+    sys.cpu.set_register(2, 0);
+    sys.cpu.set_pc(0x0300_0000);
+    for _ in 0..200 {
+        if sys.gba.is_low_power() {
+            break;
+        }
+        sys.step();
+    }
+    assert_eq!(sys.gba.power_state(), PowerState::Halted, "CustomHalt(0) -> Halted");
+
+    // CustomHalt with r2 = 0x80 -> Stopped.
+    let mut sys = booted(gba::default_bios());
+    put_iwram(&mut sys, 0x0300_0000, &[0xEF27_0000, 0xEAFF_FFFE]);
+    sys.cpu.set_register(2, 0x80);
+    sys.cpu.set_pc(0x0300_0000);
+    for _ in 0..200 {
+        if sys.gba.is_low_power() {
+            break;
+        }
+        sys.step();
+    }
+    assert_eq!(sys.gba.power_state(), PowerState::Stopped, "CustomHalt(0x80) -> Stopped");
+}
+
+#[test]
 fn irq_handler_forwards_to_user_handler_and_returns() {
     // The documented BIOS IRQ path: save context, call [0x03007FFC], restore,
     // and return to the interrupted code with CPSR restored from SPSR_irq.

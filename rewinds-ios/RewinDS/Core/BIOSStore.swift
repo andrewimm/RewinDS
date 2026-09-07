@@ -11,7 +11,7 @@ enum SystemFile: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .gbaBios: return "GBA BIOS"
+        case .gbaBios: return "GBA BIOS (optional override)"
         case .ndsBios9: return "DS ARM9 BIOS"
         case .ndsBios7: return "DS ARM7 BIOS"
         case .ndsFirmware: return "DS Firmware (optional)"
@@ -19,8 +19,10 @@ enum SystemFile: String, CaseIterable, Identifiable {
     }
 
     /// Which console needs it, and whether it's mandatory to boot that console.
+    /// The GBA BIOS is optional: without one the built-in replacement (embedded in
+    /// the core) is used, so a supplied file only overrides it for fidelity.
     var console: Console { self == .gbaBios ? .gba : .nds }
-    var required: Bool { self != .ndsFirmware }
+    var required: Bool { self != .ndsFirmware && self != .gbaBios }
 }
 
 /// Resolves BIOS/firmware bytes. Files the user imported at runtime (into app-support)
@@ -61,10 +63,12 @@ final class BIOSStore: ObservableObject {
 
     func isAvailable(_ file: SystemFile) -> Bool { data(file) != nil }
 
-    /// Whether the required BIOS for a console is present (firmware is optional).
+    /// Whether the required BIOS for a console is present. The GBA always boots on
+    /// the core's built-in replacement BIOS, so it needs no supplied file; the DS
+    /// still needs its ARM9/ARM7 images (firmware is optional).
     func hasRequiredBios(for console: Console) -> Bool {
         switch console {
-        case .gba: return isAvailable(.gbaBios)
+        case .gba: return true
         case .nds: return isAvailable(.ndsBios9) && isAvailable(.ndsBios7)
         }
     }
@@ -74,6 +78,8 @@ final class BIOSStore: ObservableObject {
     func bootImages(for console: Console, rom: Data) -> BootImages {
         switch console {
         case .gba:
+            // A nil BIOS tells the core to use its built-in replacement; a supplied
+            // file (imported or bundled) overrides it.
             return BootImages(rom: rom, bios: data(.gbaBios), bios7: nil, firmware: nil)
         case .nds:
             return BootImages(rom: rom, bios: data(.ndsBios9), bios7: data(.ndsBios7), firmware: nil)

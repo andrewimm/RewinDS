@@ -52,6 +52,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--debug-port" => {
                 debug_port = Some(args.next().ok_or("--debug-port needs a value")?.parse::<u16>()?);
             }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option {other}\n{USAGE}").into());
+            }
             _ => rom_path = Some(arg),
         }
     }
@@ -67,9 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bios = bios_path.as_ref().map(std::fs::read).transpose()?;
     let bios7 = bios7_path.as_ref().map(std::fs::read).transpose()?;
     let firmware = firmware_path.as_ref().map(std::fs::read).transpose()?;
-    if console == Console::Gba && bios.is_none() {
-        return Err(format!("the GBA needs a BIOS: {USAGE}").into());
-    }
+    // With no `--bios`, the GBA falls back to the built-in replacement BIOS.
     let mut emulator = Emulator::load(Load {
         console: Some(console),
         rom: rom.as_deref(),
