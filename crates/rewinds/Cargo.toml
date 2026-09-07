@@ -10,3 +10,7 @@ debug = { path = "../debug" }
 minifb = "0.27"
 cpal = "0.15"
 log = "0.4"
+
+[dev-dependencies]
+arm = { path = "../arm" }
+nds = { path = "../nds" }

@@ -41,12 +41,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rom_path: Option<String> = None;
     let mut bios_path: Option<String> = None;
     let mut bios7_path: Option<String> = None;
+    let mut firmware_path: Option<String> = None;
     let mut debug_port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bios" => bios_path = Some(args.next().ok_or("--bios needs a value")?),
             "--bios7" => bios7_path = Some(args.next().ok_or("--bios7 needs a value")?),
+            "--firmware" => firmware_path = Some(args.next().ok_or("--firmware needs a value")?),
             "--debug-port" => {
                 debug_port = Some(args.next().ok_or("--debug-port needs a value")?.parse::<u16>()?);
             }
@@ -64,6 +66,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rom = rom_path.as_ref().map(std::fs::read).transpose()?;
     let bios = bios_path.as_ref().map(std::fs::read).transpose()?;
     let bios7 = bios7_path.as_ref().map(std::fs::read).transpose()?;
+    let firmware = firmware_path.as_ref().map(std::fs::read).transpose()?;
     if console == Console::Gba && bios.is_none() {
         return Err(format!("the GBA needs a BIOS: {USAGE}").into());
     }
@@ -72,6 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         rom: rom.as_deref(),
         bios: bios.as_deref(),
         bios7: bios7.as_deref(),
+        firmware: firmware.as_deref(),
     })?;
 
     // A loaded GBA ROM brings a save backup: its type is detected from the ROM, an
@@ -153,6 +157,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         emulator.set_input(input);
+        // Hold L to shut the clamshell lid — the same discrete call a native host makes
+        // on background/foreground (raises the hinge interrupt; the game sleeps while
+        // held and wakes when released). Idempotent, so driving it every frame is fine.
+        emulator.set_lid(window.is_key_down(Key::L));
 
         // Debug mix toggles (GBA-specific dev conveniences, via the escape hatch):
         // F1 = DirectSound, F2 = PSG, F3 = output low-pass.
