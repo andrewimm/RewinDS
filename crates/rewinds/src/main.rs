@@ -8,7 +8,10 @@
 //! a future wgpu renderer would replace only the window/present code here.
 
 mod audio;
+mod link;
 mod logging;
+
+use link::Transport;
 
 use emulator::{button, Console, Emulator, Input, Load};
 use minifb::{Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
@@ -31,8 +34,8 @@ const KEY_MAP: &[(Key, u32)] = &[
     (Key::S, button::R),
 ];
 
-const USAGE: &str =
-    "usage: rewinds <rom.gba|rom.nds> [--bios <path>] [--bios7 <path>] [--debug-port N]";
+const USAGE: &str = "usage: rewinds <rom.gba|rom.nds> [--bios <path>] [--bios7 <path>] \
+[--debug-port N] [--link listen <port> | --link connect <host:port>]";
 
 fn main() -> Result<(), Box<dyn Error>> {
     logging::init();
@@ -43,6 +46,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut bios7_path: Option<String> = None;
     let mut firmware_path: Option<String> = None;
     let mut debug_port = None;
+    let mut link_listen: Option<u16> = None;
+    let mut link_connect: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -52,6 +57,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--debug-port" => {
                 debug_port = Some(args.next().ok_or("--debug-port needs a value")?.parse::<u16>()?);
             }
+            "--link" => match args.next().as_deref() {
+                Some("listen") => {
+                    link_listen = Some(args.next().ok_or("--link listen needs a port")?.parse()?);
+                }
+                Some("connect") => {
+                    link_connect = Some(args.next().ok_or("--link connect needs host:port")?);
+                }
+                _ => return Err(format!("--link expects 'listen <port>' or 'connect <host:port>'\n{USAGE}").into()),
+            },
             other if other.starts_with("--") => {
                 return Err(format!("unknown option {other}\n{USAGE}").into());
             }
@@ -78,6 +92,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         bios7: bios7.as_deref(),
         firmware: firmware.as_deref(),
     })?;
+
+    // Optional serial link: this host owns the carrier (TCP here). The emulator
+    // core stays carrier-blind — it just produces/consumes opaque frame bytes.
+    let mut serial_link: Option<link::TcpLink> = match (link_listen, link_connect) {
+        (Some(port), _) => Some(link::TcpLink::listen(port)?),
+        (_, Some(addr)) => Some(link::TcpLink::connect(&addr)?),
+        _ => None,
+    };
+    if let Some(l) = &serial_link {
+        emulator.set_link_config(true, l.id(), l.count());
+    }
 
     // A loaded GBA ROM brings a save backup: its type is detected from the ROM, an
     // optional `<rom>.sav.meta` sidecar may override it, and a `<rom>.sav` file
@@ -162,6 +187,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // on background/foreground (raises the hinge interrupt; the game sleeps while
         // held and wakes when released). Idempotent, so driving it every frame is fine.
         emulator.set_lid(window.is_key_down(Key::L));
+
+        // Serial link: deliver any peer frames that have arrived. The SIO busy-wait
+        // is itself the sync barrier, so no extra frame pacing is needed.
+        if let Some(l) = serial_link.as_mut() {
+            for frame in l.recv() {
+                emulator.link_deliver(&frame);
+            }
+        }
 
         // Debug mix toggles (GBA-specific dev conveniences, via the escape hatch):
         // F1 = DirectSound, F2 = PSG, F3 = output low-pass.
@@ -255,6 +288,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         } else {
             emulator.run_frame();
+        }
+
+        // Ship whatever serial frames the core produced this step.
+        if let Some(l) = serial_link.as_mut() {
+            while let Some(frame) = emulator.link_poll_out() {
+                let f = frame.to_vec();
+                l.send(&f);
+            }
         }
 
         // Present every screen, stacked top-to-bottom.

@@ -34,6 +34,7 @@ pub use interrupt::{InterruptController, IrqSource};
 pub use io::{Io, PowerState, SystemControl};
 pub use keypad::{Key, Keypad};
 pub use machine::Gba;
+pub use serial::{Serial, LINK_FRAME_LEN};
 pub use ppu::debug::{
     ExplainError, PixelExplanation, ScanlineExplanation, SourceProvenance, VideoInstrumentation,
 };

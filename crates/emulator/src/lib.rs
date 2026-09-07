@@ -386,6 +386,50 @@ impl Emulator {
         }
     }
 
+    // --- Serial link (host owns the carrier) --------------------------------
+
+    /// Configure the serial link: whether a carrier is attached, this unit's id
+    /// (0 = parent/master, 1-3 = child), and the number of linked units (2-4).
+    /// Discrete, host-driven (like [`Self::set_lid`]). No-op on the DS.
+    pub fn set_link_config(&mut self, connected: bool, id: u8, count: u8) {
+        if let Emulator::Gba(g) = self {
+            g.system.gba.bus.io.serial_set_link(connected, id, count);
+        }
+    }
+
+    /// Take the next serial frame the core wants transmitted, as opaque bytes for
+    /// the host to relay over its carrier. The slice borrows the emulator and is
+    /// valid until the next mutating call. `None` when there is nothing to send.
+    pub fn link_poll_out(&mut self) -> Option<&[u8]> {
+        match self {
+            Emulator::Gba(g) => match g.system.gba.bus.io.serial_poll_out() {
+                Some(bytes) => {
+                    g.link_out = bytes;
+                    Some(&g.link_out)
+                }
+                None => None,
+            },
+            Emulator::Nds(_) => None,
+        }
+    }
+
+    /// Deliver a peer's serial frame received from the carrier (may complete a
+    /// transfer and raise the serial interrupt). No-op on the DS.
+    pub fn link_deliver(&mut self, bytes: &[u8]) {
+        if let Emulator::Gba(g) = self {
+            g.system.gba.bus.io.serial_deliver(bytes);
+        }
+    }
+
+    /// Whether a serial transfer is in progress — the host should keep pumping
+    /// [`Self::link_poll_out`] / [`Self::link_deliver`].
+    pub fn link_pending(&self) -> bool {
+        match self {
+            Emulator::Gba(g) => g.system.gba.bus.io.serial_pending(),
+            Emulator::Nds(_) => false,
+        }
+    }
+
     // --- Escape hatches (GBA-specific tooling) ------------------------------
 
     /// The underlying GBA system, if this is a GBA. For GBA-specific tooling (the
@@ -561,6 +605,9 @@ pub struct GbaEmulator {
     rgba: Vec<u8>,
     audio: Option<audio::AudioSink>,
     audio_muted: bool,
+    /// Stable backing for the outbound serial frame returned by
+    /// [`Emulator::link_poll_out`] (valid until the next mutating call).
+    link_out: [u8; gba::LINK_FRAME_LEN],
 }
 
 impl GbaEmulator {
@@ -570,6 +617,7 @@ impl GbaEmulator {
             rgba: vec![0; gba_screen::WIDTH * gba_screen::HEIGHT * 4],
             audio: None,
             audio_muted: false,
+            link_out: [0; gba::LINK_FRAME_LEN],
         };
         g.refresh_rgba();
         g

@@ -191,6 +191,29 @@ impl Io {
         }
     }
 
+    // --- Serial link (carrier-agnostic; the host relays the frame bytes) ---
+
+    /// Configure the link topology (connected, this unit's id, unit count).
+    pub fn serial_set_link(&mut self, connected: bool, id: u8, count: u8) {
+        self.serial.set_link(connected, id, count);
+    }
+
+    /// Take the frame the SIO wants transmitted, if any (host sends it on).
+    pub fn serial_poll_out(&mut self) -> Option<[u8; crate::serial::LINK_FRAME_LEN]> {
+        self.serial.poll_out()
+    }
+
+    /// Deliver a peer's frame received from the carrier (may complete a transfer
+    /// and raise the serial IRQ).
+    pub fn serial_deliver(&mut self, bytes: &[u8]) {
+        self.serial.deliver(bytes, &mut self.irq);
+    }
+
+    /// Whether a serial transfer is in progress (the host should keep pumping).
+    pub fn serial_pending(&self) -> bool {
+        self.serial.pending()
+    }
+
     // --- MMIO access, composed from 16-bit registers ---
 
     /// Read `width` bytes of I/O at `offset` (relative to `04000000h`).

@@ -490,6 +490,67 @@ pub unsafe extern "C" fn rewinds_clear_save_dirty(p: *mut RewindsEmulator) {
     }
 }
 
+// --- Serial link (host owns the carrier; frames are opaque bytes) -----------
+
+/// Configure the serial link: whether a carrier is attached, this unit's id
+/// (0 = parent/master, 1-3 = child), and the number of linked units (2-4).
+///
+/// # Safety
+/// `p` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_link_set_config(
+    p: *mut RewindsEmulator,
+    connected: bool,
+    id: u8,
+    count: u8,
+) {
+    if let Some(e) = emu(p) {
+        e.set_link_config(connected, id, count);
+    }
+}
+
+/// Take the next serial frame to transmit, writing a borrowed span into `out`
+/// (empty when there is nothing to send). The span is valid until the next
+/// mutating call; the host copies it before transmitting.
+///
+/// # Safety
+/// `p` must be null or a live handle; `out` must be non-null and writable.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_link_poll_out(p: *mut RewindsEmulator, out: *mut RewindsBytes) {
+    if out.is_null() {
+        return;
+    }
+    *out = match emu(p).and_then(|e| e.link_poll_out()) {
+        Some(d) => RewindsBytes { ptr: d.as_ptr(), len: d.len() },
+        None => RewindsBytes { ptr: null(), len: 0 },
+    };
+}
+
+/// Deliver a peer's serial frame received from the carrier.
+///
+/// # Safety
+/// `p` must be null or a live handle; `bytes`/`len` must describe a readable span
+/// that outlives the call.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_link_deliver(
+    p: *mut RewindsEmulator,
+    bytes: *const u8,
+    len: usize,
+) {
+    if let (Some(e), Some(frame)) = (emu(p), borrow(bytes, len)) {
+        e.link_deliver(frame);
+    }
+}
+
+/// Whether a serial transfer is in progress (the host should keep pumping).
+///
+/// # Safety
+/// `p` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_link_pending(p: *mut RewindsEmulator) -> bool {
+    emu(p).map(|e| e.link_pending()).unwrap_or(false)
+}
+
 /// Write the save type's name (e.g. `"flash128k"`) as UTF-8 (no NUL) into `buf`,
 /// returning the number of bytes written (truncated to `cap`). Pass a null `buf` /
 /// `cap` of 0 to query the length.
@@ -537,7 +598,7 @@ pub unsafe extern "C" fn rewinds_set_save_type_by_name(
 /// so a host can refuse a mismatched framework.
 #[no_mangle]
 pub extern "C" fn rewinds_core_version() -> u32 {
-    1
+    2
 }
 
 #[cfg(test)]
