@@ -50,8 +50,8 @@ The `gba` crate embeds it via `gba::default_bios()`.
   `GetBiosChecksum` (0x0D), `BgAffineSet` (0x0E), `ObjAffineSet` (0x0F),
   `BitUnPack` (0x10), `LZ77UnComp`
   Wram/Vram (0x11/0x12), `HuffUnComp` (0x13), `RLUnComp` Wram/Vram (0x14/0x15),
-  `Diff8bitUnFilter` Wram/Vram (0x16/0x17), and `Diff16bitUnFilter` (0x18).
-  Every other SWI currently returns as a no-op.
+  `Diff8bitUnFilter` Wram/Vram (0x16/0x17), `Diff16bitUnFilter` (0x18), and
+  `SoundBias` (0x19). Every other SWI currently returns as a no-op.
 - **IRQ**: the documented BIOS interrupt entry that saves context, forwards to
   the user handler at `[0x03007FFC]`, and returns via `subs pc, lr, #4`.
 
@@ -103,10 +103,18 @@ the BIOS, so its reads see the real bytes). It returns *this* image's checksum,
 not a real BIOS's `0xBAAE187F` — hardcoding that would be dishonest and
 inconsistent with the bytes actually present.
 
+`SoundBias` sets the `SOUNDBIAS` level (0 or 0x200), preserving the upper
+amplitude-resolution bits. The hardware ramps to the target with small delays to
+avoid an audible click; only the final register value is observable, so it is
+set directly.
+
 ## Not yet implemented
 
-The sound-driver SWIs (`SoundBias`, `SoundDriver*`, `MidiKey2Freq`, `MultiBoot`),
-and the boot logo intro. See the crate memory / project notes for the roadmap.
+The MP2K sound-driver SWIs (`SoundDriverInit`/`Mode`/`Main`/`VSync`,
+`SoundChannelClear`, `MidiKey2Freq`, `MultiBoot`, 0x1A–0x2A), which need the
+driver's work-area structures, and the boot logo intro. Most commercial games
+ship their own sound engine and never call these. See the crate memory / project
+notes for the roadmap.
 
 ## Tests
 

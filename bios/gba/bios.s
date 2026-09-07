@@ -133,7 +133,7 @@ swi_table:
     b swi_diff8_wram        @ 0x16 Diff8bitUnFilterWram
     b swi_diff8_vram        @ 0x17 Diff8bitUnFilterVram
     b swi_diff16            @ 0x18 Diff16bitUnFilter
-    b swi_stub              @ 0x19 SoundBias
+    b swi_sound_bias        @ 0x19 SoundBias
     b swi_stub              @ 0x1A SoundDriverInit
     b swi_stub              @ 0x1B SoundDriverMode
     b swi_stub              @ 0x1C SoundDriverMain
@@ -348,6 +348,21 @@ swi_cpu_fast_set:
     subs  r3, r3, #1
     bne   .Lcfs_fill_loop
     b     swi_return
+
+@ SWI 0x19 SoundBias: set the SOUNDBIAS level (0x04000088), keeping the upper
+@ bits (amplitude resolution). r0 = 0 -> level 0x000, non-zero -> level 0x200.
+@ Hardware ramps there with small delays to avoid a click; only the final
+@ register value is observable, so this sets it directly. No return value.
+swi_sound_bias:
+    ldr   r2, =0x04000088
+    ldrh  r3, [r2]
+    bic   r3, r3, #0x300
+    bic   r3, r3, #0xFF        @ clear the bias level (bits 0-9)
+    cmp   r0, #0
+    orrne r3, r3, #0x200       @ non-zero -> normal bias level 0x200
+    strh  r3, [r2]
+    b     swi_return
+    .pool
 
 @ SWI 0x0D GetBiosChecksum (undocumented): sum the whole 16 KiB BIOS as 32-bit
 @ words. Running inside the BIOS, its reads see the real bytes. Returns our own

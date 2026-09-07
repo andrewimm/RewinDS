@@ -967,6 +967,21 @@ fn register_ram_reset_clears_palette_vram_and_oam() {
 }
 
 #[test]
+fn sound_bias_sets_level_and_preserves_upper_bits() {
+    let mut sys = booted(gba::default_bios());
+    // Upper bits (amplitude resolution) set, plus an arbitrary current level.
+    sys.gba.bus.io.apu.write16(0x088, 0xC155, 0xFFFF);
+    invoke_swi(&mut sys, 0x19, 1, 0); // non-zero -> level 0x200
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    assert_eq!(sys.gba.bus.io.apu.read16(0x088), 0xC200);
+
+    sys.gba.bus.io.apu.write16(0x088, 0xC155, 0xFFFF);
+    invoke_swi(&mut sys, 0x19, 0, 0); // zero -> level 0x000
+    assert!(run_until_swi_returns(&mut sys, 5000));
+    assert_eq!(sys.gba.bus.io.apu.read16(0x088), 0xC000);
+}
+
+#[test]
 fn get_bios_checksum_sums_the_image() {
     // GetBiosChecksum reads the BIOS in 32-bit units and adds them up. It runs
     // inside the BIOS, so the read-protection returns the real bytes. We return
