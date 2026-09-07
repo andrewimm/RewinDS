@@ -27,8 +27,18 @@ final class EmulatorSession: NSObject, ObservableObject {
 
     private var thread: Thread?
     private var alive = false
-    private var paused = false
     private var frameCounter: UInt64 = 0
+
+    /// Reasons the emulator is currently paused. The run loop advances only when the set
+    /// is empty, so independent causes compose correctly — e.g. backgrounding while the
+    /// in-game menu is open won't resume the game when you return until you close the menu.
+    /// Guarded by `stateLock`.
+    private struct PauseReason: OptionSet {
+        let rawValue: Int
+        static let lifecycle = PauseReason(rawValue: 1 << 0) // app inactive/background
+        static let menu = PauseReason(rawValue: 1 << 1)      // in-game menu open
+    }
+    private var pauseReasons: PauseReason = []
 
     /// Weak references to the screen views, keyed by index, so the view hierarchy owns
     /// their lifetime and the session just borrows them each tick. Guarded by `stateLock`.
@@ -82,34 +92,46 @@ final class EmulatorSession: NSObject, ObservableObject {
         OrientationLock.unlock()
     }
 
-    /// App backgrounded: close the DS lid (sleep), flush, pause the clock and audio.
+    /// Add or clear a pause reason, pausing/resuming audio on the empty↔non-empty edge.
+    private func setPause(_ reason: PauseReason, _ on: Bool) {
+        stateLock.lock()
+        let wasPaused = !pauseReasons.isEmpty
+        if on { pauseReasons.insert(reason) } else { pauseReasons.remove(reason) }
+        let nowPaused = !pauseReasons.isEmpty
+        stateLock.unlock()
+        if nowPaused && !wasPaused { audio?.pause() }
+        else if !nowPaused && wasPaused { audio?.resume() }
+    }
+
+    /// App backgrounded: close the DS lid (sleep), flush, and pause.
     func enterBackground() {
-        stateLock.lock(); paused = true; stateLock.unlock()
+        setPause(.lifecycle, true)
         coreLock.lock()
         core.setLid(closed: true)
         saveStore.flushIfDirty(core, romId: romId)
         coreLock.unlock()
-        audio?.pause()
     }
 
     /// App lost focus without backgrounding (app switcher, Control Center, a system
-    /// prompt): freeze the clock and silence audio, keeping all state exactly as-is.
-    /// Lighter than `enterBackground` — no lid sleep, no flush — so a quick peek resumes
-    /// instantly on `enterForeground`.
+    /// prompt): freeze and silence, keeping all state exactly as-is. Lighter than
+    /// `enterBackground` — no lid sleep, no flush — so a quick peek resumes instantly.
     func pause() {
-        stateLock.lock(); paused = true; stateLock.unlock()
-        audio?.pause()
+        setPause(.lifecycle, true)
     }
 
-    /// App foregrounded: wake the lid and resume.
+    /// App foregrounded: wake the lid and clear the lifecycle pause (the game stays paused
+    /// if the in-game menu is still up).
     func enterForeground() {
         guard thread != nil else { return }
         coreLock.lock()
         core.setLid(closed: false)
         coreLock.unlock()
-        audio?.resume()
-        stateLock.lock(); paused = false; stateLock.unlock()
+        setPause(.lifecycle, false)
     }
+
+    /// Open/close the in-game menu, pausing the game while it's up.
+    func openMenu() { setPause(.menu, true) }
+    func closeMenu() { setPause(.menu, false) }
 
     /// Write the battery save to disk now (the Save toolbar action).
     func saveNow() {
@@ -163,7 +185,7 @@ final class EmulatorSession: NSObject, ObservableObject {
         while true {
             stateLock.lock()
             let live = alive
-            let isPaused = paused
+            let isPaused = !pauseReasons.isEmpty
             stateLock.unlock()
             guard live else { break }
 

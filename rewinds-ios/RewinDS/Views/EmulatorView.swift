@@ -9,6 +9,7 @@ struct EmulatorView: View {
     // A reference type held stably for the life of this view.
     @State private var registry = ControlRegistry()
     @State private var toast: String?
+    @State private var showMenu = false
 
     // Dev HUD: show the live frame counter when launched from the test harness.
     @State private var hudFrame: UInt64 = 0
@@ -22,11 +23,11 @@ struct EmulatorView: View {
             case .gba:
                 GBALayout(
                     session: session, shell: shell, registry: registry,
-                    onSave: save, onMenu: exit)
+                    onSave: save, onMenu: openMenu)
             case .nds:
                 DSLayout(
                     session: session, shell: shell, registry: registry,
-                    onSave: save, onRewind: rewind, onMenu: exit)
+                    onSave: save, onRewind: rewind, onMenu: openMenu)
             }
         }
         .overlay(alignment: .bottomLeading) {
@@ -51,6 +52,16 @@ struct EmulatorView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        .overlay {
+            if showMenu {
+                PauseMenu(
+                    shell: shell,
+                    onResume: resumeGame,
+                    onSave: { session.saveNow() },
+                    onQuit: { model.exitGame() })
+                .transition(.opacity)
+            }
+        }
     }
 
     private func save() {
@@ -58,8 +69,14 @@ struct EmulatorView: View {
         flash("Saved")
     }
 
-    private func exit() {
-        model.exitGame()
+    private func openMenu() {
+        session.openMenu()
+        withAnimation(.easeOut(duration: 0.2)) { showMenu = true }
+    }
+
+    private func resumeGame() {
+        withAnimation(.easeOut(duration: 0.2)) { showMenu = false }
+        session.closeMenu()
     }
 
     private func rewind() {
@@ -74,5 +91,65 @@ struct EmulatorView: View {
             try? await Task.sleep(for: .seconds(1.3))
             withAnimation(.easeOut(duration: 0.25)) { toast = nil }
         }
+    }
+}
+
+/// The in-game pause overlay. Emulation is already frozen by the session while this is
+/// up; tapping the dimmed backdrop or Resume returns to the game.
+private struct PauseMenu: View {
+    let shell: Shell
+    let onResume: () -> Void
+    let onSave: () -> Void
+    let onQuit: () -> Void
+
+    @State private var savedConfirm = false
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onResume)
+
+            VStack(spacing: 12) {
+                Text("Paused")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.bottom, 4)
+
+                button("Resume", "play.fill", tint: shell.accent, action: onResume)
+                button(savedConfirm ? "Saved ✓" : "Save", "square.and.arrow.down",
+                       tint: .white.opacity(0.16)) {
+                    onSave()
+                    withAnimation { savedConfirm = true }
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.2))
+                        withAnimation { savedConfirm = false }
+                    }
+                }
+                button("Quit to Library", "rectangle.portrait.and.arrow.right",
+                       tint: .red.opacity(0.85), action: onQuit)
+            }
+            .padding(22)
+            .frame(maxWidth: 300)
+            .background(shell.background, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(.white.opacity(0.08)))
+            .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
+            .padding(40)
+        }
+    }
+
+    private func button(_ title: String, _ icon: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(tint)
+        .foregroundStyle(.white)
     }
 }
