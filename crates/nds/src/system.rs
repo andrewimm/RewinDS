@@ -292,6 +292,10 @@ pub struct Machine {
     /// `KEYINPUT` (`0x4000130`): the ten buttons, active-low (a set bit = released),
     /// readable by both cores.
     pub(crate) keyinput: u16,
+    /// `KEYCNT` (`0x4000132`) per core: the keypad-interrupt condition — key mask
+    /// (bits 0-9), IRQ enable (bit 14), and OR/AND mode (bit 15). Each core configures
+    /// its own so either can be woken by a key press.
+    pub(crate) keycnt: [u16; 2],
     /// `EXTKEYIN` (`0x4000136`, ARM7): the X/Y buttons, pen-down, and hinge, all
     /// active-low with the unused bits set. Default = nothing pressed, pen up, hinge
     /// open; a booting game checks the pen bit before sampling the touchscreen.
@@ -361,6 +365,7 @@ impl Machine {
             timing: [CoreTiming::default(), CoreTiming::default()],
             exec_pc: [0, 0],
             keyinput: 0x03FF,   // all released
+            keycnt: [0; 2],
             extkeyin: 0x007F,   // X/Y released, pen up, hinge open
             postflg: [0, 0],
             halted: [false, false],
@@ -507,6 +512,28 @@ impl Machine {
         }
     }
 
+    /// Raise the keypad interrupt on `core` when the pressed keys satisfy its `KEYCNT`
+    /// condition: bit 14 enables it, bit 15 selects AND (every selected key) vs OR (any
+    /// selected key) over the bit 0-9 key mask. `KEYINPUT` is active-low, so a *pressed*
+    /// key reads as a cleared bit. Evaluated whenever the key state or `KEYCNT` changes,
+    /// so a menu or title that sleeps on a key press is woken.
+    fn check_keypad_irq(&mut self, core: Core) {
+        let cnt = self.keycnt[core.index()];
+        if cnt & (1 << 14) == 0 {
+            return;
+        }
+        let selected = cnt & 0x03FF;
+        let pressed = !self.keyinput & 0x03FF;
+        let matched = if cnt & (1 << 15) != 0 {
+            selected != 0 && (pressed & selected) == selected
+        } else {
+            (pressed & selected) != 0
+        };
+        if matched {
+            self.interrupts[core.index()].request(crate::interrupt::IrqSource::Keypad);
+        }
+    }
+
     /// Route a write to the gamecard registers (`40001A0h`..`40001BFh`). ROMCTRL is
     /// read-modify-written so any access width works; a start bit launches the
     /// transfer. The command buffer takes byte writes; the KEY2 seed ports are
@@ -624,6 +651,7 @@ impl Machine {
             0x0400_0180 => self.ipc.read_sync(core) as u32,
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
+            0x0400_0132 => self.keycnt[c] as u32, // KEYCNT (per core)
             0x0400_0136 if core == Core::Arm7 => self.extkeyin as u32,
             0x0400_0138 if core == Core::Arm7 => self.rtc.read(),
             0x0400_0204 => self.exmemcnt as u32, // EXMEMCNT/EXMEMSTAT (both cores)
@@ -775,6 +803,13 @@ impl Machine {
                 self.spi.write_cnt(value as u16);
             } else {
                 self.spi.write_data(value as u16);
+                // A byte transfer completes instantly here; raise the SPI IRQ if the
+                // requester enabled it (SPICNT bit 14). An IRQ-driven SPI driver waits
+                // on this instead of polling the busy flag.
+                if self.spi.read_cnt() & (1 << 14) != 0 {
+                    self.interrupts[Core::Arm7.index()]
+                        .request(crate::interrupt::IrqSource::Spi);
+                }
             }
             return;
         }
@@ -804,6 +839,12 @@ impl Machine {
             0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(0, value, bytes),
             0x0400_1000 if core == Core::Arm9 => self.ppu.write_dispcnt(1, value, bytes),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
+            0x0400_0132 => {
+                // KEYCNT: arming or reconfiguring the condition can immediately satisfy
+                // it against the keys already held, so re-check right away.
+                self.keycnt[c] = value as u16;
+                self.check_keypad_irq(core);
+            }
             0x0400_0180 => self.ipc.write_sync(core, value as u16, &mut self.interrupts),
             0x0400_0184 => self
                 .ipc
@@ -1775,6 +1816,9 @@ impl System {
         let owned = (1 << 6) | (1 << 7);
         ext = (ext & !owned) | (self.machine.extkeyin & owned);
         self.machine.extkeyin = ext;
+        // A key press can satisfy either core's KEYCNT condition and wake it.
+        self.machine.check_keypad_irq(Core::Arm9);
+        self.machine.check_keypad_irq(Core::Arm7);
     }
 
     /// The currently-pressed keypad mask in [`Self::set_keypad`] bit order (A..L, plus X
@@ -2590,6 +2634,45 @@ mod tests {
         assert_eq!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
         system.machine.poll_gxfifo_irq();
         assert_ne!(system.interrupts(Core::Arm9).iflags() & gxfifo, 0);
+    }
+
+    #[test]
+    fn keypad_irq_fires_when_pressed_keys_match_keycnt() {
+        use crate::IrqSource;
+        let keypad = IrqSource::Keypad.mask();
+        // Arm the ARM9 keypad IRQ for the A button (bit 0), OR mode, enabled (bit 14).
+        let mut system = System::new();
+        system.io_write(Core::Arm9, 0x0400_0132, (1 << 14) | (1 << 0), 2);
+        assert_eq!(system.interrupts(Core::Arm9).iflags() & keypad, 0);
+        // Pressing A satisfies the condition and raises the interrupt.
+        system.set_keypad(1 << 0);
+        assert_ne!(system.interrupts(Core::Arm9).iflags() & keypad, 0);
+
+        // An unselected key (B) does not, and neither does a disabled KEYCNT.
+        let mut off = System::new();
+        off.io_write(Core::Arm9, 0x0400_0132, (1 << 14) | (1 << 0), 2);
+        off.set_keypad(1 << 1);
+        assert_eq!(off.interrupts(Core::Arm9).iflags() & keypad, 0);
+    }
+
+    #[test]
+    fn spi_irq_fires_on_transfer_when_enabled() {
+        use crate::IrqSource;
+        let spi = IrqSource::Spi.mask();
+        let firmware = 1u32 << 8; // SPICNT device select bits 8-9 = 1
+        // Bus enable (bit 15) + transfer IRQ (bit 14) + firmware device.
+        let mut system = System::new();
+        system.io_write(Core::Arm7, 0x0400_01C0, (1 << 15) | (1 << 14) | firmware, 2);
+        assert_eq!(system.interrupts(Core::Arm7).iflags() & spi, 0);
+        // A byte transfer completes instantly and raises the SPI IRQ on the ARM7.
+        system.io_write(Core::Arm7, 0x0400_01C2, 0, 2);
+        assert_ne!(system.interrupts(Core::Arm7).iflags() & spi, 0);
+
+        // Without the IRQ enable bit, the same transfer raises nothing.
+        let mut off = System::new();
+        off.io_write(Core::Arm7, 0x0400_01C0, (1 << 15) | firmware, 2);
+        off.io_write(Core::Arm7, 0x0400_01C2, 0, 2);
+        assert_eq!(off.interrupts(Core::Arm7).iflags() & spi, 0);
     }
 
     #[test]

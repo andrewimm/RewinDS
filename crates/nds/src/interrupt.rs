@@ -30,8 +30,14 @@ pub enum IrqSource {
     IpcRecvNotEmpty = 18,
     /// A gamecard block transfer completed (`AUXSPICNT` bit 14 enables it).
     Gamecard = 19,
+    /// The pressed keys matched the `KEYCNT` (`0x4000132`) condition — bit 14 enables
+    /// it, bit 15 selects OR (any selected key) / AND (all selected keys). Menus and
+    /// title screens that sleep on a key press wake through this rather than polling.
+    Keypad = 12,
     /// The 3D geometry command FIFO reached its `GXSTAT` IRQ condition (ARM9 only).
     GxFifo = 21,
+    /// An ARM7 SPI bus transfer completed with its IRQ enabled (`SPICNT` bit 14).
+    Spi = 23,
     /// The clamshell lid opened or closed ("screens unfolding"; ARM7 only). The hinge
     /// sensor raises this on every open/close transition; a game's handler uses it to
     /// enter or leave sleep, so it also wakes the ARM7 from a halt.
