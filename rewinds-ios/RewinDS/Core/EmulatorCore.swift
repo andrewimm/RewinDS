@@ -148,6 +148,26 @@ final class EmulatorCore {
     var saveDirty: Bool { rewinds_save_dirty(handle) }
     func clearSaveDirty() { rewinds_clear_save_dirty(handle) }
 
+    /// The cartridge save type's name (e.g. "FLASH1M"), or "none" for a console without
+    /// configurable save types (the DS).
+    func saveTypeName() -> String {
+        var buf = [UInt8](repeating: 0, count: 32)
+        let n = buf.withUnsafeMutableBufferPointer {
+            rewinds_save_type_name(handle, $0.baseAddress, UInt($0.count))
+        }
+        return String(decoding: buf.prefix(Int(n)), as: UTF8.self)
+    }
+
+    /// Override the save type by name (from a host sidecar). Returns whether it was
+    /// accepted (an unknown name or a DS handle returns false).
+    @discardableResult
+    func setSaveType(name: String) -> Bool {
+        let bytes = Array(name.utf8)
+        return bytes.withUnsafeBufferPointer {
+            rewinds_set_save_type_by_name(handle, $0.baseAddress, UInt($0.count))
+        }
+    }
+
     // --- Audio ----------------------------------------------------------------
 
     /// Attach an audio output at `rate` Hz / `channels` channels; returns a consumer
