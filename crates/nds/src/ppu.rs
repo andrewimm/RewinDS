@@ -57,6 +57,11 @@ struct Engine {
     /// modes, and drops the DISPCNT char/screen base bits.
     is_b: bool,
     dispcnt: u32,
+    /// `MASTER_BRIGHT` (`0x400006C` / `0x400106C`): a whole-screen fade applied to the
+    /// engine's final output — bits 14-15 pick the mode (1 = brighten toward white,
+    /// 2 = darken toward black), bits 0-4 the 1/16 factor. Games fade a screen fully to
+    /// black/white through this (intro transitions), which reads as the screen "off".
+    master_bright: u16,
     registers: video2d::Registers,
     framebuffer: Vec<u16>,
     render_fb: video2d::state::Framebuffer,
@@ -78,6 +83,7 @@ impl Engine {
         Engine {
             is_b,
             dispcnt: 0,
+            master_bright: 0,
             registers: video2d::Registers::default(),
             framebuffer: vec![0; WIDTH * HEIGHT],
             render_fb: video2d::state::Framebuffer::new(WIDTH, HEIGHT),
@@ -125,6 +131,26 @@ impl Engine {
             }
             // Display off, or main-memory FIFO (unmodelled): black.
             _ => self.framebuffer.fill(0),
+        }
+        self.apply_master_bright();
+    }
+
+    /// Fade the composited framebuffer per `MASTER_BRIGHT`. Mode 1 brightens each
+    /// BGR555 channel toward 31 (white), mode 2 darkens toward 0 (black), by
+    /// `factor/16` (factor clamped to 16 = a full fade); modes 0/3 do nothing.
+    fn apply_master_bright(&mut self) {
+        let mode = (self.master_bright >> 14) & 3;
+        let factor = (self.master_bright & 0x1F).min(16) as u32;
+        if factor == 0 || (mode != 1 && mode != 2) {
+            return;
+        }
+        for px in self.framebuffer.iter_mut() {
+            let chan = |shift: u32| {
+                let c = ((*px >> shift) & 0x1F) as u32;
+                let c = if mode == 1 { c + (31 - c) * factor / 16 } else { c - c * factor / 16 };
+                (c as u16) << shift
+            };
+            *px = (*px & 0x8000) | chan(0) | chan(5) | chan(10);
         }
     }
 
@@ -291,6 +317,10 @@ pub struct Ppu {
     vcount: u16,
     frame: u64,
     started: bool,
+    /// `POWCNT1` (`0x4000304`) power bits that gate the display: bit 0 = both LCDs,
+    /// bit 1 = 2D Engine A, bit 9 = 2D Engine B. A cleared bit blanks that screen even
+    /// when the engine would otherwise draw. Powers up with the LCDs + both engines on.
+    powcnt1: u16,
 }
 
 impl Default for Ppu {
@@ -307,6 +337,28 @@ impl Ppu {
             vcount: 0,
             frame: 0,
             started: false,
+            // LCDs + both 2D engines powered (bits 0, 1, 9), matching the firmware's
+            // hand-off state; a booting game rewrites this.
+            powcnt1: 1 | (1 << 1) | (1 << 9),
+        }
+    }
+
+    /// Update the display-power bits from a `POWCNT1` write (only bits 0/1/9 matter to
+    /// the 2D present path; the 3D/rendering bits are handled elsewhere).
+    pub fn set_powcnt1(&mut self, value: u16) {
+        self.powcnt1 = value;
+    }
+
+    /// Blank the framebuffer of any screen `POWCNT1` powers down — the LCDs off
+    /// (bit 0), or 2D Engine A (bit 1) / Engine B (bit 9) off — so a disabled screen
+    /// presents nothing regardless of what its engine composited.
+    fn blank_powered_off_engines(&mut self) {
+        let lcds = self.powcnt1 & 1 != 0;
+        if !lcds || self.powcnt1 & (1 << 1) == 0 {
+            self.engines[0].framebuffer.fill(0);
+        }
+        if !lcds || self.powcnt1 & (1 << 9) == 0 {
+            self.engines[1].framebuffer.fill(0);
         }
     }
 
@@ -332,6 +384,15 @@ impl Ppu {
     /// A snapshot of an engine's `video2d` register file, for debugging.
     pub fn engine_registers(&self, engine: usize) -> video2d::Registers {
         self.engines[engine].registers
+    }
+
+    /// `MASTER_BRIGHT` (whole-screen fade) for an engine (0 = A, 1 = B).
+    pub fn write_master_bright(&mut self, engine: usize, value: u16) {
+        self.engines[engine].master_bright = value;
+    }
+
+    pub fn master_bright(&self, engine: usize) -> u16 {
+        self.engines[engine].master_bright
     }
 
     /// Debug: render each 2D BG (0-3) and OBJ (index 4) of `engine` in isolation
@@ -544,6 +605,7 @@ impl Ppu {
                     // expects).
                     self.engines[0].render(vram, &palette[..0x400], &oam[..0x400], three_d);
                     self.engines[1].render(vram, &palette[0x400..], &oam[0x400..], None);
+                    self.blank_powered_off_engines();
                     self.frame += 1;
                     for (c, irq) in irqs.iter_mut().enumerate() {
                         if self.dispstat[c] & (1 << 3) != 0 {
@@ -573,6 +635,56 @@ impl Ppu {
 mod tests {
     use super::*;
     use crate::vram::Vram;
+
+    /// `MASTER_BRIGHT` is a whole-screen fade over the engine's composite: a full fade
+    /// to black (mode 2) or white (mode 1) must blank the screen even though the layers
+    /// still draw — the intro transitions rely on it, so an unfaded screen shows content
+    /// that should be hidden.
+    #[test]
+    fn master_bright_full_fade_overrides_the_composite() {
+        let mut ppu = Ppu::new();
+        let vram = Vram::new();
+        let mut palette = vec![0u8; 0x800];
+        palette[0..2].copy_from_slice(&0x001Fu16.to_le_bytes()); // backdrop = red
+        let oam = vec![0u8; 0x800];
+        ppu.write_dispcnt(0, 1 << 16, 4); // graphics display mode, backdrop only
+
+        // No fade: the backdrop shows through as red.
+        let fb = ppu.debug_render_engine(0, &vram, &palette, &oam, None);
+        assert!(fb.iter().all(|&p| p & 0x7FFF == 0x001F));
+        // Full fade to black (mode 2, factor 16): every pixel collapses to 0.
+        ppu.write_master_bright(0, (2 << 14) | 16);
+        let fb = ppu.debug_render_engine(0, &vram, &palette, &oam, None);
+        assert!(fb.iter().all(|&p| p & 0x7FFF == 0), "fade-to-black blanks the screen");
+        // Full fade to white (mode 1): every pixel saturates to 0x7FFF.
+        ppu.write_master_bright(0, (1 << 14) | 16);
+        let fb = ppu.debug_render_engine(0, &vram, &palette, &oam, None);
+        assert!(fb.iter().all(|&p| p & 0x7FFF == 0x7FFF), "fade-to-white whitens the screen");
+    }
+
+    /// `POWCNT1` gates the present: powering down an engine (bit 1 = A, bit 9 = B) or the
+    /// LCDs (bit 0) blanks that screen. Regression test for a disabled screen still
+    /// showing its (stale) composite.
+    #[test]
+    fn powcnt1_blanks_a_powered_off_engine() {
+        let mut ppu = Ppu::new();
+        let vram = Vram::new();
+        let mut palette = vec![0u8; 0x800];
+        palette[0..2].copy_from_slice(&0x001Fu16.to_le_bytes()); // A backdrop = red
+        palette[0x400..0x402].copy_from_slice(&0x03E0u16.to_le_bytes()); // B backdrop = green
+        let oam = vec![0u8; 0x800];
+        ppu.write_dispcnt(0, 1 << 16, 4);
+        ppu.write_dispcnt(1, 1 << 16, 4);
+        // Fill both engines' framebuffers with their composite.
+        ppu.debug_render_engine(0, &vram, &palette, &oam, None);
+        ppu.debug_render_engine(1, &vram, &palette, &oam, None);
+
+        // Engine A powered off (bit 1 clear), Engine B + LCDs on.
+        ppu.set_powcnt1(1 | (1 << 9));
+        ppu.blank_powered_off_engines();
+        assert!(ppu.framebuffer(0).iter().all(|&p| p == 0), "engine A blanked");
+        assert!(ppu.framebuffer(1).iter().all(|&p| p & 0x7FFF == 0x03E0), "engine B untouched");
+    }
 
     /// An extended (affine-addressed) background must advance its reference point down
     /// the frame, so different scanlines sample different map rows. Regression test for

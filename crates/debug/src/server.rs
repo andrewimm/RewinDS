@@ -412,8 +412,32 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             let engine = enginep(params);
             let mode = Debugger::new(emu).video().current_mode(engine);
             let mut out = json!({ "engine": engine, "mode": mode });
-            // GBA carries the richer register/background summary; the DS's per-BG state
-            // is available through video.scanline / video.explainPixel instead.
+            // The DS reports each engine's DISPCNT + per-background configuration via its
+            // register snapshot; the GBA carries an equivalent summary from its own io.
+            if let Some(regs) = Debugger::new(emu).video().engine_registers(engine) {
+                let dispcnt = Debugger::new(emu).video().nds_dispcnt(engine).unwrap_or(0);
+                let display_mode = (dispcnt >> 16) & 3;
+                let display_mode_name = ["off", "graphics", "vram", "mainmem"][display_mode as usize];
+                let bgs: Vec<Value> = (0..4)
+                    .map(|i| json!({
+                        "index": i,
+                        "enabled": dispcnt & (1 << (8 + i)) != 0,
+                        "priority": regs.bgcnt[i] & 3,
+                        "bgcnt": regs.bgcnt[i],
+                    }))
+                    .collect();
+                let (mbright, powcnt) = Debugger::new(emu).video().nds_display_power(engine).unwrap_or((0, 0));
+                let mbright_mode = (mbright >> 14) & 3; // 0/3 = none, 1 = to white, 2 = to black
+                let mbright_factor = (mbright & 0x1F).min(16);
+                let engine_powered = if engine == 0 { powcnt & (1 << 1) != 0 } else { powcnt & (1 << 9) != 0 };
+                out = json!({"engine": engine, "mode": mode, "dispcnt": dispcnt,
+                             "displayMode": display_mode, "displayModeName": display_mode_name,
+                             "bg0_is_3d": engine == 0 && dispcnt & (1 << 3) != 0,
+                             "masterBright": mbright, "masterBrightMode": mbright_mode,
+                             "masterBrightFactor": mbright_factor,
+                             "lcdsOn": powcnt & 1 != 0, "enginePowered": engine_powered,
+                             "backgrounds": bgs});
+            }
             if let Some(system) = emu.as_gba() {
                 let v = &system.gba.bus.io.video;
                 let bgs: Vec<Value> = v
@@ -445,6 +469,30 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 "format": "rgba8",
                 "base64": base64(s.rgba),
             })
+        }
+        // Per-background "dump all BGs" — pixel coverage per layer, and each layer
+        // rendered in isolation as an RGBA8 image (DS only; `layer`: BG 0-3, OBJ = 4).
+        "video.layerCoverage" => {
+            let engine = enginep(params);
+            let cov = Debugger::new(emu).video().layer_coverage(engine);
+            json!({"engine": engine, "bg0": cov[0], "bg1": cov[1], "bg2": cov[2], "bg3": cov[3], "obj": cov[4]})
+        }
+        "video.renderLayer" => {
+            let engine = enginep(params);
+            let layer = params.get("layer").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let bgr = Debugger::new(emu).video().render_layer(engine, layer);
+            // The DS engine framebuffer is 256 wide (video2d::WIDTH is the *GBA* width);
+            // derive the height from the buffer so the row stride is correct.
+            let width = video2d::MAX_WIDTH; // DS active width (nonzero constant)
+            let height = bgr.len() / width;
+            // BGR555 -> RGBA8 so the client can PNG it directly, like video.framebuffer.
+            let mut rgba = Vec::with_capacity(bgr.len() * 4);
+            for &v in &bgr {
+                let c5to8 = |c: u16| ((c & 0x1F) as u32 * 255 / 31) as u8;
+                rgba.extend_from_slice(&[c5to8(v), c5to8(v >> 5), c5to8(v >> 10), 255]);
+            }
+            json!({"engine": engine, "layer": layer, "width": width, "height": height,
+                   "format": "rgba8", "base64": base64(&rgba)})
         }
         "video.explainPixel" => {
             let (engine, x, y) = (enginep(params), u32p(params, "x") as u16, u32p(params, "y") as u16);

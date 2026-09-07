@@ -122,6 +122,46 @@ impl Video<'_> {
             unreachable!("an emulator is always GBA or NDS")
         }
     }
+
+    /// Per-layer pixel coverage `[bg0, bg1, bg2, bg3, obj]` for an engine — how many
+    /// pixels each layer would contribute if rendered in isolation. Zero for the GBA
+    /// (use its own tooling); the DS reports both engines.
+    pub fn layer_coverage(&mut self, engine: usize) -> [usize; 5] {
+        if let Some(n) = self.emu.as_nds_mut() {
+            n.debug_layer_coverage(engine)
+        } else {
+            [0; 5]
+        }
+    }
+
+    /// One layer of an engine rendered in isolation (BG 0-3, or OBJ = 4) as a
+    /// `WIDTH×HEIGHT` BGR555 buffer — the per-BG "dump all backgrounds" view. Empty on
+    /// the GBA.
+    pub fn render_layer(&mut self, engine: usize, layer: usize) -> Vec<u16> {
+        if let Some(n) = self.emu.as_nds_mut() {
+            n.debug_render_layer(engine, layer)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A 2D engine's register file (`DISPCNT` and the per-background configuration), for
+    /// a state summary. `None` on the GBA (its `video.state` already carries this).
+    pub fn engine_registers(&mut self, engine: usize) -> Option<video2d::Registers> {
+        self.emu.as_nds().map(|n| n.engine_registers(engine))
+    }
+
+    /// The full 32-bit `DISPCNT` of a DS 2D engine, whose high bits carry the display
+    /// mode (0 = off, 1 = graphics, 2 = VRAM, 3 = main-memory) that gates the present.
+    pub fn nds_dispcnt(&mut self, engine: usize) -> Option<u32> {
+        self.emu.as_nds().map(|n| n.engine_dispcnt(engine))
+    }
+
+    /// `(MASTER_BRIGHT of the engine, POWCNT1)` — the fade register (bits 14-15 mode,
+    /// 0-4 factor) and the display-power bits (0 = LCDs, 1 = Engine A, 9 = Engine B).
+    pub fn nds_display_power(&mut self, engine: usize) -> Option<(u16, u16)> {
+        self.emu.as_nds().map(|n| (n.engine_master_bright(engine), n.powcnt1()))
+    }
 }
 
 /// `emu.cpu.*` — processor state. `core` selects the DS CPU (0 = ARM9, 1 = ARM7);

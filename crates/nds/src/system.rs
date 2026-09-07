@@ -652,6 +652,8 @@ impl Machine {
             0x0400_0184 => self.ipc.read_fifocnt(core) as u32,
             0x0400_0130 => self.keyinput as u32, // KEYINPUT (both cores)
             0x0400_0132 => self.keycnt[c] as u32, // KEYCNT (per core)
+            0x0400_006C if core == Core::Arm9 => self.ppu.master_bright(0) as u32,
+            0x0400_106C if core == Core::Arm9 => self.ppu.master_bright(1) as u32,
             0x0400_0136 if core == Core::Arm7 => self.extkeyin as u32,
             0x0400_0138 if core == Core::Arm7 => self.rtc.read(),
             0x0400_0204 => self.exmemcnt as u32, // EXMEMCNT/EXMEMSTAT (both cores)
@@ -838,6 +840,8 @@ impl Machine {
         match addr {
             0x0400_0000 if core == Core::Arm9 => self.ppu.write_dispcnt(0, value, bytes),
             0x0400_1000 if core == Core::Arm9 => self.ppu.write_dispcnt(1, value, bytes),
+            0x0400_006C if core == Core::Arm9 => self.ppu.write_master_bright(0, value as u16),
+            0x0400_106C if core == Core::Arm9 => self.ppu.write_master_bright(1, value as u16),
             0x0400_0004 => self.ppu.write_dispstat(c, value as u16),
             0x0400_0132 => {
                 // KEYCNT: arming or reconfiguring the condition can immediately satisfy
@@ -860,7 +864,10 @@ impl Machine {
                     (self.exmemcnt & !0x7F) | (value as u16 & 0x7F)
                 };
             }
-            0x0400_0304 if core == Core::Arm9 => self.powcnt1 = value as u16,
+            0x0400_0304 if core == Core::Arm9 => {
+                self.powcnt1 = value as u16;
+                self.ppu.set_powcnt1(value as u16);
+            }
             0x0400_0208 => self.interrupts[c].set_ime(value & 1 != 0),
             0x0400_0210 => self.interrupts[c].set_ie(value),
             0x0400_0214 => self.interrupts[c].acknowledge(value),
@@ -1967,6 +1974,24 @@ impl System {
     /// A snapshot of a 2D engine's register file, for debugging (0 = A, 1 = B).
     pub fn engine_registers(&self, engine: usize) -> video2d::Registers {
         self.machine.ppu.engine_registers(engine)
+    }
+
+    /// The full 32-bit `DISPCNT` for a 2D engine (0 = A, 1 = B). Unlike the shared
+    /// `video2d` register (16-bit, GBA-shaped) this keeps the DS-only high bits — most
+    /// importantly the display mode (bits 16-17: 0 = off, 1 = graphics, 2 = VRAM, 3 =
+    /// main-memory), which decides whether the engine's composite reaches its screen.
+    pub fn engine_dispcnt(&self, engine: usize) -> u32 {
+        self.machine.ppu.dispcnt(engine)
+    }
+
+    /// `MASTER_BRIGHT` (whole-screen fade) for a 2D engine, and the `POWCNT1` display
+    /// power bits — the two screen-disable signals beyond the DISPCNT display mode.
+    pub fn engine_master_bright(&self, engine: usize) -> u16 {
+        self.machine.ppu.master_bright(engine)
+    }
+
+    pub fn powcnt1(&self) -> u16 {
+        self.machine.powcnt1
     }
 
     /// Debug: the recent inter-core IPC traffic — `(sender_index, kind, value)`
