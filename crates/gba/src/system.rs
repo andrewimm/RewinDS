@@ -174,6 +174,19 @@ pub enum FrameOutcome {
     LinkPending,
 }
 
+/// The result of [`System::run_step`]: a bounded slice of a frame, so a linked host can
+/// service its carrier between slices (sub-frame granularity) rather than once per frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// The video frame finished.
+    FrameComplete,
+    /// A connected serial transfer awaits the peer's word (exchange, then call again).
+    LinkPending,
+    /// The slice's cycle budget ran out mid-frame with no barrier — call again to continue
+    /// (the host can service its carrier first).
+    Yielded,
+}
+
 /// The result of progressing a low-power machine by one event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HaltProgress {
@@ -312,6 +325,28 @@ impl System {
             }
         }
         FrameOutcome::Completed
+    }
+
+    /// Run at most `max_cycles` of the current frame, stopping early at a transfer barrier
+    /// or the end of the frame. Lets a linked host advance in small slices and service its
+    /// carrier between them (sub-frame granularity), so a burst of transfers within one
+    /// frame — Pokémon party data, Advance Wars state sync — isn't throttled to one
+    /// transfer per frame. `max_cycles` bounds only the slice, not the frame.
+    pub fn run_step(&mut self, max_cycles: u64) -> StepOutcome {
+        self.start_lcd();
+        self.start_apu();
+        let start_frame = self.gba.bus.io.video.frame();
+        let target = self.scheduler.now() + max_cycles;
+        // `run_until` dispatches PPU events along the way (ticking the frame counter) and
+        // side-exits the instant a transfer awaits its peer.
+        self.run_until(target);
+        if self.gba.bus.io.serial_awaiting_peer() {
+            StepOutcome::LinkPending
+        } else if self.gba.bus.io.video.frame() != start_frame {
+            StepOutcome::FrameComplete
+        } else {
+            StepOutcome::Yielded
+        }
     }
 
     /// Select which video instrumentation a running frame collects. Off by default
@@ -966,6 +1001,32 @@ mod tests {
         // A keypad interrupt does.
         sys.gba.bus.io.irq.request(IrqSource::Keypad);
         assert!(sys.gba.should_wake());
+    }
+
+    /// Throughput of the unlinked frame path (the single-player common case), to check the
+    /// transfer-barrier check added to `run_until` doesn't regress it. Ignored by default;
+    /// run with `cargo test -p gba --release bench_unlinked -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf benchmark"]
+    fn bench_unlinked_run_frame_throughput() {
+        let mut sys = System::new();
+        // add r0,r0,#1 ; add r1,r1,r0 ; b . — a representative ALU + branch mix.
+        load_iwram(&mut sys, &[0xE280_0001, 0xE081_1000, 0xEAFF_FFFC]);
+        sys.cpu.set_pc(0x0300_0000);
+        for _ in 0..120 {
+            sys.run_frame_step(); // warm up
+        }
+        let n = 1200;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            sys.run_frame_step();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "unlinked run_frame_step: {n} frames in {elapsed:?} = {:.2} us/frame, {:.0} frames/s",
+            elapsed.as_micros() as f64 / n as f64,
+            n as f64 / elapsed.as_secs_f64()
+        );
     }
 
     /// The transfer barrier: a connected multiplayer transfer suspends `run_frame_step`

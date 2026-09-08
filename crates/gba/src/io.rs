@@ -216,7 +216,8 @@ impl Io {
 
     /// Whether a connected serial transfer is awaiting peer words — the point at
     /// which the core suspends the frame so the host can exchange a link frame
-    /// (the transfer barrier).
+    /// (the transfer barrier). Polled once per instruction, so `#[inline]`.
+    #[inline]
     pub fn serial_awaiting_peer(&self) -> bool {
         self.serial.awaiting_peer()
     }

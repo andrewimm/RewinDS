@@ -13,7 +13,7 @@ mod logging;
 
 use link::Transport;
 
-use emulator::{button, Console, Emulator, Input, Load};
+use emulator::{button, Console, Emulator, Input, Load, StepOutcome};
 use minifb::{Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -188,14 +188,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         // held and wakes when released). Idempotent, so driving it every frame is fine.
         emulator.set_lid(window.is_key_down(Key::L));
 
-        // Serial link: deliver any peer frames that have arrived. The SIO busy-wait
-        // is itself the sync barrier, so no extra frame pacing is needed.
-        if let Some(l) = serial_link.as_mut() {
-            for frame in l.recv() {
-                emulator.link_deliver(&frame);
-            }
-        }
-
         // Debug mix toggles (GBA-specific dev conveniences, via the escape hatch):
         // F1 = DirectSound, F2 = PSG, F3 = output low-pass.
         if let Some(system) = emulator.as_gba_mut() {
@@ -272,13 +264,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Hold Space to fast-forward: run unthrottled for a display frame's worth
-        // of real time, presenting only the final frame and muting audio. Otherwise
-        // run one frame at 60 fps with audio.
-        let warp = window.is_key_down(Key::Space);
+        // Advance one display frame. When linked, drive the synchronous transfer barrier
+        // so each SIO transfer completes in-frame with the peer's word (clock-locked
+        // lockstep). Unlinked, hold Space to fast-forward: run unthrottled for a display
+        // frame's worth of real time, presenting only the final frame and muting audio.
+        let warp = serial_link.is_none() && window.is_key_down(Key::Space);
         window.set_target_fps(if warp { 10_000 } else { 60 });
         emulator.set_audio_muted(warp);
-        if warp {
+        if let Some(l) = serial_link.as_mut() {
+            run_linked_frame(&mut emulator, l);
+        } else if warp {
             let deadline = Instant::now() + Duration::from_millis(14);
             loop {
                 emulator.run_frame();
@@ -288,14 +283,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         } else {
             emulator.run_frame();
-        }
-
-        // Ship whatever serial frames the core produced this step.
-        if let Some(l) = serial_link.as_mut() {
-            while let Some(frame) = emulator.link_poll_out() {
-                let f = frame.to_vec();
-                l.send(&f);
-            }
         }
 
         // Present every screen, stacked top-to-bottom.
@@ -328,6 +315,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// Advance one video frame under the **serial transfer barrier**: [`Emulator::run_frame_step`]
+/// suspends the frame at each transfer, we exchange the word with the peer over the carrier
+/// and resume, so the transfer completes in-frame and the two machines stay clock-locked —
+/// the fix real-time link games (Advance Wars, Pokémon VS) need. A stalled peer (no reply
+/// within the timeout) ends the frame early rather than hanging the window.
+fn run_linked_frame(emulator: &mut Emulator, link: &mut impl Transport) {
+    const BARRIER_TIMEOUT: Duration = Duration::from_millis(50);
+    // Advance in small slices, servicing the carrier between each, so a burst of transfers
+    // within one frame (Pokémon party data, Advance Wars state sync) is answered per
+    // transfer instead of once per frame — the difference between a crawl and full speed.
+    const SLICE_CYCLES: u64 = 512;
+    loop {
+        // Deliver frames already waiting (completes our in-flight transfer, or — as the
+        // passive child — drives our SIO auto-response), then flush anything we owe.
+        for frame in link.recv() {
+            emulator.link_deliver(&frame);
+        }
+        while let Some(frame) = emulator.link_poll_out() {
+            let f = frame.to_vec();
+            link.send(&f);
+        }
+        match emulator.run_step(SLICE_CYCLES) {
+            StepOutcome::FrameComplete => return,
+            StepOutcome::Yielded => continue, // service the carrier, then run the next slice
+            StepOutcome::LinkPending => {
+                // We clocked a transfer: send our word, then block for the peer's reply so
+                // the transfer completes before the guest reads the result.
+                while let Some(frame) = emulator.link_poll_out() {
+                    let f = frame.to_vec();
+                    link.send(&f);
+                }
+                let frames = link.recv_blocking(BARRIER_TIMEOUT);
+                if frames.is_empty() {
+                    return; // peer stalled — bail this frame rather than hang
+                }
+                for frame in frames {
+                    emulator.link_deliver(&frame);
+                }
+            }
+        }
+    }
 }
 
 /// Read the `save_type` override name from a `.sav.meta` sidecar, if present.

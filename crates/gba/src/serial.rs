@@ -344,6 +344,11 @@ impl Serial {
     /// [`deliver`](Self::deliver)) before the guest reads the result, keeping the
     /// two machines in lockstep. False when disconnected (the fallback completes
     /// instantly) or once every slot for this round is in.
+    ///
+    /// Checked once per instruction by the core's run loop, so it is `#[inline]` and
+    /// short-circuits on `connected` — a single-player game pays only a byte load and a
+    /// predicted-not-taken branch.
+    #[inline]
     pub fn awaiting_peer(&self) -> bool {
         self.connected && (self.siocnt & START_BUSY != 0) && self.filled() < self.count
     }
