@@ -1,4 +1,5 @@
 import UIKit
+import RewindsKit
 
 /// Per-console orientation locking. The app allows both orientations in Info.plist;
 /// this pins the device to the one a console wants — GBA landscape, DS portrait — and
@@ -23,10 +24,27 @@ enum OrientationLock {
     static func landscape() { set(.landscape, preferred: .landscapeRight) }
     static func portrait() { set(.portrait, preferred: .portrait) }
     static func unlock() { set(.all, preferred: .portrait) }
+
+    /// Lock to the orientation a console wants — GBA landscape, DS portrait.
+    static func lock(for console: Console) {
+        switch console {
+        case .gba: landscape()
+        case .nds: portrait()
+        }
+    }
 }
 
-/// Minimal app delegate whose only job is to report the current orientation lock.
+/// Minimal app delegate: reports the current orientation lock, and installs the link
+/// notification presenter so connect/disconnect banners show while the game is foreground.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        LinkNotifier.configure()
+        return true
+    }
+
     func application(
         _ application: UIApplication,
         supportedInterfaceOrientationsFor window: UIWindow?

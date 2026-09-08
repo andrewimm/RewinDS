@@ -5,7 +5,7 @@ import Foundation
 /// side asserts this ordering at compile time, so these literals can't silently drift.
 ///
 /// Named `GameButton`, not `Button`, to stay clear of SwiftUI's `Button` view.
-enum GameButton: UInt32, CaseIterable {
+public enum GameButton: UInt32, CaseIterable {
     case a = 0x001
     case b = 0x002
     case select = 0x004
@@ -22,10 +22,11 @@ enum GameButton: UInt32, CaseIterable {
 
 /// The live input snapshot the run loop feeds the core each frame. Mutated by the
 /// on-screen controls and read by the display-link tick — all on the main thread.
-final class InputState {
+public final class InputState {
     /// A mask of `Button` raw values currently held.
-    var buttons: UInt32 = 0
-    var touchX: Int16 = 0
-    var touchY: Int16 = 0
-    var touchPressed: Bool = false
+    public var buttons: UInt32 = 0
+    public var touchX: Int16 = 0
+    public var touchY: Int16 = 0
+    public var touchPressed: Bool = false
+    public init() {}
 }

@@ -2,9 +2,9 @@
 #
 # Build the Rust emulator core into RewindsCore.xcframework for the iOS app.
 #
-# Produces a static-library XCFramework with two slices — device (ios-arm64) and
-# simulator (ios-arm64-simulator) — plus the cbindgen-generated C header wrapped in
-# a Clang modulemap, so Swift can `import RewindsCore`. Re-run this whenever
+# Produces a static-library XCFramework with three slices — iOS device (ios-arm64),
+# iOS simulator (ios-arm64-simulator), and macOS (macos-arm64) — plus the cbindgen-generated
+# C header wrapped in a Clang modulemap, so Swift can `import RewindsCore`. Re-run this whenever
 # crates/emulator-ffi or anything it links changes; the Xcode project references the
 # framework at a fixed path, so a rebuild is picked up without project edits.
 #
@@ -24,12 +24,13 @@ LIB="librewinds_core.a"
 # rustup/cargo live in ~/.cargo/bin, which Xcode's non-login build shell does not have.
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "==> Ensuring iOS Rust targets are installed"
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim >/dev/null
+echo "==> Ensuring Apple Rust targets are installed"
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin >/dev/null
 
-echo "==> Building static lib (device + simulator, $CONFIG)"
+echo "==> Building static lib (iOS device + iOS simulator + macOS, $CONFIG)"
 cargo build -p emulator-ffi --release --target aarch64-apple-ios
 cargo build -p emulator-ffi --release --target aarch64-apple-ios-sim
+cargo build -p emulator-ffi --release --target aarch64-apple-darwin
 
 echo "==> Regenerating C header with cbindgen"
 cbindgen --config "$FFI_DIR/cbindgen.toml" --crate emulator-ffi \
@@ -52,6 +53,7 @@ mkdir -p "$OUT_DIR"
 xcodebuild -create-xcframework \
     -library "$REPO_ROOT/target/aarch64-apple-ios/$CONFIG/$LIB" -headers "$HDR_DIR" \
     -library "$REPO_ROOT/target/aarch64-apple-ios-sim/$CONFIG/$LIB" -headers "$HDR_DIR" \
+    -library "$REPO_ROOT/target/aarch64-apple-darwin/$CONFIG/$LIB" -headers "$HDR_DIR" \
     -output "$XCFRAMEWORK"
 
 echo "==> Done: $XCFRAMEWORK"

@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// A single emulator screen, held at its native aspect ratio with a rounded bezel. The
 /// DS lower screen passes `touch: true` to route touches as the console's touchscreen.

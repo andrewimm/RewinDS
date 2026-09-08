@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// Top-level navigation + game-loading orchestrator.
 @MainActor

@@ -1,29 +1,25 @@
 import SwiftUI
-import RewindsKit
 import MetalKit
+import RewindsKit
 
-/// An `MTKView` that blits one emulator screen. The run loop hands it a freshly
-/// presented RGBA8 buffer via `present`, which uploads it into a source texture and
-/// draws immediately — the view is otherwise paused, so it renders exactly in lockstep
-/// with the emulator rather than on its own clock.
-final class EmulatorMetalView: MTKView, ScreenSink {
+/// An `MTKView` that blits one emulator screen on macOS. The renderer mirrors the iOS
+/// `EmulatorMetalView` exactly (Metal is identical across platforms); only input differs —
+/// the mouse drives the DS touch screen, and keyboard is handled at the SwiftUI layer.
+final class MacEmulatorMetalView: MTKView, ScreenSink {
     private var queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState?
     private var texture: MTLTexture?
     private var texWidth = 0
     private var texHeight = 0
 
-    // The latest frame the run loop handed us, copied and drawn on the view's own tick.
-    // Written by the emulation thread (`present`) and read by the main thread (`draw`),
-    // so all access is guarded by `frameLock`.
     private let frameLock = NSLock()
     private var latest = [UInt8]()
     private var latestWidth = 0
     private var latestHeight = 0
 
-    /// When set (the DS lower screen), reports touch location as native screen pixels,
-    /// or `nil` on release.
-    var onTouch: ((_ pixel: CGPoint?) -> Void)?
+    /// When set (the DS lower screen), reports mouse location as native screen pixels, or
+    /// `nil` on release.
+    var onTouch: ((CGPoint?) -> Void)?
 
     init() {
         super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -35,18 +31,18 @@ final class EmulatorMetalView: MTKView, ScreenSink {
         commonInit()
     }
 
+    // Top-left origin so mouse coordinates match the texture/screen space (and iOS).
+    override var isFlipped: Bool { true }
+
     private func commonInit() {
-        // Let the view run its own display link and render the latest uploaded frame in
-        // its managed `draw(_:)` cycle — the canonical MTKView pattern. Presenting a
-        // drawable manually off this cycle leaves rapidly-changing content on black.
         isPaused = false
         enableSetNeedsDisplay = false
         preferredFramesPerSecond = 60
         framebufferOnly = true
         colorPixelFormat = .bgra8Unorm
-        // A DS shows its backdrop as black when idle; match that behind the quad.
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        layer.magnificationFilter = .nearest
+        wantsLayer = true
+        layer?.magnificationFilter = .nearest
 
         guard let device else { return }
         queue = device.makeCommandQueue()
@@ -63,8 +59,6 @@ final class EmulatorMetalView: MTKView, ScreenSink {
         pipeline = try? device.makeRenderPipelineState(descriptor: desc)
     }
 
-    /// Hand the view the latest presented frame (`width * height` RGBA8, borrowed only
-    /// for this call). It's copied and drawn on the view's next display tick.
     func present(width: Int, height: Int, pixels: UnsafePointer<UInt8>) {
         guard width > 0, height > 0 else { return }
         let count = width * height * 4
@@ -78,12 +72,9 @@ final class EmulatorMetalView: MTKView, ScreenSink {
         frameLock.unlock()
     }
 
-    /// Render the latest frame. Called by the view's own display link each vsync.
     override func draw(_ rect: CGRect) {
         guard let queue, let pipeline else { return }
 
-        // Upload the latest frame into the source texture under the lock (the emulation
-        // thread may be writing it concurrently), then render outside the lock.
         frameLock.lock()
         let w = latestWidth, h = latestHeight
         guard w > 0, h > 0 else { frameLock.unlock(); return }
@@ -120,55 +111,40 @@ final class EmulatorMetalView: MTKView, ScreenSink {
         cmd.commit()
     }
 
-    /// Re-establish the display link after a screen-off / lock, which can leave `MTKView`'s
-    /// internal `CADisplayLink` stalled so the view stops drawing while the emulator keeps
-    /// running. Toggling `isPaused` restarts it.
-    func displayResumed() {
-        isPaused = true
-        isPaused = false
-    }
+    // --- Mouse → touch (DS lower screen only) --------------------------------
 
-    // --- Touch (DS lower screen only) ----------------------------------------
+    override func mouseDown(with event: NSEvent) { reportMouse(event) }
+    override func mouseDragged(with event: NSEvent) { reportMouse(event) }
+    override func mouseUp(with event: NSEvent) { onTouch?(nil) }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { reportTouch(touches) }
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { reportTouch(touches) }
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { onTouch?(nil) }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { onTouch?(nil) }
-
-    private func reportTouch(_ touches: Set<UITouch>) {
-        guard onTouch != nil, let t = touches.first, bounds.width > 0, bounds.height > 0 else { return }
-        let p = t.location(in: self)
+    private func reportMouse(_ event: NSEvent) {
+        guard onTouch != nil, bounds.width > 0, bounds.height > 0 else { return }
+        let p = convert(event.locationInWindow, from: nil)
         let fx = min(max(p.x / bounds.width, 0), 1)
         let fy = min(max(p.y / bounds.height, 0), 1)
         onTouch?(CGPoint(x: fx * CGFloat(max(texWidth, 1)), y: fy * CGFloat(max(texHeight, 1))))
     }
 }
 
-/// SwiftUI wrapper. Registers the underlying view with the session for its screen index
-/// so the run loop can push frames to it; wires touch for the DS lower screen.
-struct MetalScreenView: UIViewRepresentable {
+/// SwiftUI wrapper registering the view with the session for its screen index. The DS
+/// lower screen forwards mouse drags as the console's touchscreen input.
+struct MacMetalScreenView: NSViewRepresentable {
     let session: EmulatorSession
     let index: Int
-    /// The DS lower screen forwards touches as the console's touchscreen input.
     var isTouchScreen: Bool = false
 
-    func makeUIView(context: Context) -> EmulatorMetalView {
-        let view = EmulatorMetalView()
+    func makeNSView(context: Context) -> MacEmulatorMetalView {
+        let view = MacEmulatorMetalView()
         if isTouchScreen {
-            view.isMultipleTouchEnabled = false
-            view.onTouch = { [weak session] pixel in
-                session?.setTouch(pixel)
-            }
-        } else {
-            view.isUserInteractionEnabled = false
+            view.onTouch = { [weak session] pixel in session?.setTouch(pixel) }
         }
         session.registerScreen(view, at: index)
         return view
     }
 
-    func updateUIView(_ uiView: EmulatorMetalView, context: Context) {}
+    func updateNSView(_ nsView: MacEmulatorMetalView, context: Context) {}
 
-    static func dismantleUIView(_ uiView: EmulatorMetalView, coordinator: ()) {
-        uiView.onTouch = nil
+    static func dismantleNSView(_ nsView: MacEmulatorMetalView, coordinator: ()) {
+        nsView.onTouch = nil
     }
 }

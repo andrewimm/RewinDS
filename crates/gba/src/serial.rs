@@ -26,6 +26,23 @@
 
 use crate::interrupt::{InterruptController, IrqSource};
 
+/// Whether SIO tracing is on (set `REWINDS_SIO_TRACE` in the environment). Read once.
+fn sio_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REWINDS_SIO_TRACE").is_some())
+}
+
+/// Emit a serial-link trace line to stderr when `REWINDS_SIO_TRACE` is set. Zero cost
+/// otherwise. A window into the transfer round machine for debugging link sessions.
+macro_rules! sio_trace {
+    ($($arg:tt)*) => {
+        if sio_trace_on() {
+            eprintln!("[sio] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 /// `SIOCNT` bit 7 — start / busy.
 const START_BUSY: u16 = 1 << 7;
 /// `SIOCNT` bit 6 — multiplayer error (no other GBA/adapter responded).
@@ -177,6 +194,10 @@ impl Serial {
 
     /// Handle a guest write of the SIOCNT start bit.
     fn on_start(&mut self, irq: &mut InterruptController) {
+        sio_trace!(
+            "start id={} round={} connected={} count={} mode={:?} send={:#06x}",
+            self.id, self.round, self.connected, self.count, self.mode(), self.send
+        );
         if !self.connected || self.count < 2 {
             self.disconnected_fallback(irq);
             return;
@@ -191,6 +212,7 @@ impl Serial {
 
     /// Complete instantly as "nothing connected" (link/adapter detection path).
     fn disconnected_fallback(&mut self, irq: &mut InterruptController) {
+        sio_trace!("disconnected_fallback mode={:?}", self.mode());
         self.data = [0xFFFF; 4];
         self.siocnt &= !START_BUSY;
         if self.mode() == SioMode::Multiplayer {
@@ -210,6 +232,7 @@ impl Serial {
         let word = self.tx_word();
         self.slots[self.id as usize] = Some(word);
         self.outbound = Some(LinkFrame { round: r, id: self.id, mode: self.mode() as u8, word });
+        sio_trace!("begin_round r={} id={} word={:#06x} mode={:?}", r, self.id, word, self.mode());
         if self.filled() >= self.count {
             self.complete_round(irq);
         }
@@ -231,6 +254,10 @@ impl Serial {
                 }
                 // ID bits become valid after the first transfer.
                 self.siocnt = (self.siocnt & !(0b11 << 4)) | ((self.id as u16 & 0b11) << 4);
+                // A successful multiplayer transfer clears the error flag — otherwise a
+                // stale error (e.g. a pre-connection start) would persist and games read it
+                // as a permanent "link error".
+                self.siocnt &= !MULTI_ERROR;
             }
             SioMode::Normal8 => {
                 let peer = (1 - self.id as usize).min(3);
@@ -245,6 +272,10 @@ impl Serial {
             SioMode::Other => {}
         }
         self.siocnt &= !START_BUSY;
+        sio_trace!(
+            "complete r={} data=[{:#06x},{:#06x},{:#06x},{:#06x}] siocnt={:#06x}",
+            self.round, self.data[0], self.data[1], self.data[2], self.data[3], self.siocnt
+        );
         // Do NOT drop `outbound` here: our contribution still needs to reach the
         // peers even though we have already assembled the round locally. It is
         // taken by `poll_out` and overwritten by the next round.
@@ -284,6 +315,10 @@ impl Serial {
         if (frame.id as usize) >= 4 {
             return;
         }
+        sio_trace!(
+            "deliver frame(r={} id={} word={:#06x}) self.round={} id={}",
+            frame.round, frame.id, frame.word, self.round, self.id
+        );
         // First frame of a not-yet-joined round: join it (also queues our reply).
         if frame.round != self.round || self.slots[self.id as usize].is_none() {
             self.begin_round(frame.round, irq);

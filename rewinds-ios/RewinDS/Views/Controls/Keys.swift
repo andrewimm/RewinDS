@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// A round face key (A/B/X/Y) — a soft raised disc with a rounded letter.
 struct RoundKey: View {

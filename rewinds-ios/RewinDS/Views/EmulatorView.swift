@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// Hosts a running session: chooses the console's shell layout, owns the control
 /// registry, and turns the toolbar actions into core operations plus brief feedback.
@@ -58,6 +59,10 @@ struct EmulatorView: View {
                     .transition(.opacity)
             }
         }
+        // The session no longer owns orientation (it's shared, platform-neutral); the iOS
+        // game view locks to the console's orientation while it's on screen.
+        .onAppear { OrientationLock.lock(for: session.console) }
+        .onDisappear { OrientationLock.unlock() }
     }
 
     private func openMenu() {

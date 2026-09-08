@@ -1,20 +1,20 @@
 import Foundation
 
 /// One launchable ROM in the library.
-struct GameEntry: Identifiable, Hashable {
-    let id: String            // stable per-ROM id (also the save filename)
-    let name: String          // display name
-    let url: URL
-    let console: Console?      // detected from extension; confirmed at load
-    let isBundled: Bool        // shipped in dev-assets vs. imported by the user
+public struct GameEntry: Identifiable, Hashable {
+    public let id: String            // stable per-ROM id (also the save filename)
+    public let name: String          // display name
+    public let url: URL
+    public let console: Console?      // detected from extension; confirmed at load
+    public let isBundled: Bool        // shipped in dev-assets vs. imported by the user
 }
 
 /// Enumerates launchable ROMs: the ones bundled from `dev-assets/` plus any the user
 /// imported through Files (kept under Documents/ROMs).
-final class GameLibrary: ObservableObject {
-    static let shared = GameLibrary()
+public final class GameLibrary: ObservableObject {
+    public static let shared = GameLibrary()
 
-    @Published private(set) var games: [GameEntry] = []
+    @Published public private(set) var games: [GameEntry] = []
 
     private let romsDir: URL
     private static let romExtensions = ["gba", "nds"]
@@ -26,7 +26,7 @@ final class GameLibrary: ObservableObject {
         reload()
     }
 
-    func reload() {
+    public func reload() {
         var entries: [GameEntry] = []
 
         // Bundled dev-assets ROMs.
@@ -57,7 +57,7 @@ final class GameLibrary: ObservableObject {
 
     /// Import a user-picked ROM into the library, returning its new entry.
     @discardableResult
-    func importROM(from url: URL) throws -> GameEntry {
+    public func importROM(from url: URL) throws -> GameEntry {
         let needsStop = url.startAccessingSecurityScopedResource()
         defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
         let dest = romsDir.appendingPathComponent(url.lastPathComponent)
@@ -69,7 +69,7 @@ final class GameLibrary: ObservableObject {
         return makeEntry(url: dest, isBundled: false)
     }
 
-    func delete(_ entry: GameEntry) {
+    public func delete(_ entry: GameEntry) {
         guard !entry.isBundled else { return }
         try? FileManager.default.removeItem(at: entry.url)
         reload()

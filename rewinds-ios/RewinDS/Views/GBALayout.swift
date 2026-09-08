@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// The landscape GBA shell: a maximized centered screen with the controls pushed out to
 /// the corners of the side margins — L/R at the top edges, the D-pad low-left, A/B

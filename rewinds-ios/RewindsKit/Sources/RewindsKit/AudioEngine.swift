@@ -43,10 +43,18 @@ final class AudioEngine {
     /// output rate, so the emulator can resample once straight to it (no hidden second
     /// conversion through a hardcoded 48 kHz).
     static func prepareSession() -> Double {
+        #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default, options: [])
         try? session.setActive(true)
         return session.sampleRate
+        #else
+        // macOS has no audio session. Use a standard 48 kHz; AVAudioEngine's implicit
+        // mainMixerNode → outputNode connection converts to the hardware device rate.
+        // (Probing a throwaway engine's outputNode for the exact rate can fault on a cold
+        // audio HAL, so we don't touch it here.)
+        return 48_000
+        #endif
     }
 
     /// Build the graph (once) and begin playback.
@@ -74,7 +82,9 @@ final class AudioEngine {
     func stop() {
         shouldPlay = false
         engine.stop()
+        #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        #endif
     }
 
     private func buildGraphIfNeeded() {
@@ -129,6 +139,8 @@ final class AudioEngine {
     }
 
     private func activateSession() {
+        #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
     }
 }

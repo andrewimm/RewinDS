@@ -1,4 +1,5 @@
 import Foundation
+import RewindsKit
 
 /// One system file the emulator may need to boot.
 enum SystemFile: String, CaseIterable, Identifiable {

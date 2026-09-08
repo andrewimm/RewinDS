@@ -22,6 +22,10 @@ rewinds-ios/build/
 rewinds-ios/DerivedData/
 *.xcuserstate
 
+# RewindsKit Swift package local build artifacts
+rewinds-ios/RewindsKit/.build/
+rewinds-ios/RewindsKit/.swiftpm/
+
 # Copyrighted BIOS/firmware and local test ROMs the developer drops in (never committed)
 rewinds-ios/dev-assets/*
 !rewinds-ios/dev-assets/README.md

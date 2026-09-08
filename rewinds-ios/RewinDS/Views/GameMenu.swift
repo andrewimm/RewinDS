@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// A page in the in-game menu. Add a case here plus a branch in `GameMenu.pageContent`
 /// to introduce a new menu (e.g. a future `.gamepad`); navigation and back handling come
@@ -14,7 +15,7 @@ enum MenuPage: Hashable {
         case .root: return "Paused"
         case .games: return "Games"
         case .systemFiles: return "System Files"
-        case .link: return "Link (dev)"
+        case .link: return "Link"
         }
     }
 }
@@ -104,7 +105,7 @@ struct GameMenu: View {
         case .root: rootPage
         case .games: gamesPage
         case .systemFiles: SystemFilesList().scrollContentBackground(.hidden)
-        case .link: LinkDevPage(shell: shell, link: session.link)
+        case .link: LinkPage(shell: shell, link: session.link, rom: session.romId, console: session.console)
         }
     }
 
@@ -114,7 +115,7 @@ struct GameMenu: View {
             filledButton("Resume", "play.fill", tint: shell.accent, action: onResume)
             navRow("Games", "square.grid.2x2") { push(.games) }
             navRow("System Files", "cpu") { push(.systemFiles) }
-            navRow("Link (dev)", "antenna.radiowaves.left.and.right") { push(.link) }
+            navRow("Link", "antenna.radiowaves.left.and.right") { push(.link) }
             filledButton("Quit to Library", "rectangle.portrait.and.arrow.right",
                          tint: .red.opacity(0.85)) { model.exitGame() }
         }

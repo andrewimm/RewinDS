@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 /// The portrait DS shell: a top bar (RewinDS / Menu), the two stacked screens with a
 /// hinge divider (the lower one touch-enabled), then L/R, the D-pad and X/Y/A/B diamond,

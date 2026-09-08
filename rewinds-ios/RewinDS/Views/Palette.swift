@@ -1,4 +1,5 @@
 import SwiftUI
+import RewindsKit
 
 extension Color {
     init(hex: UInt32) {
