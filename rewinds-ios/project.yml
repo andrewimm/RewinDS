@@ -4,7 +4,7 @@
 # ./build-core.sh — run that whenever crates/emulator-ffi changes.
 name: RewinDS
 options:
-  bundleIdPrefix: com.rewinds
+  bundleIdPrefix: com.setimmediate
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
@@ -40,7 +40,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.rewinds.RewinDS
+        PRODUCT_BUNDLE_IDENTIFIER: com.setimmediate.RewinDS
         INFOPLIST_FILE: RewinDS/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # The Rust staticlib brings its own C++ runtime symbols in via std.

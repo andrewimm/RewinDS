@@ -168,6 +168,35 @@ final class EmulatorCore {
         }
     }
 
+    // --- Serial link ----------------------------------------------------------
+
+    /// The next opaque serial frame to transmit, or `nil` if nothing is queued. The core
+    /// hands out a borrowed span (valid only until the next mutating call), so we copy it
+    /// immediately. The host relays these bytes to a peer without interpreting them.
+    func linkPollOut() -> Data? {
+        var b = RewindsBytes(ptr: nil, len: 0)
+        rewinds_link_poll_out(handle, &b)
+        guard let ptr = b.ptr, b.len > 0 else { return nil }
+        return Data(bytes: ptr, count: Int(b.len))
+    }
+
+    /// Deliver a peer's opaque serial frame received from the carrier.
+    func linkDeliver(_ frame: Data) {
+        guard !frame.isEmpty else { return }
+        frame.withUnsafeBytes { raw in
+            rewinds_link_deliver(handle, raw.bindMemory(to: UInt8.self).baseAddress, UInt(frame.count))
+        }
+    }
+
+    /// Whether a serial transfer is mid-flight (the host should keep pumping).
+    var linkPending: Bool { rewinds_link_pending(handle) }
+
+    /// Attach/detach a carrier and set this unit's id (0 = parent, 1–3 = child) and the
+    /// number of linked units.
+    func setLinkConfig(connected: Bool, id: UInt8, count: UInt8) {
+        rewinds_link_set_config(handle, connected, id, count)
+    }
+
     // --- Audio ----------------------------------------------------------------
 
     /// Attach an audio output at `rate` Hz / `channels` channels; returns a consumer

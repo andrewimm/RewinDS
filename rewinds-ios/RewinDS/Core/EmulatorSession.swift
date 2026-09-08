@@ -19,6 +19,10 @@ final class EmulatorSession: NSObject, ObservableObject {
 
     let input = InputState()
 
+    /// Serial-link controller. Drives frame exchange with a peer carrier from `tick`, and
+    /// publishes link state for the UI. Idle (a no-op each tick) until a link is requested.
+    let link = LinkController()
+
     private let saveStore: SaveStore
     private var audio: AudioEngine?
 
@@ -86,6 +90,8 @@ final class EmulatorSession: NSObject, ObservableObject {
         coreLock.lock()
         saveStore.flushIfDirty(core, romId: romId)
         coreLock.unlock()
+        // The run loop has stopped, so no `pump` can race this teardown of the carrier.
+        link.shutdown()
         audio?.stop()
         audio = nil
         thread = nil
@@ -208,6 +214,9 @@ final class EmulatorSession: NSObject, ObservableObject {
 
         coreLock.lock()
         core.setInput(buttons: buttons, touchX: touchX, touchY: touchY, touchPressed: touchPressed)
+        // Shuttle serial-link frames with any connected peer before advancing the frame, so
+        // inbound frames land before the guest polls SIO this frame.
+        link.pump(core)
         core.runFrame()
         for (i, view) in views.enumerated() {
             guard let view else { continue }

@@ -306,6 +306,42 @@ bool rewinds_save_dirty(RewindsEmulator *p);
 void rewinds_clear_save_dirty(RewindsEmulator *p);
 
 /**
+ * Configure the serial link: whether a carrier is attached, this unit's id
+ * (0 = parent/master, 1-3 = child), and the number of linked units (2-4).
+ *
+ * # Safety
+ * `p` must be null or a live handle.
+ */
+void rewinds_link_set_config(RewindsEmulator *p, bool connected, uint8_t id, uint8_t count);
+
+/**
+ * Take the next serial frame to transmit, writing a borrowed span into `out`
+ * (empty when there is nothing to send). The span is valid until the next
+ * mutating call; the host copies it before transmitting.
+ *
+ * # Safety
+ * `p` must be null or a live handle; `out` must be non-null and writable.
+ */
+void rewinds_link_poll_out(RewindsEmulator *p, RewindsBytes *out);
+
+/**
+ * Deliver a peer's serial frame received from the carrier.
+ *
+ * # Safety
+ * `p` must be null or a live handle; `bytes`/`len` must describe a readable span
+ * that outlives the call.
+ */
+void rewinds_link_deliver(RewindsEmulator *p, const uint8_t *bytes, uintptr_t len);
+
+/**
+ * Whether a serial transfer is in progress (the host should keep pumping).
+ *
+ * # Safety
+ * `p` must be null or a live handle.
+ */
+bool rewinds_link_pending(RewindsEmulator *p);
+
+/**
  * Write the save type's name (e.g. `"flash128k"`) as UTF-8 (no NUL) into `buf`,
  * returning the number of bytes written (truncated to `cap`). Pass a null `buf` /
  * `cap` of 0 to query the length.

@@ -7,12 +7,14 @@ enum MenuPage: Hashable {
     case root
     case games
     case systemFiles
+    case link
 
     var title: String {
         switch self {
         case .root: return "Paused"
         case .games: return "Games"
         case .systemFiles: return "System Files"
+        case .link: return "Link (dev)"
         }
     }
 }
@@ -102,6 +104,7 @@ struct GameMenu: View {
         case .root: rootPage
         case .games: gamesPage
         case .systemFiles: SystemFilesList().scrollContentBackground(.hidden)
+        case .link: LinkDevPage(shell: shell, link: session.link)
         }
     }
 
@@ -111,6 +114,7 @@ struct GameMenu: View {
             filledButton("Resume", "play.fill", tint: shell.accent, action: onResume)
             navRow("Games", "square.grid.2x2") { push(.games) }
             navRow("System Files", "cpu") { push(.systemFiles) }
+            navRow("Link (dev)", "antenna.radiowaves.left.and.right") { push(.link) }
             filledButton("Quit to Library", "rectangle.portrait.and.arrow.right",
                          tint: .red.opacity(0.85)) { model.exitGame() }
         }
