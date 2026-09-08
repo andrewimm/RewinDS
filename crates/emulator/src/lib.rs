@@ -30,6 +30,10 @@ pub mod audio;
 
 pub use audio::AudioSource;
 
+/// The result of [`Emulator::run_frame_step`]: the frame finished, or a serial transfer
+/// is waiting for the peer's word (the host must exchange a link frame and call again).
+pub use gba::FrameOutcome;
+
 /// Which console an image targets.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,9 +239,27 @@ impl Emulator {
     /// [`Self::screen`] and (unless muted) feeding produced samples to the audio
     /// sink from [`Self::enable_audio`].
     pub fn run_frame(&mut self) {
+        // Unlinked, a single step runs the whole frame (it never hits a barrier). Linked,
+        // it returns at the first transfer barrier; a carrier-aware host should drive
+        // [`Self::run_frame_step`] directly and exchange a link frame at each `LinkPending`.
+        let _ = self.run_frame_step();
+    }
+
+    /// Advance the current video frame, stopping early at a serial transfer barrier.
+    ///
+    /// Returns [`FrameOutcome::LinkPending`] when a connected serial transfer is waiting
+    /// for the peer's word: exchange a link frame ([`Self::link_poll_out`] → carrier →
+    /// [`Self::link_deliver`]) and call again to resume the *same* frame. Returns
+    /// [`FrameOutcome::Completed`] when the frame finishes (presenting to [`Self::screen`]
+    /// and feeding audio). With no carrier attached it never returns `LinkPending`, so a
+    /// single call runs a whole frame.
+    pub fn run_frame_step(&mut self) -> FrameOutcome {
         match self {
-            Emulator::Gba(g) => g.run_frame(),
-            Emulator::Nds(n) => n.run_frame(),
+            Emulator::Gba(g) => g.run_frame_step(),
+            Emulator::Nds(n) => {
+                n.run_frame();
+                FrameOutcome::Completed
+            }
         }
     }
 
@@ -623,17 +645,22 @@ impl GbaEmulator {
         g
     }
 
-    fn run_frame(&mut self) {
-        self.system.run_frame();
-        self.refresh_rgba();
-        // The APU buffer is always drained so it cannot grow unbounded, but the
-        // samples are fed to the host only when audio is attached and unmuted.
-        let samples = self.system.take_audio();
-        if let Some(sink) = self.audio.as_mut() {
-            if !self.audio_muted {
-                sink.push(&samples);
+    fn run_frame_step(&mut self) -> FrameOutcome {
+        let outcome = self.system.run_frame_step();
+        // Present and drain audio only once the frame actually finishes; a `LinkPending`
+        // step is mid-frame, with nothing new to show or play yet.
+        if outcome == FrameOutcome::Completed {
+            self.refresh_rgba();
+            // The APU buffer is always drained so it cannot grow unbounded, but the
+            // samples are fed to the host only when audio is attached and unmuted.
+            let samples = self.system.take_audio();
+            if let Some(sink) = self.audio.as_mut() {
+                if !self.audio_muted {
+                    sink.push(&samples);
+                }
             }
         }
+        outcome
     }
 
     /// Convert the canonical BGR555 framebuffer into the RGBA8 present buffer.

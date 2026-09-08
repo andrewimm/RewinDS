@@ -163,6 +163,17 @@ impl CpuMemory for CpuBus<'_> {
     }
 }
 
+/// The result of running (a portion of) a video frame via [`System::run_frame_step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The video frame finished; the framebuffer holds the completed image.
+    Completed,
+    /// A connected serial transfer is waiting for the peer's word. The host must
+    /// exchange a link frame (poll_out → carrier → deliver) and call again to resume
+    /// the same frame. Only occurs when a link carrier is attached.
+    LinkPending,
+}
+
 /// The result of progressing a low-power machine by one event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HaltProgress {
@@ -276,6 +287,33 @@ impl System {
         }
     }
 
+    /// Run (or resume) one video frame, stopping early at a serial transfer barrier.
+    ///
+    /// Returns [`FrameOutcome::Completed`] when the frame finishes, or
+    /// [`FrameOutcome::LinkPending`] when a connected serial transfer is waiting for a
+    /// peer's word: the host should exchange a link frame (poll_out → carrier →
+    /// deliver) and call this again to resume the *same* frame. When no link carrier is
+    /// attached this never returns `LinkPending`, so a single call runs a whole frame —
+    /// identical to [`Self::run_frame`].
+    pub fn run_frame_step(&mut self) -> FrameOutcome {
+        self.start_lcd();
+        self.start_apu();
+        let start = self.gba.bus.io.video.frame();
+        for _ in 0..(LINES_PER_FRAME + 2) {
+            if self.gba.bus.io.video.frame() != start {
+                return FrameOutcome::Completed;
+            }
+            let target = self.scheduler.now() + CYCLES_PER_LINE;
+            self.run_until(target);
+            // `run_until` side-exits the instant a transfer awaits its peer; surface that
+            // so the host can exchange before we advance (and read a stale result).
+            if self.gba.bus.io.serial_awaiting_peer() {
+                return FrameOutcome::LinkPending;
+            }
+        }
+        FrameOutcome::Completed
+    }
+
     /// Select which video instrumentation a running frame collects. Off by default
     /// and zero-cost when off; mirrors the event-trace opt-in.
     pub fn set_video_instrumentation(&mut self, level: VideoInstrumentation) {
@@ -372,6 +410,13 @@ impl System {
     /// boundaries.
     pub fn run_until(&mut self, target: Timestamp) {
         while self.scheduler.now() < target {
+            // Transfer barrier: a connected serial transfer that is still waiting for
+            // the peer's word suspends execution here, so the host can exchange a link
+            // frame before the guest reads the result — keeping the two linked machines
+            // in lockstep. Unlinked play never sets this, so it is a no-op then.
+            if self.gba.bus.io.serial_awaiting_peer() {
+                return;
+            }
             // Recompute the deadline every instruction: an MMIO write can
             // schedule an earlier event, and the CPU must side-exit to it.
             let deadline = self
@@ -921,5 +966,57 @@ mod tests {
         // A keypad interrupt does.
         sys.gba.bus.io.irq.request(IrqSource::Keypad);
         assert!(sys.gba.should_wake());
+    }
+
+    /// The transfer barrier: a connected multiplayer transfer suspends `run_frame_step`
+    /// (`LinkPending`) until the peer's word is delivered, then the frame resumes and
+    /// completes — the synchronous-lockstep primitive Phase A adds. Two in-process
+    /// machines relay each other's frames directly (a no-op "carrier").
+    #[test]
+    fn link_transfer_barrier_suspends_and_resumes_the_frame() {
+        use emu_core::{Access, AccessKind, AccessSequence};
+        const CPU: Access = Access::cpu(AccessKind::Data, AccessSequence::NonSequential);
+        const MULTI: u16 = (0b10 << 12) | (1 << 14); // multiplayer mode + transfer IRQ
+        const START: u16 = 1 << 7;
+
+        // Two machines each spinning on `b .`, wired as a two-unit multiplayer link.
+        let mut parent = System::new();
+        let mut child = System::new();
+        for sys in [&mut parent, &mut child] {
+            load_iwram(sys, &[0xEAFF_FFFE]); // b .
+            sys.cpu.set_pc(0x0300_0000);
+        }
+        parent.gba.bus.io.serial_set_link(true, 0, 2);
+        child.gba.bus.io.serial_set_link(true, 1, 2);
+
+        // Serial/multiplayer mode and each unit's send word, via MMIO.
+        parent.gba.bus.write16(0x0400_0134, 0, CPU, &mut parent.scheduler);
+        child.gba.bus.write16(0x0400_0134, 0, CPU, &mut child.scheduler);
+        parent.gba.bus.write16(0x0400_012A, 0xAAAA, CPU, &mut parent.scheduler);
+        child.gba.bus.write16(0x0400_012A, 0x5555, CPU, &mut child.scheduler);
+        child.gba.bus.write16(0x0400_0128, MULTI, CPU, &mut child.scheduler); // child ready
+
+        // The parent clocks a transfer; the frame suspends awaiting the peer, and stays
+        // suspended across calls until something is delivered.
+        parent.gba.bus.write16(0x0400_0128, MULTI | START, CPU, &mut parent.scheduler);
+        assert_eq!(parent.run_frame_step(), FrameOutcome::LinkPending);
+        assert_eq!(parent.run_frame_step(), FrameOutcome::LinkPending);
+
+        // Relay the barrier frames between the two machines (the in-process carrier).
+        let pf = parent.gba.bus.io.serial_poll_out().expect("parent queued an outbound frame");
+        child.gba.bus.io.serial_deliver(&pf);
+        let cf = child.gba.bus.io.serial_poll_out().expect("child replied");
+        parent.gba.bus.io.serial_deliver(&cf);
+
+        // The peer's word is in, so the barrier lifts and the frame runs to completion.
+        assert_eq!(parent.run_frame_step(), FrameOutcome::Completed);
+
+        // Both machines hold the exchanged words, cleared busy, and took the serial IRQ.
+        for sys in [&mut parent, &mut child] {
+            assert_eq!(sys.gba.bus.read16(0x0400_0120, CPU, &mut sys.scheduler).value, 0xAAAA);
+            assert_eq!(sys.gba.bus.read16(0x0400_0122, CPU, &mut sys.scheduler).value, 0x5555);
+            assert_eq!(sys.gba.bus.read16(0x0400_0128, CPU, &mut sys.scheduler).value & START, 0);
+            assert_ne!(sys.gba.bus.io.irq.iflags() & IrqSource::Serial.mask(), 0);
+        }
     }
 }

@@ -214,6 +214,13 @@ impl Io {
         self.serial.pending()
     }
 
+    /// Whether a connected serial transfer is awaiting peer words — the point at
+    /// which the core suspends the frame so the host can exchange a link frame
+    /// (the transfer barrier).
+    pub fn serial_awaiting_peer(&self) -> bool {
+        self.serial.awaiting_peer()
+    }
+
     // --- MMIO access, composed from 16-bit registers ---
 
     /// Read `width` bytes of I/O at `offset` (relative to `04000000h`).

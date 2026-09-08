@@ -336,6 +336,17 @@ impl Serial {
     pub fn pending(&self) -> bool {
         self.outbound.is_some() || self.siocnt & START_BUSY != 0
     }
+
+    /// Whether a **connected** transfer has started and is still waiting for one or
+    /// more peers' words. This is the transfer barrier: real GBA link is a
+    /// synchronous clocked exchange, so the emulator must suspend here and let the
+    /// host exchange a frame ([`poll_out`](Self::poll_out) → carrier →
+    /// [`deliver`](Self::deliver)) before the guest reads the result, keeping the
+    /// two machines in lockstep. False when disconnected (the fallback completes
+    /// instantly) or once every slot for this round is in.
+    pub fn awaiting_peer(&self) -> bool {
+        self.connected && (self.siocnt & START_BUSY != 0) && self.filled() < self.count
+    }
 }
 
 #[cfg(test)]
