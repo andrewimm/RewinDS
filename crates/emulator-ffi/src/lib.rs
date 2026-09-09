@@ -29,7 +29,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::{null, null_mut};
 
-use emulator::{button, Console, Emulator, Input, Load};
+use emulator::{button, Console, Emulator, Input, Load, StepOutcome};
 use emulator::audio::AudioSource;
 
 /// cbindgen:opaque
@@ -284,6 +284,31 @@ pub unsafe extern "C" fn rewinds_run_frame(p: *mut RewindsEmulator) {
     if let Some(e) = emu(p) {
         let _ = catch_unwind(AssertUnwindSafe(|| e.run_frame()));
     }
+}
+
+/// Advance at most `max_cycles` of the current frame, returning an outcome code so a
+/// linked host can service its carrier between slices (sub-frame granularity — needed for
+/// real-time link, where a game fires many transfers per frame):
+///   `0` frame complete (presented; read screens/audio now),
+///   `1` a serial transfer awaits the peer (exchange a link frame via `rewinds_link_*`
+///       and call again to resume the same frame),
+///   `2` the slice budget was spent mid-frame (call again to continue).
+/// With no link carrier attached this never returns `1`, so one call runs a whole frame.
+/// A null handle or caught panic returns `0`.
+///
+/// # Safety
+/// `p` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_run_step(p: *mut RewindsEmulator, max_cycles: u64) -> u32 {
+    if let Some(e) = emu(p) {
+        return match catch_unwind(AssertUnwindSafe(|| e.run_step(max_cycles))) {
+            Ok(StepOutcome::FrameComplete) => 0,
+            Ok(StepOutcome::LinkPending) => 1,
+            Ok(StepOutcome::Yielded) => 2,
+            Err(_) => 0,
+        };
+    }
+    0
 }
 
 /// Re-derive the present buffers from the current framebuffer without advancing
@@ -598,7 +623,7 @@ pub unsafe extern "C" fn rewinds_set_save_type_by_name(
 /// so a host can refuse a mismatched framework.
 #[no_mangle]
 pub extern "C" fn rewinds_core_version() -> u32 {
-    2
+    3
 }
 
 #[cfg(test)]

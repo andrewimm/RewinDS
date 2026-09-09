@@ -186,6 +186,22 @@ uint64_t rewinds_frame(RewindsEmulator *p);
 void rewinds_run_frame(RewindsEmulator *p);
 
 /**
+ * Advance at most `max_cycles` of the current frame, returning an outcome code so a
+ * linked host can service its carrier between slices (sub-frame granularity — needed for
+ * real-time link, where a game fires many transfers per frame):
+ *   `0` frame complete (presented; read screens/audio now),
+ *   `1` a serial transfer awaits the peer (exchange a link frame via `rewinds_link_*`
+ *       and call again to resume the same frame),
+ *   `2` the slice budget was spent mid-frame (call again to continue).
+ * With no link carrier attached this never returns `1`, so one call runs a whole frame.
+ * A null handle or caught panic returns `0`.
+ *
+ * # Safety
+ * `p` must be null or a live handle.
+ */
+uint32_t rewinds_run_step(RewindsEmulator *p, uint64_t max_cycles);
+
+/**
  * Re-derive the present buffers from the current framebuffer without advancing
  * (for a repaint after a paused/stepped run).
  *

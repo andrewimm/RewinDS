@@ -50,6 +50,16 @@ public struct BootImages {
     }
 }
 
+/// Outcome of [`EmulatorCore.runStep`] — mirrors the core's `rewinds_run_step` codes.
+public enum StepOutcome: UInt32 {
+    /// The video frame finished (presented; read screens/audio now).
+    case frameComplete = 0
+    /// A serial transfer awaits the peer's word — exchange a link frame and call again.
+    case linkPending = 1
+    /// The slice budget ran out mid-frame — call again to continue.
+    case yielded = 2
+}
+
 /// A borrowed view of one presented screen: `count` bytes of RGBA8 at `pixels`, valid
 /// only until the next `runFrame`/`present`.
 public struct ScreenBuffer {
@@ -116,6 +126,14 @@ public final class EmulatorCore {
 
     public func runFrame() { rewinds_run_frame(handle) }
     public func present() { rewinds_present(handle) }
+
+    /// Advance at most `maxCycles` of the current frame, so a linked host can service its
+    /// carrier between slices (sub-frame granularity — needed for real-time link, where a
+    /// game fires many transfers per frame). See `StepOutcome`. With no carrier attached it
+    /// never returns `.linkPending`, so a single call runs a whole frame.
+    public func runStep(maxCycles: UInt64) -> StepOutcome {
+        StepOutcome(rawValue: rewinds_run_step(handle, maxCycles)) ?? .frameComplete
+    }
 
     /// The button mask (`REWINDS_BTN_*`) and touch applied on subsequent frames.
     public func setInput(buttons: UInt32, touchX: Int16, touchY: Int16, touchPressed: Bool) {

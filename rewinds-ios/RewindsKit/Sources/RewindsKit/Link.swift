@@ -66,7 +66,10 @@ final class LinkConnection: LinkCarrier {
 
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.setimmediate.link")
-    private let lock = NSLock()
+    // A condition (not a plain lock) so `recvBlocking` can park the emulation thread on
+    // the socket at a transfer barrier and be woken the instant a frame or a status change
+    // arrives — no busy-polling.
+    private let cond = NSCondition()
     private var status: Status = .connecting
     private var inbox: [Data] = []
     private var inbuf = [UInt8]()
@@ -109,7 +112,7 @@ final class LinkConnection: LinkCarrier {
     }
 
     func currentStatus() -> Status {
-        lock.lock(); defer { lock.unlock() }
+        cond.lock(); defer { cond.unlock() }
         return status
     }
 
@@ -123,7 +126,7 @@ final class LinkConnection: LinkCarrier {
     }
 
     func poll() -> [Data] {
-        lock.lock(); defer { lock.unlock() }
+        cond.lock(); defer { cond.unlock() }
         guard !inbox.isEmpty else { return [] }
         let frames = inbox
         inbox.removeAll(keepingCapacity: true)
@@ -158,18 +161,46 @@ final class LinkConnection: LinkCarrier {
     }
 
     private func ingest(_ data: Data) {
-        lock.lock()
+        cond.lock()
         inbuf.append(contentsOf: data)
         // Split off every complete length-prefixed frame.
+        var gotFrame = false
         while let len = inbuf.first.map(Int.init), inbuf.count >= 1 + len {
             inbox.append(Data(inbuf[1..<(1 + len)]))
             inbuf.removeFirst(1 + len)
+            gotFrame = true
         }
-        lock.unlock()
+        if gotFrame { cond.signal() } // wake a barrier wait in `recvBlocking`
+        cond.unlock()
     }
 
     private func setStatus(_ newStatus: Status) {
-        lock.lock(); status = newStatus; lock.unlock()
+        cond.lock()
+        status = newStatus
+        cond.signal() // wake a barrier wait so a drop/close doesn't wait out the timeout
+        cond.unlock()
+    }
+
+    /// Block up to `timeout` for at least one frame, **parking** the emulation thread on
+    /// the socket rather than spinning — the transfer barrier's wait. Returns whatever
+    /// frames arrived (empty on timeout or a dead connection).
+    func recvBlocking(timeout: TimeInterval) -> [Data] {
+        cond.lock(); defer { cond.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while inbox.isEmpty && Self.waitable(status) && Date() < deadline {
+            if !cond.wait(until: deadline) { break } // timed out
+        }
+        let frames = inbox
+        inbox.removeAll(keepingCapacity: true)
+        return frames
+    }
+
+    /// Whether it's still worth waiting on this connection (not failed/closed).
+    private static func waitable(_ status: Status) -> Bool {
+        switch status {
+        case .connecting, .ready: return true
+        case .failed, .closed: return false
+        }
     }
 }
 
@@ -286,14 +317,15 @@ public final class LinkController: ObservableObject {
 
     // --- Emulation thread (under the core lock) -------------------------------
 
-    /// Before the frame: apply pending intents, reconcile link config, and deliver any
-    /// inbound frames so the guest sees peers' data when it polls SIO this frame.
-    func receive(_ core: EmulatorCore) {
+    /// Apply pending intents and reconcile the core's link config. Returns whether a link
+    /// is up and this frame should be driven by [`runLinkedFrame`] (the transfer barrier);
+    /// `false` means run a normal frame (unlinked, or still connecting).
+    func reconcile(_ core: EmulatorCore) -> Bool {
         applyIntents(core)
-        guard let carrier else { return }
+        guard let carrier else { return false }
         switch carrier.currentStatus() {
         case .connecting:
-            break
+            return false
         case .ready:
             if !configured {
                 core.setLinkConfig(connected: true, id: carrier.id, count: carrier.count)
@@ -301,26 +333,47 @@ public final class LinkController: ObservableObject {
                 publish(.linked)
                 LinkNotifier.notify("RewinDS linked", "Connected for multiplayer.")
             }
-            for frame in carrier.poll() { core.linkDeliver(frame) }
+            return true
         case .failed(let message):
             let wasLinked = configured
             teardown(core)
             publish(.disconnected(message))
             if wasLinked { LinkNotifier.notify("Link disconnected", message) }
+            return false
         case .closed:
             let wasLinked = configured
             teardown(core)
             publish(.disconnected("Link closed"))
             if wasLinked { LinkNotifier.notify("Link disconnected", "The other player left.") }
+            return false
         }
     }
 
-    /// After the frame: ship whatever serial frames it produced, so an outbound frame goes
-    /// out the same frame the guest generated it — matching the desktop host's ordering
-    /// (deliver before `run_frame`, poll-out after) and minimizing link round-trip latency.
-    func transmit(_ core: EmulatorCore) {
-        guard let carrier, configured else { return }
-        while let frame = core.linkPollOut() { carrier.send(frame) }
+    /// Drive one video frame under the serial transfer barrier, mirroring the desktop host:
+    /// advance in short slices, service the carrier between each, and at every transfer send
+    /// our word and **park** for the peer's reply before resuming — so each transfer
+    /// completes in-frame (clock-locked) even during the bursts a link session fires within
+    /// a single frame. A stalled peer (no reply within the timeout) ends the frame early.
+    /// Only called when [`reconcile`] returned `true`; runs on the emulation thread.
+    func runLinkedFrame(_ core: EmulatorCore) {
+        guard let carrier else { return }
+        let sliceCycles: UInt64 = 512
+        let barrierTimeout: TimeInterval = 0.05
+        while true {
+            for frame in carrier.poll() { core.linkDeliver(frame) }
+            while let frame = core.linkPollOut() { carrier.send(frame) }
+            switch core.runStep(maxCycles: sliceCycles) {
+            case .frameComplete:
+                return
+            case .yielded:
+                continue
+            case .linkPending:
+                while let frame = core.linkPollOut() { carrier.send(frame) }
+                let frames = carrier.recvBlocking(timeout: barrierTimeout)
+                if frames.isEmpty { return } // peer stalled — bail this frame rather than hang
+                for frame in frames { core.linkDeliver(frame) }
+            }
+        }
     }
 
     private func applyIntents(_ core: EmulatorCore) {

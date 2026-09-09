@@ -246,17 +246,21 @@ public final class EmulatorSession: NSObject, ObservableObject {
         let touchX = input.touchX
         let touchY = input.touchY
         let touchPressed = input.touchPressed
-        let warping = warp
+        let warpHeld = warp
         let sinks = (0..<console.screenCount).map { screens[$0]?.sink }
         stateLock.unlock()
 
         coreLock.lock()
         core.setInput(buttons: buttons, touchX: touchX, touchY: touchY, touchPressed: touchPressed)
-        // Deliver any peer serial frames before the frame runs, so inbound data is present
-        // when the guest polls SIO this frame.
-        link.receive(core)
+        // Reconcile the link (apply connect/disconnect intents, set config on ready). When a
+        // link is up, drive the frame under the transfer barrier; fast-forward is disabled
+        // then (it would desync the two machines).
+        let linked = link.reconcile(core)
+        let warping = warpHeld && !linked
         core.setAudioMuted(warping)
-        if warping {
+        if linked {
+            link.runLinkedFrame(core)
+        } else if warping {
             // Fast-forward: run unthrottled for ~a display frame's worth of real time, then
             // present only the final frame (audio muted above) — matching the desktop host.
             let deadline = CACurrentMediaTime() + 0.014
@@ -264,9 +268,6 @@ public final class EmulatorSession: NSObject, ObservableObject {
         } else {
             core.runFrame()
         }
-        // Ship the serial frames this frame produced — after running it, so an outbound
-        // frame leaves the same frame it was generated (minimizing link round-trip latency).
-        link.transmit(core)
         for (i, sink) in sinks.enumerated() {
             guard let sink else { continue }
             core.withScreen(i) { buf in
