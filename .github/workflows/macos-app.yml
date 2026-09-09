@@ -1,0 +1,32 @@
+# Compile-and-link check for the native macOS app (unsigned — no team signing needed,
+# since CI isn't distributing the build). Deliberately NOT part of the per-commit CI: it's
+# slower than the Rust jobs (it builds the Rust core into a 3-slice XCFramework, regenerates
+# the Xcode project, then does an Xcode build). It runs only on version tags (releases) and
+# on demand from the Actions tab.
+name: macOS app
+
+on:
+  workflow_dispatch: {}   # run manually from the Actions tab
+  push:
+    tags:
+      - "v*"              # and on release tags
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen + cbindgen
+        run: brew install xcodegen cbindgen
+      - name: Build the Rust core into RewindsCore.xcframework
+        run: ./rewinds-ios/build-core.sh   # adds the Rust targets and runs cbindgen itself
+      - name: Generate the Xcode project
+        run: cd rewinds-ios && xcodegen generate
+      - name: Build the macOS app (unsigned)
+        run: |
+          xcodebuild -project rewinds-ios/RewinDS.xcodeproj -scheme RewinDS-mac \
+            -destination 'platform=macOS,arch=arm64' \
+            CODE_SIGNING_ALLOWED=NO build
