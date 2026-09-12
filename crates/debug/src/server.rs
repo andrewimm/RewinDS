@@ -506,6 +506,9 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 .map(|c| json!({
                     "layer": format!("{:?}", c.candidate.layer),
                     "color": c.candidate.color.0,
+                    "priority": c.candidate.priority,
+                    "semiTransparentObj": c.candidate.flags.semi_transparent_obj,
+                    "objAlpha": c.candidate.flags.obj_alpha,
                     "visible": c.visible_after_window,
                     "rejection": c.rejection_reason.as_ref().map(|r| format!("{r:?}")),
                     "addresses": c.provenance.source_addresses(),
@@ -516,6 +519,23 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 "finalColor": ex.final_color.0,
                 "videoMode": ex.video_mode,
                 "topLayer": format!("{:?}", ex.resolved.top.layer),
+                "topPriority": ex.resolved.top.priority,
+                // The second-front-most candidate: the alpha-blend operand behind the top.
+                "secondLayer": format!("{:?}", ex.resolved.second.layer),
+                "secondPriority": ex.resolved.second.priority,
+                // Window decision at this pixel — `effectsEnabled` gates all color effects.
+                "window": {
+                    "region": format!("{:?}", ex.window.region),
+                    "effectsEnabled": ex.window.effects_enabled,
+                    "layersEnabled": ex.window.layers_enabled,
+                },
+                // The color-effects (blend/brighten/darken) stage — the "why" behind a
+                // translucency result. `applied` names the operands and coefficients.
+                "effect": {
+                    "mode": format!("{:?}", ex.effect.mode),
+                    "applied": format!("{:?}", ex.effect.applied),
+                    "result": ex.effect.result.0,
+                },
                 "candidates": candidates,
             })
         }

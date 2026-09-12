@@ -91,8 +91,8 @@ export class Debugger {
   spriteAt(x, y) { return this.call('video.spriteAt', { x, y }); }
   framebuffer() { return this.call('video.framebuffer'); }
   async screenshot(path) {
-    const { width, height, rgba } = await this.framebuffer();
-    writeFileSync(path, encodePng(width, height, Buffer.from(rgba, 'base64')));
+    const { width, height, base64 } = await this.framebuffer();
+    writeFileSync(path, encodePng(width, height, Buffer.from(base64, 'base64')));
     return path;
   }
 

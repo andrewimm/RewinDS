@@ -2,9 +2,11 @@
 //! resolution.
 //!
 //! Effects run once per pixel on the resolved top (and, for alpha, second)
-//! candidate, gated by `BLDCNT` target selection and by the per-pixel window
-//! effect-enable. A semi-transparent OBJ forces alpha blending regardless of the
-//! `BLDCNT` mode, as long as the pixel behind it is a valid second target.
+//! candidate. The `BLDCNT`-driven effects are gated by `BLDCNT` target selection and
+//! by the per-pixel window color-special-effect enable. A semi-transparent OBJ (like
+//! the DS 3D and bitmap-OBJ layers) instead forces alpha blending regardless of the
+//! `BLDCNT` mode *and* regardless of the window effect-enable, as long as the pixel
+//! behind it is a valid second target.
 
 use super::debug::explain::{AppliedEffect, EffectExplanation, EffectMode};
 use super::registers::Registers;
@@ -77,7 +79,9 @@ fn pack(r: u16, g: u16, b: u16) -> Color15 {
 }
 
 /// Apply color effects to a resolved pixel. `effects_enabled` is the window's
-/// per-pixel effect-enable; when clear, only the plain top color passes through.
+/// per-pixel color-special-effect enable; when clear it suppresses the BLDCNT-driven
+/// effects only — the forced per-pixel blends (3D layer, semi-transparent OBJ, DS
+/// bitmap OBJ) still apply, matching hardware.
 pub fn apply(
     top: CandidatePixel,
     second: CandidatePixel,
@@ -90,28 +94,36 @@ pub fn apply(
     // enable. Opaque 3D pixels (`A = 31`) are NOT alpha-blended here (they would wash out
     // against an additive BLDALPHA); they fall through and may still be brightened/
     // darkened by EVY below like an ordinary BG0.
+    let eva = (regs.bldalpha & 0x1F).min(16);
+    let evb = ((regs.bldalpha >> 8) & 0x1F).min(16);
+    let evy = (regs.bldy & 0x1F).min(16);
+
+    // The forced, per-pixel blends below (3D layer, semi-transparent OBJ, DS bitmap OBJ)
+    // are intrinsic to the source pixel rather than selected by BLDCNT, and so run BEFORE
+    // the window's color-effect gate: on hardware they blend even where a window clears the
+    // color-special-effect enable bit (that bit gates only the BLDCNT-driven effects at the
+    // end). Missing this made FireRed's Pokémon Tower fog — semi-transparent OBJs under a
+    // full-screen WIN0 with effects disabled — render opaque and conceal the map.
+
+    // The DS 3D layer (Engine A BG0) blends with the 2D layer behind it using its OWN
+    // per-pixel alpha as the coefficient — `EVA = A/2`, `EVB = 16 − A/2` (GBATEK) — not
+    // BLDALPHA. Opaque 3D pixels (`A = 31`) are NOT alpha-blended here (they would wash out
+    // against an additive BLDALPHA); they fall through and may still be brightened/darkened
+    // by EVY below like an ordinary BG0.
     let top_is_3d = top.flags.three_d_alpha.is_some();
     if let Some(a) = top.flags.three_d_alpha {
         if a < 31 && is_second_target(regs, second.layer) {
-            let eva = (a / 2) as u16;
+            let eva3 = (a / 2) as u16;
             return EffectResult {
-                color: alpha_blend(top.color, second.color, eva, 16 - eva),
+                color: alpha_blend(top.color, second.color, eva3, 16 - eva3),
                 mode: EffectMode::ThreeDBlend,
                 applied: AppliedEffect::ThreeDBlend { second: second.layer, alpha: a },
             };
         }
     }
 
-    if !effects_enabled {
-        return EffectResult::none(top.color);
-    }
-
-    let eva = (regs.bldalpha & 0x1F).min(16);
-    let evb = ((regs.bldalpha >> 8) & 0x1F).min(16);
-    let evy = (regs.bldy & 0x1F).min(16);
-
-    // A semi-transparent OBJ blends with the layer behind it regardless of the
-    // BLDCNT effect mode, provided that layer is a valid second target.
+    // A semi-transparent OBJ is always the alpha-blend 1st target (regardless of BLDCNT),
+    // blending with the layer behind it provided that layer is a valid second target.
     if top.flags.semi_transparent_obj && is_second_target(regs, second.layer) {
         return EffectResult {
             color: alpha_blend(top.color, second.color, eva, evb),
@@ -144,6 +156,13 @@ pub fn apply(
                 },
             };
         }
+    }
+
+    // The window's per-pixel color-special-effect enable gates the BLDCNT-driven effects
+    // only (the forced per-pixel blends above already returned). When clear, the plain top
+    // color passes through.
+    if !effects_enabled {
+        return EffectResult::none(top.color);
     }
 
     match (regs.bldcnt >> 6) & 0x3 {
@@ -273,6 +292,25 @@ mod tests {
         let below = pixel(0x7C00, LayerId::Bg1);
         let out = apply(obj, below, &regs, true);
         assert_eq!(out.color, Color15(0x001F));
+    }
+
+    #[test]
+    fn semi_transparent_obj_blends_even_when_window_disables_effects() {
+        // FireRed's Pokémon Tower fog: a semi-transparent OBJ over BG2 (a valid 2nd
+        // target) under a full-screen WIN0 whose color-effect enable bit is clear. The
+        // forced OBJ blend is intrinsic to the pixel, so it must still happen — otherwise
+        // the fog renders opaque and conceals the map.
+        let regs = Registers {
+            bldcnt: 1 << 10, // second target = BG2; effect mode 0
+            bldalpha: (8 << 8) | 8, // eva = 8, evb = 8 (half each)
+            ..Default::default()
+        };
+        let mut obj = pixel(0x001F, LayerId::Obj); // red fog
+        obj.flags.semi_transparent_obj = true;
+        let below = pixel(0x7C00, LayerId::Bg2); // blue map
+        let out = apply(obj, below, &regs, /* effects_enabled */ false);
+        assert!(matches!(out.mode, EffectMode::Alpha));
+        assert_eq!(out.color, pack(15, 0, 15)); // blended, not the opaque red OBJ
     }
 
     #[test]
