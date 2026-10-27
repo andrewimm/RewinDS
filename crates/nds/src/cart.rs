@@ -164,8 +164,23 @@ impl Cart {
         self.rom = rom.to_vec().into_boxed_slice();
         let size_mb = (rom.len() >> 20).max(1) as u32;
         let size_byte = size_mb.saturating_sub(1).min(0x7F);
-        let flags = if size_mb >= 128 { 0x80 } else { 0x00 }; // bit31: new 1T-ROM protocol
-        self.chip_id = 0xC2 | (size_byte << 8) | (flags << 24);
+        // Chip-ID flag bytes (GBATEK "1st Get ROM Chip ID"). An **infrared** cart (Pokémon
+        // HG/SS, B/W, B2/W2 — all carry the IR chip for the Pokéwalker / C-Gear) reports the
+        // IR flag in byte 2 and flag byte 3 = 0xE0; HG/SS verify this when loading a save and
+        // show "A communication error has occurred" if it is absent (our old `00h,80h` looked
+        // like a plain non-IR cart). A plain cart uses byte 3 = 0x80 once it is ≥ 128 MB
+        // (the new/bigger-ROM protocol variant).
+        let gamecode = rom.get(0x0C..0x10).unwrap_or(&[0; 4]);
+        let infrared = matches!(
+            &gamecode[..gamecode.len().min(3)],
+            b"IPK" | b"IPG" | b"IRB" | b"IRA" | b"IRE" | b"IRD"
+        );
+        let (flags2, flags3): (u32, u32) = if infrared {
+            (0x01, 0xE0)
+        } else {
+            (0x00, if size_mb >= 128 { 0x80 } else { 0x00 })
+        };
+        self.chip_id = 0xC2 | (size_byte << 8) | (flags2 << 16) | (flags3 << 24);
     }
 
     /// The cartridge's ROM chip ID (the boot-info footer mirrors it into RAM).
