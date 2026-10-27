@@ -11,9 +11,9 @@
 //! per-pixel alpha is exported so the 2D compositor can blend the 3D layer over the
 //! backgrounds behind it.
 //!
-//! Interpolation of color, depth and texcoords is linear in screen space (not yet
-//! perspective-correct); fog, edge marking, toon/highlight shading, wireframe and the
-//! 4×4 compressed texture format are still to come.
+//! After shading, **edge marking** (`DISP3DCNT` bit 5) outlines opaque silhouettes and
+//! polygon-ID creases from the `EDGE_COLOR_TABLE`. Fog, wireframe and the 4×4 compressed
+//! texture format are still to come.
 
 use crate::geometry::{Polygon, RenderList, Vertex};
 use crate::texture::{TexParams, TextureSet};
@@ -111,6 +111,12 @@ pub struct RenderConfig {
     /// `DISP3DCNT` bit 1: polygon-mode-2 pixels use highlight shading (add the toon color
     /// on top of the modulation) when set, plain toon shading (replace) when clear.
     pub toon_highlight: bool,
+    /// `DISP3DCNT` bit 5: draw outlines where the winning opaque polygon ID changes
+    /// (object silhouettes and creases). Gives Pokémon-style games their cartoon look.
+    pub edge_marking: bool,
+    /// `EDGE_COLOR_TABLE`: 8 × 15-bit BGR555 outline colors, selected by a pixel's
+    /// polygon ID >> 3.
+    pub edge_table: [u16; 8],
 }
 
 impl Default for RenderConfig {
@@ -128,6 +134,8 @@ impl Default for RenderConfig {
             ignore_depth: false,
             toon_table: [0; 32],
             toon_highlight: false,
+            edge_marking: false,
+            edge_table: [0; 8],
         }
     }
 }
@@ -144,6 +152,18 @@ impl RenderConfig {
     /// 5-bit channels expand to 6-bit per GBATEK (`c>0 ? c*2+1 : 0`).
     fn toon_color(&self, vred: i32) -> [u8; 3] {
         let e = self.toon_table[((vred >> 1) as usize) & 31];
+        let x = |c: u16| -> u8 {
+            let c = (c & 0x1F) as u8;
+            if c == 0 { 0 } else { c * 2 + 1 }
+        };
+        [x(e), x(e >> 5), x(e >> 10)]
+    }
+
+    /// The 6-bit RGB outline color for a 6-bit polygon ID: the 8-entry `EDGE_COLOR_TABLE`
+    /// is indexed by the ID's top three bits (`id >> 3`); each 5-bit BGR555 channel
+    /// expands to 6-bit per GBATEK (`c>0 ? c*2+1 : 0`), as elsewhere in this engine.
+    fn edge_color(&self, poly_id: u8) -> [u8; 3] {
+        let e = self.edge_table[(poly_id >> 3) as usize];
         let x = |c: u16| -> u8 {
             let c = (c & 0x1F) as u8;
             if c == 0 { 0 } else { c * 2 + 1 }
@@ -535,9 +555,53 @@ fn scan_poly(fb: &mut Framebuffer3d, rp: &RPoly, tex: &TextureSet, cfg: &RenderC
     fill_span(fb, rp, tex, cfg, y, &l, &r, pass);
 }
 
+/// Edge marking (`DISP3DCNT` bit 5): outline the near side of every boundary where the
+/// winning opaque polygon ID changes — object silhouettes against the rear plane (an
+/// uncovered neighbor reads as the rear ID `0xFF` at the far depth) and creases between
+/// polygons with different IDs. A pixel is outlined when a 4-neighbor has a different ID
+/// *and* is farther (larger depth), so only the nearer polygon of a boundary is marked
+/// and each edge is a single line, never doubled. The outline color comes from
+/// `EDGE_COLOR_TABLE`, indexed by the pixel's own polygon ID >> 3.
+///
+/// Runs on the opaque ID/depth buffers after all shading, so translucent pixels (which
+/// never write a polygon ID) don't create outlines. Off-screen neighbors are skipped —
+/// geometry running to the screen border is not framed — since the test reads only the
+/// ID and depth buffers (never color), it is safe to recolor pixels in place.
+fn edge_mark(fb: &mut Framebuffer3d, cfg: &RenderConfig) {
+    let Framebuffer3d { pixels, depth, poly_id, .. } = fb;
+    let (w, h) = (WIDTH as i32, HEIGHT as i32);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let id = poly_id[idx];
+            if id == 0xFF {
+                continue; // rear plane / no opaque polygon here — never an outline
+            }
+            let z = depth[idx];
+            // A neighbor forms an edge when it belongs to a different polygon and lies
+            // farther away (so this, the nearer pixel, owns the outline). Off-screen
+            // neighbors don't count — the screen border is not outlined.
+            let farther_other = |nx: i32, ny: i32| -> bool {
+                if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                    return false;
+                }
+                let n = (ny * w + nx) as usize;
+                poly_id[n] != id && depth[n] > z
+            };
+            if farther_other(x - 1, y)
+                || farther_other(x + 1, y)
+                || farther_other(x, y - 1)
+                || farther_other(x, y + 1)
+            {
+                pixels[idx].color = cfg.edge_color(id);
+            }
+        }
+    }
+}
+
 /// Rasterize the sealed render list into `fb`, sampling from `tex` under `cfg`. Opaque
 /// pixels are laid down first (with depth), then — if alpha-blending is enabled —
-/// translucent pixels blend over them.
+/// translucent pixels blend over them, and finally edge marking outlines the result.
 pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut Framebuffer3d) {
     fb.clear_rear(cfg.clear_color, cfg.clear_alpha, cfg.clear_depth);
     let vp = Viewport::decode(list.viewport);
@@ -589,6 +653,11 @@ pub fn render(list: &RenderList, tex: &TextureSet, cfg: &RenderConfig, fb: &mut 
                 }
             }
         }
+    }
+
+    // Final pass: outline the opaque silhouettes and ID creases (no-op unless enabled).
+    if cfg.edge_marking {
+        edge_mark(fb, cfg);
     }
 }
 
@@ -682,6 +751,60 @@ mod tests {
         let e = one_triangle(0x001F, 2 << 4);
         let fb = rasterize_cfg(&e, &cfg);
         assert_eq!(fb.at(128, 96).color, [0, 42, 0]);
+    }
+
+    #[test]
+    fn edge_marking_outlines_the_silhouette_but_not_the_interior() {
+        // A red triangle with polygon ID 8 (group 1), edge marking on. The top-edge pixel
+        // borders the uncovered rear plane above it (farther) → outlined with the group-1
+        // edge color; the interior pixel, surrounded by the same ID, keeps its own color.
+        let mut edge = [0u16; 8];
+        edge[1] = 0x7C00; // group 1 (IDs 8-15): blue 31 → [0, 0, 63]
+        let cfg = RenderConfig { edge_marking: true, edge_table: edge, ..RenderConfig::default() };
+        let e = one_triangle(0x1F, 8 << 24); // red, POLYGON_ATTR polygon ID = 8
+        let fb = rasterize_cfg(&e, &cfg);
+        // The triangle's flat top projects to row 47; (128, 47) borders the uncovered rear
+        // above it, while (128, 96) is deep inside, surrounded by the same polygon ID.
+        assert_eq!(fb.at(128, 96).color, [63, 0, 0], "interior is not outlined");
+        assert!(fb.at(128, 47).covered, "top edge of the triangle is filled");
+        assert_eq!(fb.at(128, 47).color, [0, 0, 63], "silhouette against the rear is outlined");
+    }
+
+    #[test]
+    fn edge_marking_disabled_leaves_colors_untouched() {
+        let mut edge = [0u16; 8];
+        edge[1] = 0x7C00;
+        let cfg = RenderConfig { edge_marking: false, edge_table: edge, ..RenderConfig::default() };
+        let fb = rasterize_cfg(&one_triangle(0x1F, 8 << 24), &cfg);
+        assert_eq!(fb.at(128, 47).color, [63, 0, 0], "no outline when edge marking is off");
+    }
+
+    #[test]
+    fn edge_marking_outlines_only_the_nearer_polygon_at_an_id_boundary() {
+        // Fill the whole buffer (no rear anywhere) with a far polygon (ID 16) on the left
+        // half and a near polygon (ID 8) on the right half. At the shared boundary only
+        // the nearer side is outlined — its neighbor is farther; the far side's neighbor is
+        // closer, so it is left alone (no doubled line). Interiors are untouched.
+        let (near, far) = (100_000, 500_000);
+        let mut fb = Framebuffer3d::new();
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let idx = y * WIDTH + x;
+                let left = x < WIDTH / 2;
+                fb.poly_id[idx] = if left { 16 } else { 8 };
+                fb.depth[idx] = if left { far } else { near };
+                fb.pixels[idx] = Pixel3d { color: [63, 0, 0], alpha: 31, covered: true };
+            }
+        }
+        let mut edge = [0u16; 8];
+        edge[1] = 0x7C00; // group 1 (ID 8, the near side): blue
+        edge[2] = 0x03E0; // group 2 (ID 16, the far side): green — must stay unused here
+        let cfg = RenderConfig { edge_marking: true, edge_table: edge, ..RenderConfig::default() };
+        edge_mark(&mut fb, &cfg);
+        let bx = WIDTH / 2;
+        assert_eq!(fb.at(bx, 96).color, [0, 0, 63], "near side of the boundary is outlined");
+        assert_eq!(fb.at(bx - 1, 96).color, [63, 0, 0], "far side of the boundary is not outlined");
+        assert_eq!(fb.at(WIDTH - 2, 96).color, [63, 0, 0], "interior away from the boundary is untouched");
     }
 
     #[test]

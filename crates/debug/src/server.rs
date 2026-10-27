@@ -556,6 +556,46 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 .collect();
             json!({"engine": engine, "y": y, "sprites": sprites})
         }
+        // DS 3D render-list shading summary: DISP3DCNT, the frame's toon-vs-highlight select,
+        // and a per-polygon-mode count (mode 2 = toon/highlight — the cel-shaded polygons).
+        "video.polySummary" => {
+            let nds = emu.as_nds().ok_or_else(|| "video.polySummary is DS-only".to_string())?;
+            let (disp3dcnt, polys) = nds.gpu3d_poly_summary();
+            let mut by_mode = [0u32; 4];
+            for &(_, _, mode, _) in &polys {
+                by_mode[(mode & 3) as usize] += 1;
+            }
+            json!({
+                "disp3dcnt": disp3dcnt,
+                "shading": if disp3dcnt & 2 != 0 { "highlight" } else { "toon" },
+                "polyCount": polys.len(),
+                "byMode": {"modulate": by_mode[0], "decal": by_mode[1], "toonHighlight": by_mode[2], "shadow": by_mode[3]},
+            })
+        }
+        "video.edgeMarking" => {
+            let nds = emu.as_nds().ok_or_else(|| "video.edgeMarking is DS-only".to_string())?;
+            let (enabled, table, changed) = nds.gpu3d_edge_marking();
+            json!({
+                "enabled": enabled,
+                "edgeTable": table.iter().map(|&c| c as u32).collect::<Vec<_>>(),
+                "changedPixels": changed,
+            })
+        }
+        // The 3D framebuffer with edge-marked pixels forced to magenta (BGR555 → RGBA8),
+        // so outlines are visible pre-composite. 256×192, like video.renderLayer.
+        "video.edgeOverlay" => {
+            let nds = emu.as_nds().ok_or_else(|| "video.edgeOverlay is DS-only".to_string())?;
+            let bgr = nds.gpu3d_edge_overlay();
+            let width = 256usize;
+            let height = bgr.len() / width;
+            let mut rgba = Vec::with_capacity(bgr.len() * 4);
+            for &v in &bgr {
+                let c5to8 = |c: u16| ((c & 0x1F) as u32 * 255 / 31) as u8;
+                let a = if v == 0 { 0 } else { 255 };
+                rgba.extend_from_slice(&[c5to8(v), c5to8(v >> 5), c5to8(v >> 10), a]);
+            }
+            json!({"width": width, "height": height, "format": "rgba8", "base64": base64(&rgba)})
+        }
 
         // --- scheduler / interrupts / input (console-agnostic) ---
         "scheduler.pendingEvents" => {

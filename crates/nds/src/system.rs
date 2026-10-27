@@ -1136,6 +1136,18 @@ impl System {
         self.machine.gpu3d.debug_render_no_depth()
     }
 
+    /// Debug: edge-marking status — `(enabled, edge_color_table, pixels_changed)` for the
+    /// current frame (see [`gpu3d::Gpu3d::debug_edge_marking`]).
+    pub fn gpu3d_edge_marking(&self) -> (bool, [u16; 8], usize) {
+        self.machine.gpu3d.debug_edge_marking()
+    }
+
+    /// Debug: the 3D framebuffer (BGR555) with edge-marked pixels forced to magenta (see
+    /// [`gpu3d::Gpu3d::debug_edge_overlay`]).
+    pub fn gpu3d_edge_overlay(&self) -> Vec<u16> {
+        self.machine.gpu3d.debug_edge_overlay()
+    }
+
     /// Debug: toggle 3D winding culling off/on.
     pub fn gpu3d_set_disable_cull(&mut self, on: bool) {
         self.machine.gpu3d.set_disable_cull(on);

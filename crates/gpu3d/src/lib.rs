@@ -28,6 +28,8 @@ use geometry::GeometryEngine;
 /// IO register offsets relative to `0x0400_0000` (the ARM9 GX block).
 mod reg {
     pub const DISP3DCNT: u32 = 0x060;
+    pub const EDGE_COLOR: u32 = 0x330;
+    pub const EDGE_COLOR_HI: u32 = 0x340; // exclusive; 8 × u16
     pub const ALPHA_TEST_REF: u32 = 0x340;
     pub const TOON_TABLE: u32 = 0x380;
     pub const TOON_TABLE_HI: u32 = 0x3C0; // exclusive; 32 × u16
@@ -62,6 +64,9 @@ pub struct Gpu3d {
     /// `TOON_TABLE` (`0x4000380`): 32 × 15-bit BGR555 shading colors, indexed by a
     /// polygon-mode-2 pixel's vertex-red component for toon/highlight shading.
     toon_table: [u16; 32],
+    /// `EDGE_COLOR_TABLE` (`0x4000330`): 8 × 15-bit BGR555 outline colors for edge
+    /// marking (`DISP3DCNT` bit 5), selected by a pixel's polygon ID >> 3.
+    edge_table: [u16; 8],
     /// The rasterized 256×192 output of the sealed render list, and the frame index it
     /// was rendered from (so it is rasterized at most once per swap).
     framebuffer: raster::Framebuffer3d,
@@ -101,6 +106,7 @@ impl Gpu3d {
             clear_color: 0,
             clear_depth: 0x7FFF,
             toon_table: [0; 32],
+            edge_table: [0; 8],
             framebuffer: raster::Framebuffer3d::new(),
             rendered_frame: 0,
             tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
@@ -240,6 +246,9 @@ impl Gpu3d {
             toon_table: self.toon_table,
             // DISP3DCNT bit 1 selects highlight (1) vs plain toon (0) shading for the frame.
             toon_highlight: self.disp3dcnt & (1 << 1) != 0,
+            // DISP3DCNT bit 5 enables edge marking (object/crease outlines).
+            edge_marking: self.disp3dcnt & (1 << 5) != 0,
+            edge_table: self.edge_table,
         }
     }
 
@@ -279,6 +288,60 @@ impl Gpu3d {
     /// The rasterized 3D framebuffer (256×192), composited as Engine A's BG0.
     pub fn framebuffer_3d(&self) -> &raster::Framebuffer3d {
         &self.framebuffer
+    }
+
+    /// Debug: whether edge marking is enabled this frame, the live `EDGE_COLOR_TABLE`,
+    /// and how many pixels it changes — the current render list rasterized with edge
+    /// marking forced on vs off, counting the differing pixels. A nonzero count proves
+    /// outlines are actually being drawn (and how much of the screen they touch).
+    pub fn debug_edge_marking(&self) -> (bool, [u16; 8], usize) {
+        let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
+        let base = self.render_config();
+        let render = |edge: bool| {
+            let mut cfg = base;
+            cfg.edge_marking = edge;
+            let mut fb = raster::Framebuffer3d::new();
+            raster::render(self.geometry.render_list(), &tex, &cfg, &mut fb);
+            fb
+        };
+        let (on, off) = (render(true), render(false));
+        let changed = on
+            .pixels
+            .iter()
+            .zip(off.pixels.iter())
+            .filter(|(a, b)| a.color != b.color)
+            .count();
+        (base.edge_marking, self.edge_table, changed)
+    }
+
+    /// Debug: the current 3D framebuffer as 256×192 BGR555, with every edge-marked pixel
+    /// forced to magenta — so the outlines (which survive the 2D composite only as a faint
+    /// dark tint) are plainly visible pre-composite. Uncovered pixels are 0 (transparent).
+    pub fn debug_edge_overlay(&self) -> Vec<u16> {
+        let tex = texture::TextureSet { image: &self.tex_image, palette: &self.tex_palette };
+        let base = self.render_config();
+        let render = |edge: bool| {
+            let mut cfg = base;
+            cfg.edge_marking = edge;
+            let mut fb = raster::Framebuffer3d::new();
+            raster::render(self.geometry.render_list(), &tex, &cfg, &mut fb);
+            fb
+        };
+        let (on, off) = (render(true), render(false));
+        on.pixels
+            .iter()
+            .zip(off.pixels.iter())
+            .map(|(a, b)| {
+                if !a.covered {
+                    0
+                } else if a.color != b.color {
+                    0x7C1F // magenta: this pixel is an outline
+                } else {
+                    let c = |v: u8| (v >> 1) as u16;
+                    c(a.color[0]) | (c(a.color[1]) << 5) | (c(a.color[2]) << 10)
+                }
+            })
+            .collect()
     }
 
     /// `DISP3DCNT` (`0x4000060`): the 3D display/blend/test/fog enable bits.
@@ -363,6 +426,19 @@ impl Gpu3d {
             reg::ALPHA_TEST_REF => {
                 self.alpha_test_ref = value as u8 & 0x1F;
             }
+            // EDGE_COLOR_TABLE: 8 × u16 outline colors. Loaded with 32-bit stores (two
+            // entries per word) or 16-bit stores, like TOON_TABLE below.
+            reg::EDGE_COLOR..reg::EDGE_COLOR_HI => {
+                let idx = ((offset - reg::EDGE_COLOR) / 2) as usize;
+                if bytes == 4 {
+                    self.edge_table[idx] = value as u16;
+                    if idx + 1 < self.edge_table.len() {
+                        self.edge_table[idx + 1] = (value >> 16) as u16;
+                    }
+                } else {
+                    self.edge_table[idx] = value as u16;
+                }
+            }
             // CLEAR_COLOR is a 32-bit register; handle a full word or either halfword.
             reg::CLEAR_COLOR => {
                 self.clear_color = if bytes == 4 {
@@ -391,8 +467,8 @@ impl Gpu3d {
                     self.toon_table[idx] = value as u16;
                 }
             }
-            // Other fog/edge/rear-bitmap control registers are consumed by the
-            // rasterizer (later phases); accept and ignore their writes for now.
+            // The remaining fog and rear-bitmap control registers are not yet consumed by
+            // the rasterizer; accept and ignore their writes for now.
             _ => {}
         }
     }
@@ -520,6 +596,25 @@ mod tests {
         assert_eq!(cfg.toon_table[1], 0x03E0);
         assert_eq!(cfg.toon_table[31], 0x7C00);
         assert!(cfg.toon_highlight);
+    }
+
+    #[test]
+    fn edge_color_table_writes_route_into_the_render_config() {
+        let mut g = Gpu3d::new();
+        // 32-bit write packs two entries: entry 0 and entry 1.
+        g.write_register(reg::EDGE_COLOR, 0x03E0_001F, 4); // [0] = 0x001F, [1] = 0x03E0
+        // 16-bit write lands in a single entry (the last one).
+        g.write_register(reg::EDGE_COLOR + 7 * 2, 0x7C00, 2); // [7] = blue
+        // DISP3DCNT bit 5 enables edge marking for the frame.
+        g.write_register(reg::DISP3DCNT, 1 << 5, 4);
+
+        let cfg = g.render_config();
+        assert_eq!(cfg.edge_table[0], 0x001F);
+        assert_eq!(cfg.edge_table[1], 0x03E0);
+        assert_eq!(cfg.edge_table[7], 0x7C00);
+        assert!(cfg.edge_marking);
+        // The edge table must not alias the toon table (adjacent register blocks).
+        assert_eq!(cfg.toon_table, [0; 32]);
     }
 
     #[test]
