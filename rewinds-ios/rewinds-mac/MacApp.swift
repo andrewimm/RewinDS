@@ -31,14 +31,20 @@ struct RewinDSMacApp: App {
                     Button("Close Game") { model.quitGame() }
                         .keyboardShortcut("w", modifiers: .command)
                 }
+                Divider()
+                Menu("Import DS BIOS") {
+                    Button("ARM9 BIOS…") { model.importBios(.ndsBios9) }
+                    Button("ARM7 BIOS…") { model.importBios(.ndsBios7) }
+                    Button("Firmware (optional)…") { model.importBios(.ndsFirmware) }
+                }
             }
         }
     }
 }
 
 /// Loads and runs one game on macOS. GBA boots with the built-in BIOS (the core falls back
-/// to it when none is supplied); DS ROMs additionally need BIOS/firmware, which this dev
-/// build doesn't manage yet.
+/// to it when none is supplied); DS ROMs need the ARM9/ARM7 BIOS, resolved by the shared
+/// [`BIOSStore`] from an imported copy or a `dev-assets/` bundle.
 @MainActor
 final class MacAppModel: ObservableObject {
     @Published var session: EmulatorSession?
@@ -59,8 +65,20 @@ final class MacAppModel: ObservableObject {
         do {
             let data = try Data(contentsOf: url)
             let ext = url.pathExtension.lowercased()
-            let console: Console? = ext == "nds" ? .nds : (ext == "gba" ? .gba : nil)
-            let core = try EmulatorCore(images: BootImages(rom: data), forceConsole: console)
+            guard let console: Console = ext == "nds" ? .nds : (ext == "gba" ? .gba : nil) else {
+                errorMessage = "Unsupported file type \"\(ext)\" — open a .gba or .nds ROM."
+                return
+            }
+            // The GBA boots on the core's built-in BIOS; the DS needs real ARM9 + ARM7 BIOS
+            // (there is no HLE fallback), so a DS ROM shows a black screen without them.
+            guard BIOSStore.shared.hasRequiredBios(for: console) else {
+                errorMessage = "This DS game needs the DS ARM9 and ARM7 BIOS. Add them with "
+                    + "File ▸ Import DS BIOS…, or drop nds_bios9.bin / nds_bios7.bin into the "
+                    + "dev-assets/ folder and rebuild."
+                return
+            }
+            let images = BIOSStore.shared.bootImages(for: console, rom: data)
+            let core = try EmulatorCore(images: images, forceConsole: console)
             let newSession = EmulatorSession(core: core, romId: url.deletingPathExtension().lastPathComponent)
             session?.teardown()
             newSession.start()
@@ -68,6 +86,19 @@ final class MacAppModel: ObservableObject {
             errorMessage = nil
         } catch {
             errorMessage = (error as? LoadError)?.description ?? error.localizedDescription
+        }
+    }
+
+    /// Import a DS BIOS/firmware file (copied into app support; survives rebuilds), so DS
+    /// games can boot without dropping files into dev-assets.
+    func importBios(_ file: SystemFile) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Choose the \(file.title) file."
+        if panel.runModal() == .OK, let url = panel.url {
+            do { try BIOSStore.shared.importFile(from: url, as: file) }
+            catch { errorMessage = "Couldn't import \(file.title): \(error.localizedDescription)" }
         }
     }
 
@@ -108,7 +139,8 @@ struct MacLibraryView: View {
                 .foregroundStyle(.secondary)
             Text("RewinDS")
                 .font(.largeTitle.weight(.semibold))
-            Text("Open a GBA ROM to play, then link with another device from the toolbar.")
+            Text("Open a GBA or DS ROM to play, then link with another device from the toolbar. "
+                 + "DS games need the ARM9/ARM7 BIOS — add them from File ▸ Import DS BIOS.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

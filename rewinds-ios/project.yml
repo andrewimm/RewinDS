@@ -62,7 +62,14 @@ targets:
     platform: macOS
     sources:
       - path: rewinds-mac
-      - path: RewinDS/Views/Shaders.metal   # shared screen-blit shaders
+      - path: RewinDS/Views/Shaders.metal     # shared screen-blit shaders
+      - path: RewinDS/Core/BIOSStore.swift     # shared BIOS/firmware resolver (also iOS)
+      # Copyrighted BIOS/firmware the developer drops in locally (gitignored, optional);
+      # DS ROMs need the ARM9/ARM7 BIOS, which the app also imports at runtime.
+      - path: dev-assets
+        type: folder
+        optional: true
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.setimmediate.RewinDS
