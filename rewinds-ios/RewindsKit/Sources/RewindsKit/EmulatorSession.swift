@@ -72,6 +72,15 @@ public final class EmulatorSession: NSObject, ObservableObject {
         // No emulation thread yet, so these core touches need no lock.
         saveStore.restore(into: core, romId: romId)
 
+        // Seed the RTC with the device's local time so day/night and timed events match the
+        // player's real clock. Calendar's weekday is 1=Sunday..7; the core wants 0=Sunday.
+        let c = Calendar.current.dateComponents(
+            [.year, .month, .day, .weekday, .hour, .minute, .second], from: Date())
+        core.setClock(
+            year: UInt16(c.year ?? 2024), month: UInt8(c.month ?? 1), day: UInt8(c.day ?? 1),
+            weekday: UInt8((c.weekday ?? 1) - 1), hour: UInt8(c.hour ?? 0),
+            minute: UInt8(c.minute ?? 0), second: UInt8(c.second ?? 0))
+
         // Resample once, straight to the actual output hardware rate.
         let outputRate = AudioEngine.prepareSession()
         if let consumer = core.enableAudio(rate: UInt32(outputRate), channels: 2) {

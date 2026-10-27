@@ -93,6 +93,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         firmware: firmware.as_deref(),
     })?;
 
+    // Seed the real-time clock from the host wall clock (UTC) so games see the real date
+    // for day/night and timed events. It ticks deterministically from here.
+    {
+        let (y, mo, d, dow, h, mi, s) = utc_now();
+        emulator.set_clock(y, mo, d, dow, h, mi, s);
+    }
+
     // Optional serial link: this host owns the carrier (TCP here). The emulator
     // core stays carrier-blind — it just produces/consumes opaque frame bytes.
     let mut serial_link: Option<link::TcpLink> = match (link_listen, link_connect) {
@@ -388,6 +395,29 @@ fn run_linked_frame(emulator: &mut Emulator, link: &mut impl Transport) {
 }
 
 /// Read the `save_type` override name from a `.sav.meta` sidecar, if present.
+/// The current UTC wall-clock broken into `(year, month, day, weekday 0..6, hour, minute,
+/// second)` for seeding the RTC. Civil-from-days per Howard Hinnant's algorithm; `weekday`
+/// is 0=Sunday (1970-01-01 was a Thursday = 4).
+fn utc_now() -> (u16, u8, u8, u8, u8, u8, u8) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, minute, second) = ((rem / 3600) as u8, ((rem % 3600) / 60) as u8, (rem % 60) as u8);
+    let weekday = ((days + 4).rem_euclid(7)) as u8; // 0=Sunday
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8; // [1, 12]
+    let year = (if month <= 2 { y + 1 } else { y }) as u16;
+    (year, month, day, weekday, hour, minute, second)
+}
+
 fn read_meta_save_type(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let key = "\"save_type\"";

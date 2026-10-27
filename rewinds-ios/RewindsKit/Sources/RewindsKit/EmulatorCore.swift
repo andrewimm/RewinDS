@@ -143,6 +143,13 @@ public final class EmulatorCore {
     /// Open/close the DS lid (game sleeps/wakes). No-op on GBA.
     public func setLid(closed: Bool) { rewinds_set_lid(handle, closed) }
 
+    /// Seed the real-time clock from a wall-clock date/time so games see the real date for
+    /// day/night and timed events. `weekday` is 0=Sunday..6=Saturday. No-op on the GBA.
+    public func setClock(year: UInt16, month: UInt8, day: UInt8, weekday: UInt8,
+                         hour: UInt8, minute: UInt8, second: UInt8) {
+        rewinds_set_clock(handle, year, month, day, weekday, hour, minute, second)
+    }
+
     public func setAudioMuted(_ muted: Bool) { rewinds_set_audio_muted(handle, muted) }
 
     /// Read one screen. The returned pointer borrows the core — copy it before the next

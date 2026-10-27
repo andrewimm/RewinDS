@@ -251,6 +251,23 @@ void rewinds_set_input(RewindsEmulator *p,
 void rewinds_set_lid(RewindsEmulator *p, bool closed);
 
 /**
+ * Seed the real-time clock with a wall-clock date/time (the host's current local time),
+ * so games gating day/night and timed events on the RTC see the real date. Call once at
+ * startup. `day_of_week` is 0..=6; a no-op on the GBA (its RTC samples the host clock).
+ *
+ * # Safety
+ * `p` must be null or a live handle.
+ */
+void rewinds_set_clock(RewindsEmulator *p,
+                       uint16_t year,
+                       uint8_t month,
+                       uint8_t day,
+                       uint8_t day_of_week,
+                       uint8_t hour,
+                       uint8_t minute,
+                       uint8_t second);
+
+/**
  * Mute audio capture (used for fast-forward): frames still run but drop their samples.
  *
  * # Safety

@@ -312,6 +312,29 @@ impl Emulator {
         }
     }
 
+    /// Seed the real-time clock with a wall-clock date/time (the host's current time) so
+    /// games that gate day/night and timed events on the RTC see the real date. The DS RTC
+    /// otherwise starts at a fixed epoch and only advances by emulated cycles; the host
+    /// installs the real time once at startup, after which it ticks deterministically. A
+    /// no-op on the GBA, whose cartridge RTC already samples the host clock directly.
+    /// `day_of_week` is `0..=6`; fields are plain integers (`year` is the full year).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_clock(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        day_of_week: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        if let Emulator::Nds(n) = self {
+            n.system
+                .set_rtc_datetime(year, month, day, day_of_week, hour, minute, second);
+        }
+    }
+
     /// Mute audio capture: while muted, [`Self::run_frame`] still runs but drops
     /// the frame's samples instead of feeding the sink. Used for fast-forward.
     pub fn set_audio_muted(&mut self, muted: bool) {

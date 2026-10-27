@@ -396,6 +396,29 @@ pub unsafe extern "C" fn rewinds_set_lid(p: *mut RewindsEmulator, closed: bool) 
     }
 }
 
+/// Seed the real-time clock with a wall-clock date/time (the host's current local time),
+/// so games gating day/night and timed events on the RTC see the real date. Call once at
+/// startup. `day_of_week` is 0..=6; a no-op on the GBA (its RTC samples the host clock).
+///
+/// # Safety
+/// `p` must be null or a live handle.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn rewinds_set_clock(
+    p: *mut RewindsEmulator,
+    year: u16,
+    month: u8,
+    day: u8,
+    day_of_week: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) {
+    if let Some(e) = emu(p) {
+        e.set_clock(year, month, day, day_of_week, hour, minute, second);
+    }
+}
+
 /// Mute audio capture (used for fast-forward): frames still run but drop their samples.
 ///
 /// # Safety
