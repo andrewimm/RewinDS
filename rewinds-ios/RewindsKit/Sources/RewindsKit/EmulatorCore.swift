@@ -173,6 +173,11 @@ public final class EmulatorCore {
     public var saveDirty: Bool { rewinds_save_dirty(handle) }
     public func clearSaveDirty() { rewinds_clear_save_dirty(handle) }
 
+    /// A monotonic count of save-backup writes. Persist only once this stops advancing
+    /// (the game finished its save routine) so a flush never captures a half-written save
+    /// — a truncated save is unloadable (e.g. a Pokémon HG/SS save left with one mirror).
+    public var saveWriteEpoch: UInt64 { rewinds_save_write_epoch(handle) }
+
     /// The cartridge save type's name (e.g. "FLASH1M"), or "none" for a console without
     /// configurable save types (the DS).
     public func saveTypeName() -> String {

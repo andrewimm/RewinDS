@@ -95,7 +95,7 @@ public final class EmulatorSession: NSObject, ObservableObject {
         // Acquiring coreLock blocks until any in-flight tick finishes; with `alive` false
         // the loop won't start another, so the core is ours after this point.
         coreLock.lock()
-        saveStore.flushIfDirty(core, romId: romId)
+        flushSaveWhenComplete()
         coreLock.unlock()
         // The run loop has stopped, so no `pump` can race this teardown of the carrier.
         link.shutdown()
@@ -139,8 +139,10 @@ public final class EmulatorSession: NSObject, ObservableObject {
     public func enterBackground() {
         setPause(.lifecycle, true)
         coreLock.lock()
+        // Let any in-progress save finish and persist it BEFORE closing the lid — closing
+        // the lid sleeps the game, which would freeze a half-written save.
+        flushSaveWhenComplete()
         core.setLid(closed: true)
-        saveStore.flushIfDirty(core, romId: romId)
         coreLock.unlock()
     }
 
@@ -275,9 +277,39 @@ public final class EmulatorSession: NSObject, ObservableObject {
             }
         }
         frameCounter &+= 1
-        if frameCounter % 30 == 0 {
+        // Track whether the game is still writing its save. A DS save is a large,
+        // multi-frame FLASH write; persisting it mid-write stores a half-written save
+        // (e.g. a Pokémon HG/SS save with only one of its two mirror copies, which the
+        // game then rejects). Only flush once the backup write-epoch has held steady for
+        // a short while — the save routine has finished.
+        let epoch = core.saveWriteEpoch
+        if epoch != lastSaveEpoch { lastSaveEpoch = epoch; saveQuiescentFrames = 0 }
+        else { saveQuiescentFrames &+= 1 }
+        if frameCounter % 30 == 0 && saveQuiescentFrames >= Self.saveQuiescentFrames {
             saveStore.flushIfDirty(core, romId: romId)
         }
         coreLock.unlock()
+    }
+
+    /// Frames the save backup must stay un-written before we treat a save as finished.
+    private static let saveQuiescentFrames: UInt64 = 20
+    private var lastSaveEpoch: UInt64 = 0
+    private var saveQuiescentFrames: UInt64 = 0
+
+    /// Persist a COMPLETE save: if the game is mid-save, step the core until its save
+    /// routine finishes (the write-epoch holds steady) before flushing, so a save forced
+    /// by backgrounding/teardown is never truncated. Must be called holding `coreLock`.
+    private func flushSaveWhenComplete() {
+        guard core.saveDirty else { return }
+        var prev = core.saveWriteEpoch
+        var steady: UInt64 = 0
+        var guardCount = 0
+        while steady < Self.saveQuiescentFrames && guardCount < 600 {
+            core.runFrame()
+            let e = core.saveWriteEpoch
+            if e != prev { prev = e; steady = 0 } else { steady &+= 1 }
+            guardCount += 1
+        }
+        saveStore.flushIfDirty(core, romId: romId)
     }
 }

@@ -403,6 +403,19 @@ impl Emulator {
         }
     }
 
+    /// A monotonic counter of save-backup modifications. A host persists a *complete*
+    /// save by flushing only once this stops advancing (the game has finished writing) —
+    /// never mid-write, which can otherwise truncate a save (e.g. a Pokémon HG/SS save
+    /// left with only one of its two mirror copies, which the game then rejects). The GBA
+    /// reports a constant (its small saves are flushed on `save_dirty`); the DS reports the
+    /// live backup write count.
+    pub fn save_write_epoch(&self) -> u64 {
+        match self {
+            Emulator::Gba(_) => 0,
+            Emulator::Nds(n) => n.system.cart_backup_write_epoch(),
+        }
+    }
+
     /// The save type's name (e.g. `"flash128k"`), for a sidecar the host writes.
     pub fn save_type_name(&self) -> &'static str {
         match self {

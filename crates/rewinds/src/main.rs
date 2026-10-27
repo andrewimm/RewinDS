@@ -162,9 +162,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Reused each frame: the RGBA present buffer packed into minifb's 0x00RRGGBB.
     let mut buffer = vec![0u32; win_w * win_h];
-    // Flush the save at most a few times a second, only after the game writes it.
-    const FLUSH_EVERY_FRAMES: u32 = 180;
-    let mut frames_since_flush = 0u32;
+    // Persist the save only once the game has FINISHED writing it: a DS save is a large
+    // multi-frame FLASH write, and flushing mid-write persists a half-written save (e.g. a
+    // Pokémon HG/SS save with only one of its two mirror copies, which the game rejects).
+    // So we wait for the backup write-epoch to hold steady for a short while — the write
+    // is done — before flushing.
+    const SAVE_QUIESCENT_FRAMES: u32 = 20;
+    let mut last_write_epoch = emulator.save_write_epoch();
+    let mut quiescent_frames = 0u32;
     let mut cull_disabled = false;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Mirror the host keyboard into a single input snapshot each frame.
@@ -299,19 +304,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         window.update_with_buffer(&buffer, win_w, win_h)?;
 
         if let Some((sav, meta)) = &save_paths {
-            frames_since_flush += 1;
-            if frames_since_flush >= FLUSH_EVERY_FRAMES && emulator.save_dirty() {
-                if write_save(sav, meta, &emulator).is_ok() {
-                    emulator.clear_save_dirty();
-                }
-                frames_since_flush = 0;
+            let epoch = emulator.save_write_epoch();
+            if epoch != last_write_epoch {
+                last_write_epoch = epoch;
+                quiescent_frames = 0;
+            } else {
+                quiescent_frames = quiescent_frames.saturating_add(1);
+            }
+            // Flush a COMPLETE save: dirty, and the game hasn't touched the backup for a
+            // short while (its save routine finished). `clear_save_dirty` then makes this
+            // fire once per save, not every frame.
+            if emulator.save_dirty() && quiescent_frames >= SAVE_QUIESCENT_FRAMES
+                && write_save(sav, meta, &emulator).is_ok()
+            {
+                emulator.clear_save_dirty();
             }
         }
     }
 
-    // Final flush on exit so the last writes are not lost.
+    // Final flush on exit so the last writes are not lost. If the game is mid-save, let it
+    // finish first (step frames until the backup write-epoch holds steady) so we persist a
+    // complete save rather than a truncated one.
     if let Some((sav, meta)) = &save_paths {
         if emulator.save_dirty() {
+            let mut prev = emulator.save_write_epoch();
+            let mut steady = 0u32;
+            let mut guard = 0u32;
+            while steady < SAVE_QUIESCENT_FRAMES && guard < 600 {
+                emulator.run_frame();
+                let e = emulator.save_write_epoch();
+                if e != prev { prev = e; steady = 0; } else { steady += 1; }
+                guard += 1;
+            }
             if let Err(e) = write_save(sav, meta, &emulator) {
                 log::warn!("could not write save {}: {e}", sav.display());
             }

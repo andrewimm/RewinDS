@@ -515,6 +515,17 @@ pub unsafe extern "C" fn rewinds_clear_save_dirty(p: *mut RewindsEmulator) {
     }
 }
 
+/// A monotonic count of save-backup writes. The host flushes a *complete* save by waiting
+/// until this stops advancing (the game finished writing) before persisting — never
+/// mid-write, which can truncate a save. Constant for the GBA (flush on `save_dirty`).
+///
+/// # Safety
+/// `p` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn rewinds_save_write_epoch(p: *mut RewindsEmulator) -> u64 {
+    emu(p).map(|e| e.save_write_epoch()).unwrap_or(0)
+}
+
 // --- Serial link (host owns the carrier; frames are opaque bytes) -----------
 
 /// Configure the serial link: whether a carrier is attached, this unit's id
@@ -623,7 +634,7 @@ pub unsafe extern "C" fn rewinds_set_save_type_by_name(
 /// so a host can refuse a mismatched framework.
 #[no_mangle]
 pub extern "C" fn rewinds_core_version() -> u32 {
-    3
+    4
 }
 
 #[cfg(test)]

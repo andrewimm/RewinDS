@@ -322,6 +322,16 @@ bool rewinds_save_dirty(RewindsEmulator *p);
 void rewinds_clear_save_dirty(RewindsEmulator *p);
 
 /**
+ * A monotonic count of save-backup writes. The host flushes a *complete* save by waiting
+ * until this stops advancing (the game finished writing) before persisting — never
+ * mid-write, which can truncate a save. Constant for the GBA (flush on `save_dirty`).
+ *
+ * # Safety
+ * `p` must be null or a live handle.
+ */
+uint64_t rewinds_save_write_epoch(RewindsEmulator *p);
+
+/**
  * Configure the serial link: whether a carrier is attached, this unit's id
  * (0 = parent/master, 1-3 = child), and the number of linked units (2-4).
  *

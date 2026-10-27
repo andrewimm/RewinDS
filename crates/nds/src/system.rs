@@ -1211,6 +1211,9 @@ impl System {
     pub fn clear_cart_backup_dirty(&mut self) {
         self.machine.cart.clear_backup_dirty();
     }
+    pub fn cart_backup_write_epoch(&self) -> u64 {
+        self.machine.cart.backup_write_epoch()
+    }
 
     /// The ARM9's CP15 coprocessor state.
     pub fn cp15(&self) -> &Cp15 {

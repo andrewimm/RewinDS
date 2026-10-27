@@ -94,6 +94,11 @@ pub struct Cart {
     backup_wel: bool,
     backup_in_transfer: bool,
     backup_dirty: bool,
+    /// Monotonic count of backup modifications (program/erase). The host persists the
+    /// save only once this stops advancing (the game has finished writing), so a flush
+    /// never captures a half-written save — the cause of truncated, unloadable saves
+    /// (e.g. a Pokémon HG/SS save left with only one of its two mirror copies).
+    backup_write_epoch: u64,
     backup_data: u8,
     /// How many address bytes the backup command stream carries. The DS header has no
     /// save-type field, so we auto-detect the chip class from its protocol (GBATEK "DS
@@ -142,6 +147,7 @@ impl Default for Cart {
             backup_wel: false,
             backup_in_transfer: false,
             backup_dirty: false,
+            backup_write_epoch: 0,
             backup_data: 0,
             backup_addr_bytes: 2,
             backup_ir: false,
@@ -280,6 +286,7 @@ impl Cart {
                         self.backup[a] = value;
                         self.backup_addr = self.backup_addr.wrapping_add(1);
                         self.backup_dirty = true;
+                        self.backup_write_epoch += 1;
                     }
                     0
                 }
@@ -385,6 +392,7 @@ impl Cart {
         let end = (start + size).min(BACKUP_SIZE);
         self.backup[start..end].fill(0xFF);
         self.backup_dirty = true;
+        self.backup_write_epoch += 1;
     }
 
     /// Reset the whole chip to the erased state (`FFh`) — FLASH bulk/chip erase
@@ -395,6 +403,7 @@ impl Cart {
         }
         self.backup.fill(0xFF);
         self.backup_dirty = true;
+        self.backup_write_epoch += 1;
     }
 
     /// The backup (save) contents, for the host to persist.
@@ -415,6 +424,13 @@ impl Cart {
     }
     pub fn clear_backup_dirty(&mut self) {
         self.backup_dirty = false;
+    }
+
+    /// A monotonic counter of backup modifications. When it stops advancing the game has
+    /// finished writing the save, so the host can persist a complete (never half-written)
+    /// save. See [`Self::backup_write_epoch`] field docs.
+    pub fn backup_write_epoch(&self) -> u64 {
+        self.backup_write_epoch
     }
 
     /// `ROMCTRL` with the live `DRQ`/`Start` status bits reflecting the transfer.
@@ -438,6 +454,7 @@ impl Cart {
     pub fn romctrl_config(&self) -> u32 {
         self.romctrl
     }
+
 
     /// Master-tick latency of the current block transfer: the time the real cart
     /// keeps `Start/Busy` set (and before the completion IRQ/DMA fire) while it
@@ -702,6 +719,52 @@ mod tests {
         spi(&mut cart, &[0x00, 0x02, 0x01, 0x23, 0x45, 0xA5]); // program 0xA5 at 0x012345
         let r = spi(&mut cart, &[0x00, 0x03, 0x01, 0x23, 0x45, 0]); // read back, 3-byte addr
         assert_eq!(r[5], 0xA5, "IR cart must use 3-byte addressing without an RDID probe");
+    }
+
+    /// A restored backup reads back byte-exact at a high address (the Pokémon save-slot
+    /// region at 0x40000), through the IR-cart 00h-prefixed 3-byte-address READ path —
+    /// the exact path HeartGold uses to load its save.
+    #[test]
+    fn backup_ir_read_is_byte_exact_at_high_slot_address() {
+        let mut cart = Cart::new();
+        let mut data = vec![0xFFu8; BACKUP_SIZE];
+        // Distinctive bytes at the slot-B general-block start and a few beyond.
+        let marks: &[(usize, u8)] = &[
+            (0x40000, 0xDE), (0x40001, 0xAD), (0x40002, 0xBE), (0x40003, 0xEF),
+            (0x4F620, 0x23), (0x61A08, 0x99),
+        ];
+        for &(a, v) in marks {
+            data[a] = v;
+        }
+        cart.load_backup(&data);
+        // Detect the IR cart (00h prefix) → 3-byte FLASH addressing, then READ at 0x40000.
+        let r = spi(&mut cart, &[0x00, 0x03, 0x04, 0x00, 0x00, 0, 0, 0, 0]);
+        // out: [prefix, cmd, addr2, addr1, addr0, d@0x40000, d@0x40001, d@0x40002, d@0x40003]
+        assert_eq!(&r[5..9], &[0xDE, 0xAD, 0xBE, 0xEF], "slot-B data must read back exactly");
+        // And a byte deep in the general-block footer region.
+        let r = spi(&mut cart, &[0x00, 0x03, 0x04, 0xF6, 0x20, 0]);
+        assert_eq!(r[5], 0x23, "footer byte at 0x4F620 must read back exactly");
+    }
+
+    /// The backup write-epoch advances on each program/erase and holds steady otherwise,
+    /// so the host can detect that a (multi-command) save has finished before persisting it.
+    #[test]
+    fn backup_write_epoch_advances_on_writes_and_holds_steady() {
+        let mut cart = Cart::new();
+        spi(&mut cart, &[0x9F, 0, 0, 0]); // RDID → FLASH, 3-byte addressing
+        let e0 = cart.backup_write_epoch();
+        // A read does not advance the epoch.
+        spi(&mut cart, &[0x03, 0x00, 0x00, 0x00, 0]);
+        assert_eq!(cart.backup_write_epoch(), e0, "reads don't count as writes");
+        // A program advances it.
+        spi(&mut cart, &[0x06]); // WREN
+        spi(&mut cart, &[0x02, 0x00, 0x00, 0x00, 0xAB]);
+        let e1 = cart.backup_write_epoch();
+        assert!(e1 > e0, "a program advances the epoch");
+        // A sector erase advances it too.
+        spi(&mut cart, &[0x06]);
+        spi(&mut cart, &[0xD8, 0x00, 0x00, 0x00]);
+        assert!(cart.backup_write_epoch() > e1, "an erase advances the epoch");
     }
 
     /// A ROMCTRL value selecting a `bytes`-length block with the Start bit set.
