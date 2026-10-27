@@ -104,27 +104,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         emulator.set_link_config(true, l.id(), l.count());
     }
 
-    // A loaded GBA ROM brings a save backup: its type is detected from the ROM, an
-    // optional `<rom>.sav.meta` sidecar may override it, and a `<rom>.sav` file
-    // (raw chip dump) is restored if present. Persistence is the host's job.
+    // A loaded ROM brings a save backup: a `<rom>.sav` file (raw chip dump) is restored
+    // if present, and written back as the game dirties it. Persistence is the host's job.
+    // The GBA additionally detects/overrides its backup type via an optional `<rom>.sav.meta`
+    // sidecar; the DS auto-sizes its SPI-flash backup, so it just needs the bytes.
     let mut save_paths: Option<(PathBuf, PathBuf)> = None;
-    if console == Console::Gba {
-        if let Some(rp) = rom_path.as_deref() {
+    if let Some(rp) = rom_path.as_deref() {
         let sav = Path::new(rp).with_extension("sav");
         let meta = {
             let mut m = sav.clone().into_os_string();
             m.push(".meta");
             PathBuf::from(m)
         };
-        if let Some(name) = read_meta_save_type(&meta) {
-            emulator.set_save_type_by_name(&name);
+        if console == Console::Gba {
+            if let Some(name) = read_meta_save_type(&meta) {
+                emulator.set_save_type_by_name(&name);
+            }
         }
         if let Ok(bytes) = std::fs::read(&sav) {
             emulator.load_save_data(&bytes);
         }
-        log::info!("cartridge save: {}", emulator.save_type_name());
-        save_paths = Some((sav, meta));
+        if console == Console::Gba {
+            log::info!("cartridge save: {}", emulator.save_type_name());
         }
+        save_paths = Some((sav, meta));
     }
 
     // Headless debug-server mode: the client drives execution and inspects state.
