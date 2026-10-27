@@ -105,6 +105,12 @@ pub struct RenderConfig {
     /// Debug: skip the depth test entirely (paint in submission order). Distinguishes
     /// "black because the pixel is depth-rejected" from "black because no polygon covers it".
     pub ignore_depth: bool,
+    /// `TOON_TABLE`: the 32 × 15-bit BGR555 shading colors for polygon-mode-2 (toon/
+    /// highlight) pixels, indexed by the vertex red component.
+    pub toon_table: [u16; 32],
+    /// `DISP3DCNT` bit 1: polygon-mode-2 pixels use highlight shading (add the toon color
+    /// on top of the modulation) when set, plain toon shading (replace) when clear.
+    pub toon_highlight: bool,
 }
 
 impl Default for RenderConfig {
@@ -120,6 +126,8 @@ impl Default for RenderConfig {
             clear_alpha: 0,
             clear_depth: i32::MAX,
             ignore_depth: false,
+            toon_table: [0; 32],
+            toon_highlight: false,
         }
     }
 }
@@ -129,6 +137,18 @@ impl RenderConfig {
     /// ALPHA_TEST_REF` if enabled, else when `alpha > 0`).
     fn alpha_passes(&self, alpha: u8) -> bool {
         alpha > if self.alpha_test { self.alpha_ref } else { 0 }
+    }
+
+    /// The 6-bit RGB toon/shading color for a 6-bit vertex red component. The 32-entry
+    /// table is indexed by the top 5 bits of the vertex red (`Rv >> 1`); each entry's
+    /// 5-bit channels expand to 6-bit per GBATEK (`c>0 ? c*2+1 : 0`).
+    fn toon_color(&self, vred: i32) -> [u8; 3] {
+        let e = self.toon_table[((vred >> 1) as usize) & 31];
+        let x = |c: u16| -> u8 {
+            let c = (c & 0x1F) as u8;
+            if c == 0 { 0 } else { c * 2 + 1 }
+        };
+        [x(e), x(e >> 5), x(e >> 10)]
     }
 }
 
@@ -345,8 +365,22 @@ fn blend_over(dst: Pixel3d, rgb: [u8; 3], alpha: u8) -> Pixel3d {
 /// texel per the blend mode, yielding the final 6-bit color and 5-bit alpha.
 fn shade(rp: &RPoly, tex: &TextureSet, cfg: &RenderConfig, vtx: [i32; 3], st: [i32; 2]) -> ([u8; 3], u8) {
     let vtx = [vtx[0].clamp(0, 63), vtx[1].clamp(0, 63), vtx[2].clamp(0, 63)];
+    // Polygon mode 2 (toon/highlight): the vertex red component indexes the toon table,
+    // and that shading color — not the vertex RGB — is the modulation source. Highlight
+    // additionally adds the toon color back on top (GBATEK). Mode 0/1 keep the vertex RGB.
+    let is_toon = rp.blend_mode == 2;
+    let highlight = is_toon && cfg.toon_highlight;
+    let src = if is_toon {
+        let s = cfg.toon_color(vtx[0]);
+        [s[0] as i32, s[1] as i32, s[2] as i32]
+    } else {
+        vtx
+    };
     if !cfg.texture_enable || !rp.tex.textured() {
-        return ([vtx[0] as u8, vtx[1] as u8, vtx[2] as u8], rp.poly_alpha);
+        // No texture ≡ modulating against a solid white texel, so the color is the shading
+        // source; highlight adds the toon color on top (≈ doubling it), clamped to 63.
+        let c = |s: i32| -> u8 { if highlight { (s * 2).min(63) as u8 } else { s as u8 } };
+        return ([c(src[0]), c(src[1]), c(src[2])], rp.poly_alpha);
     }
     let texel = rp.tex.sample(tex, st[0] >> 4, st[1] >> 4);
     let at = texel.alpha as i32;
@@ -368,13 +402,18 @@ fn shade(rp: &RPoly, tex: &TextureSet, cfg: &RenderConfig, vtx: [i32; 3], st: [i
                 mix(texel.color[2] as i32, vtx[2]),
             ]
         }
-        // Modulation (and, for now, toon/highlight): per-channel `((t+1)*(v+1)-1)/64`.
+        // Modulation (mode 0) and toon/highlight (mode 2): per-channel `((t+1)*(s+1)-1)/64`
+        // against the shading source `s` (vertex RGB for modulation, toon color for mode 2);
+        // highlight adds the toon color afterward, clamped to 63.
         _ => {
-            let mul = |t: i32, v: i32| (((t + 1) * (v + 1) - 1) / 64) as u8;
+            let chan = |t: i32, s: i32| -> u8 {
+                let m = ((t + 1) * (s + 1) - 1) / 64;
+                (if highlight { (m + s).min(63) } else { m }) as u8
+            };
             [
-                mul(texel.color[0] as i32, vtx[0]),
-                mul(texel.color[1] as i32, vtx[1]),
-                mul(texel.color[2] as i32, vtx[2]),
+                chan(texel.color[0] as i32, src[0]),
+                chan(texel.color[1] as i32, src[1]),
+                chan(texel.color[2] as i32, src[2]),
             ]
         }
     };
@@ -618,6 +657,31 @@ mod tests {
         assert!(!fb.at(0, 0).covered, "top-left corner is outside");
         assert!(!fb.at(0, 96).covered, "left edge is outside the span");
         assert!(!fb.at(128, 10).covered, "above the triangle's top edge");
+    }
+
+    #[test]
+    fn toon_shading_replaces_vertex_color_with_the_table_entry() {
+        // Polygon mode 2 (toon), untextured: the vertex red (5-bit 31 → 6-bit 63 → table
+        // index 63>>1 = 31) selects the toon color, which replaces the vertex RGB — the
+        // vertex's own green/blue are ignored. This is the cel-shading look.
+        let mut toon = [0u16; 32];
+        toon[31] = 10 << 5; // entry 31: green 10 (5-bit) → 21 (6-bit); red/blue 0
+        let cfg = RenderConfig { toon_table: toon, ..RenderConfig::default() };
+        let e = one_triangle(0x001F, 2 << 4); // vertex red = 31, POLYGON_ATTR mode 2
+        let fb = rasterize_cfg(&e, &cfg);
+        assert_eq!(fb.at(128, 96).color, [0, 21, 0]);
+    }
+
+    #[test]
+    fn highlight_shading_adds_the_toon_color() {
+        // DISP3DCNT = highlight: same table selection, but the toon color is added on top
+        // (≈ doubled, clamped to 63) instead of replacing — brighter than plain toon.
+        let mut toon = [0u16; 32];
+        toon[31] = 10 << 5; // green 10 → 21 (6-bit); highlight → min(63, 21*2) = 42
+        let cfg = RenderConfig { toon_table: toon, toon_highlight: true, ..RenderConfig::default() };
+        let e = one_triangle(0x001F, 2 << 4);
+        let fb = rasterize_cfg(&e, &cfg);
+        assert_eq!(fb.at(128, 96).color, [0, 42, 0]);
     }
 
     #[test]

@@ -29,6 +29,8 @@ use geometry::GeometryEngine;
 mod reg {
     pub const DISP3DCNT: u32 = 0x060;
     pub const ALPHA_TEST_REF: u32 = 0x340;
+    pub const TOON_TABLE: u32 = 0x380;
+    pub const TOON_TABLE_HI: u32 = 0x3C0; // exclusive; 32 × u16
     pub const CLEAR_COLOR: u32 = 0x350;
     pub const CLEAR_COLOR_HI: u32 = 0x352;
     pub const CLEAR_DEPTH: u32 = 0x354;
@@ -57,6 +59,9 @@ pub struct Gpu3d {
     clear_color: u32,
     /// `CLEAR_DEPTH` (`0x4000354`): the rear-plane depth (bits 0-14).
     clear_depth: u16,
+    /// `TOON_TABLE` (`0x4000380`): 32 × 15-bit BGR555 shading colors, indexed by a
+    /// polygon-mode-2 pixel's vertex-red component for toon/highlight shading.
+    toon_table: [u16; 32],
     /// The rasterized 256×192 output of the sealed render list, and the frame index it
     /// was rendered from (so it is rasterized at most once per swap).
     framebuffer: raster::Framebuffer3d,
@@ -95,6 +100,7 @@ impl Gpu3d {
             alpha_test_ref: 0,
             clear_color: 0,
             clear_depth: 0x7FFF,
+            toon_table: [0; 32],
             framebuffer: raster::Framebuffer3d::new(),
             rendered_frame: 0,
             tex_image: vec![0u8; 0x8_0000].into_boxed_slice(),
@@ -231,6 +237,9 @@ impl Gpu3d {
             clear_alpha: ((cc >> 16) & 0x1F) as u8,
             clear_depth: expand_depth(self.clear_depth & 0x7FFF),
             ignore_depth: false,
+            toon_table: self.toon_table,
+            // DISP3DCNT bit 1 selects highlight (1) vs plain toon (0) shading for the frame.
+            toon_highlight: self.disp3dcnt & (1 << 1) != 0,
         }
     }
 
@@ -368,7 +377,21 @@ impl Gpu3d {
             reg::CLEAR_DEPTH => {
                 self.clear_depth = merge16(self.clear_depth, value, bytes);
             }
-            // Other fog/toon/edge/rear-bitmap control registers are consumed by the
+            // TOON_TABLE: 32 × u16 entries. Games load it with 32-bit stores/DMA (two
+            // entries per word) or 16-bit stores (one entry); a sub-halfword write lands
+            // in the low half of its entry, as elsewhere in this block.
+            reg::TOON_TABLE..reg::TOON_TABLE_HI => {
+                let idx = ((offset - reg::TOON_TABLE) / 2) as usize;
+                if bytes == 4 {
+                    self.toon_table[idx] = value as u16;
+                    if idx + 1 < self.toon_table.len() {
+                        self.toon_table[idx + 1] = (value >> 16) as u16;
+                    }
+                } else {
+                    self.toon_table[idx] = value as u16;
+                }
+            }
+            // Other fog/edge/rear-bitmap control registers are consumed by the
             // rasterizer (later phases); accept and ignore their writes for now.
             _ => {}
         }
@@ -480,6 +503,23 @@ mod tests {
         // FIFO drains to empty/idle.
         assert_eq!(g.read_register(reg::CLIPMTX_LO + 12 * 4, 4), (2 * matrix::ONE) as u32);
         assert_eq!(g.read_register(reg::GXSTAT, 4) & (1 << 26), 1 << 26); // empty
+    }
+
+    #[test]
+    fn toon_table_writes_route_into_the_render_config() {
+        let mut g = Gpu3d::new();
+        // 32-bit write packs two entries: entry 0 and entry 1.
+        g.write_register(reg::TOON_TABLE, 0x03E0_001F, 4); // [0] = 0x001F, [1] = 0x03E0
+        // 16-bit write lands in a single entry (the last one).
+        g.write_register(reg::TOON_TABLE + 31 * 2, 0x7C00, 2); // [31] = blue
+        // DISP3DCNT bit 1 selects highlight shading for the frame.
+        g.write_register(reg::DISP3DCNT, 1 << 1, 4);
+
+        let cfg = g.render_config();
+        assert_eq!(cfg.toon_table[0], 0x001F);
+        assert_eq!(cfg.toon_table[1], 0x03E0);
+        assert_eq!(cfg.toon_table[31], 0x7C00);
+        assert!(cfg.toon_highlight);
     }
 
     #[test]
