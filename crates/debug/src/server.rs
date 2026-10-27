@@ -105,9 +105,6 @@ fn gba_only(emu: &mut Emulator) -> Result<&mut System, String> {
     emu.as_gba_mut().ok_or_else(|| "method is GBA-only (not available for the DS)".to_string())
 }
 
-fn read16(system: &mut System, addr: u32) -> u16 {
-    system.gba.bus.read16(addr, Access::cpu_data(), &mut system.scheduler).value
-}
 fn read32(system: &mut System, addr: u32) -> u32 {
     system.gba.bus.read32(addr, Access::cpu_data(), &mut system.scheduler).value
 }
@@ -361,30 +358,40 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             }
         }
 
-        // --- execution profiling / disassembly (GBA-only) ---
+        // --- execution profiling / disassembly (console-agnostic; `core` selects the DS core) ---
         "execution.hottestPc" => {
-            let (steps, top) = (u64p(params, "steps", 20_000), u64p(params, "top", 12) as usize);
-            let system = gba_only(emu)?;
+            let (steps, top, core) =
+                (u64p(params, "steps", 20_000), u64p(params, "top", 12) as usize, corep(params));
             let mut hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-            for _ in 0..steps {
-                system.step();
-                *hist.entry(system.cpu.register(15)).or_insert(0) += 1;
+            if let Some(system) = emu.as_gba_mut() {
+                for _ in 0..steps {
+                    system.step();
+                    *hist.entry(system.cpu.register(15)).or_insert(0) += 1;
+                }
+            } else if let Some(nds) = emu.as_nds_mut() {
+                let dc = crate::nds_core(core);
+                for _ in 0..steps {
+                    nds.debug_run(dc, 1, None, None, None);
+                    *hist.entry(nds.core_pc(dc)).or_insert(0) += 1;
+                }
             }
             addr_entries(&hist, top)
         }
         "execution.disassemble" => {
-            let (addr, count) = (u32p(params, "addr"), u64p(params, "count", 16) as u32);
+            let (addr, count, core) =
+                (u32p(params, "addr"), u64p(params, "count", 16) as u32, corep(params));
             let thumb_param = params.get("thumb").and_then(Value::as_bool);
-            let system = gba_only(emu)?;
-            let thumb = thumb_param.unwrap_or_else(|| system.cpu.cpsr().thumb());
+            let mut dbg = Debugger::new(emu);
+            // Thumb state: honor an explicit override, else read the core's CPSR T bit (5).
+            let thumb = thumb_param.unwrap_or_else(|| dbg.cpu().registers(core).1 & (1 << 5) != 0);
             let step = if thumb { 2 } else { 4 };
             let lines: Vec<Value> = (0..count)
                 .map(|i| {
                     let a = addr + i * step;
                     let text = if thumb {
-                        arm::format_thumb(&arm::decode_thumb(read16(system, a)))
+                        arm::format_thumb(&arm::decode_thumb(dbg.memory().read16(core, a)))
                     } else {
-                        arm::format_arm(&arm::decode_arm(read32(system, a)))
+                        arm::format_arm(&arm::decode_arm(dbg.memory().read32(core, a)))
                     };
                     json!({"addr": a, "text": text})
                 })

@@ -82,8 +82,8 @@ export class Debugger {
   watchReport(kind = 'writes', top = 24) { return this.call('memory.watchReport', { kind, top }); }
 
   // --- execution ---
-  hottestPc(steps = 20000, top = 12) { return this.call('execution.hottestPc', { steps, top }); }
-  disassemble(addr, count = 16, thumb) { return this.call('execution.disassemble', { addr, count, thumb }); }
+  hottestPc(steps = 20000, top = 12, core = 0) { return this.call('execution.hottestPc', { steps, top, core }); }
+  disassemble(addr, count = 16, thumb, core = 0) { return this.call('execution.disassemble', { addr, count, thumb, core }); }
 
   // --- video ---
   videoState() { return this.call('video.state'); }
