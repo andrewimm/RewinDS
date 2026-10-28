@@ -266,6 +266,13 @@ impl Channel {
             }
         } else {
             self.active = false;
+            // Hardware clears the start/status bit (SOUNDxCNT bit 31) when a non-looping
+            // sample reaches its end, so a read reports the channel as stopped. Games poll
+            // this to know a one-shot sound has finished — the NNS sound driver counts a
+            // sequence as still playing until its channels clear — so leaving it set hangs
+            // anything that waits for a sound effect or cry to end (e.g. battle move/faint
+            // animations spin forever on `IsSEPlaying`/`IsCryFinished`).
+            self.cnt &= !(1 << 31);
         }
     }
 
@@ -458,6 +465,28 @@ mod tests {
             s.generate_sample(data);
         }
         assert!(!s.channels[0].active, "one-shot channel stops after its length");
+        // The start/status bit (SOUNDxCNT bit 31) must also clear, so a read reports the
+        // channel stopped — games poll this to know a one-shot sound has finished.
+        assert_eq!(s.read(0x400, 4) >> 31, 0, "SOUNDxCNT start bit clears when a one-shot ends");
+    }
+
+    /// A looping channel keeps playing — its length wraps and its start/status bit stays
+    /// set (the regression guard for the one-shot stop-bit fix).
+    #[test]
+    fn loop_channel_keeps_playing_and_stays_on() {
+        let mut s = Sound::new();
+        let data = |addr: u32| -> u8 { if (0x0200_0000..0x0200_0004).contains(&addr) { 64 } else { 0 } };
+        s.write(0x500, 1 << 15 | 127, 2);
+        s.write(0x404, 0x0200_0000, 4);
+        s.write(0x408, 0xFFFF, 2);
+        s.write(0x40C, 1, 4); // LEN = 1 word = 4 PCM8 samples
+        // Start: loop-infinite (repeat=1), PCM8, full volume, center pan.
+        s.write(0x400, (1 << 31) | (1 << 27) | (64 << 16) | 127, 4);
+        for _ in 0..32 {
+            s.generate_sample(data);
+        }
+        assert!(s.channels[0].active, "a looping channel never stops on its own");
+        assert_eq!(s.read(0x400, 4) >> 31, 1, "a looping channel keeps its start bit set");
     }
 
     /// An IMA-ADPCM channel decodes its nibble stream: a run of +step nibbles drives
