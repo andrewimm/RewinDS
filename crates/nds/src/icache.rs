@@ -28,6 +28,11 @@ pub struct Cache {
     tags: Box<[u32]>,
     /// Per-set round-robin replacement pointer (next way to evict on a miss).
     victim: Box<[u8]>,
+    /// The line of the most recent access. Consecutive fetches stream through a 32-byte
+    /// line (8 ARM / 16 Thumb words), and since the model is never externally invalidated
+    /// (CP15 cache ops are no-ops here), a repeat of the last line is always still resident
+    /// — so it short-circuits to a hit without the set lookup.
+    last_line: u32,
 }
 
 impl Cache {
@@ -42,6 +47,7 @@ impl Cache {
             ways,
             tags: vec![INVALID; sets * ways].into_boxed_slice(),
             victim: vec![0u8; sets].into_boxed_slice(),
+            last_line: INVALID,
         }
     }
 
@@ -60,6 +66,12 @@ impl Cache {
     /// hits, modelling a line fill), evicting whatever it held.
     pub fn access(&mut self, address: u32) -> bool {
         let line = address >> LINE_SHIFT; // 32-byte line number
+        // Fast path: the previous access touched this same line, so it is still resident
+        // (nothing could have evicted it in between) — a guaranteed hit.
+        if line == self.last_line {
+            return true;
+        }
+        self.last_line = line;
         let set = line as usize & (self.sets - 1);
         let base = set * self.ways;
         let ways = &mut self.tags[base..base + self.ways];
