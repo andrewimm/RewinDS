@@ -470,59 +470,84 @@ fn fill_span(
     if xl >= xr {
         return;
     }
-    let span = (r.x - l.x).max(1) as i64;
+    let n = (r.x - l.x).max(1) as i64;
+    let start = (xl - l.x) as i64; // first visible pixel's offset along the span
     let row = y as usize * WIDTH;
+
+    // Per-span setup: each attribute's value at the first pixel plus a constant per-pixel
+    // step, so the inner loop advances by addition rather than a divide-by-span per pixel
+    // (the division moves from once-per-pixel to once-per-span here). `at` is the exact
+    // value at the first pixel; `step` is the per-pixel increment.
+    let at = |va: i64, vb: i64| va + (vb - va) * start / n;
+    let step = |va: i64, vb: i64| (vb - va) / n;
+    // Depth feeds the depth test, so carry it in <<16 fixed point to keep sub-unit
+    // precision (its step would otherwise truncate and could z-fight co-planar surfaces).
+    // The perspective interpolants (iw and the ·iw attributes) are huge and/or divided by
+    // iw per pixel, so the tiny step truncation is far below a recovered-value ULP.
+    let dd = (r.depth - l.depth) as i64;
+    let mut depth_fx = ((l.depth as i64) << 16) + (dd << 16) * start / n;
+    let depth_step = (dd << 16) / n;
+    let (mut iw, iw_step) = (at(l.iw, r.iw), step(l.iw, r.iw));
+    let mut cw = [at(l.cw[0], r.cw[0]), at(l.cw[1], r.cw[1]), at(l.cw[2], r.cw[2])];
+    let cw_step = [step(l.cw[0], r.cw[0]), step(l.cw[1], r.cw[1]), step(l.cw[2], r.cw[2])];
+    let mut stw = [at(l.stw[0], r.stw[0]), at(l.stw[1], r.stw[1])];
+    let stw_step = [step(l.stw[0], r.stw[0]), step(l.stw[1], r.stw[1])];
+
     for x in xl..xr {
-        let sn = (x - l.x) as i64;
-        let lerp = |va: i64, vb: i64| va + (vb - va) * sn / span;
         let idx = row + x as usize;
-        let depth = lerp(l.depth as i64, r.depth as i64) as i32;
-        if !cfg.ignore_depth && depth >= fb.depth[idx] {
-            continue; // occluded by a nearer (or equal) pixel already drawn
-        }
-        // Shadow mask (step 1): the back-face volume is nearer than the scene here, so
-        // flag the stencil. Writes no color and no depth — needs no shading.
-        if pass == Pass::ShadowMask {
-            fb.stencil[idx] = true;
-            continue;
-        }
-        // Recover perspective-correct attributes: divide each ·iw interpolant by the
-        // interpolated iw at this pixel.
-        let iw = lerp(l.iw, r.iw).max(1);
-        let recover = |a: i64, b: i64| (lerp(a, b) / iw) as i32;
-        let color = [recover(l.cw[0], r.cw[0]), recover(l.cw[1], r.cw[1]), recover(l.cw[2], r.cw[2])];
-        let st = [recover(l.stw[0], r.stw[0]), recover(l.stw[1], r.stw[1])];
-        let (rgb, alpha) = shade(rp, tex, cfg, color, st);
-        if !cfg.alpha_passes(alpha) {
-            continue; // failed the alpha test (or fully transparent)
-        }
-        let opaque_pixel = alpha == 31 || !cfg.alpha_blend;
-        match pass {
-            Pass::Opaque if opaque_pixel => {
-                // Overwrite with the polygon's color and alpha (per GBATEK, a
-                // blend-disabled translucent pixel keeps its own alpha in the buffer).
-                fb.pixels[idx] = Pixel3d { color: rgb, alpha, covered: true };
-                fb.depth[idx] = depth;
-                fb.poly_id[idx] = rp.poly_id;
-            }
-            Pass::Translucent if !opaque_pixel => {
-                fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
-                if rp.trans_depth_write {
-                    fb.depth[idx] = depth;
+        let depth = (depth_fx >> 16) as i32;
+        // Draw this pixel only when it passes the depth test (nearer than what is there,
+        // or depth ignored). The accumulators are always advanced at the loop bottom.
+        if cfg.ignore_depth || depth < fb.depth[idx] {
+            if pass == Pass::ShadowMask {
+                // Shadow mask (step 1): the back-face volume is nearer than the scene here,
+                // so flag the stencil. Writes no color and no depth — needs no shading.
+                fb.stencil[idx] = true;
+            } else {
+                // Recover perspective-correct attributes: divide each ·iw interpolant by the
+                // interpolated iw at this pixel.
+                let w = iw.max(1);
+                let color = [(cw[0] / w) as i32, (cw[1] / w) as i32, (cw[2] / w) as i32];
+                let st = [(stw[0] / w) as i32, (stw[1] / w) as i32];
+                let (rgb, alpha) = shade(rp, tex, cfg, color, st);
+                if cfg.alpha_passes(alpha) {
+                    let opaque_pixel = alpha == 31 || !cfg.alpha_blend;
+                    match pass {
+                        Pass::Opaque if opaque_pixel => {
+                            // Overwrite with the polygon's color and alpha (per GBATEK, a
+                            // blend-disabled translucent pixel keeps its own alpha).
+                            fb.pixels[idx] = Pixel3d { color: rgb, alpha, covered: true };
+                            fb.depth[idx] = depth;
+                            fb.poly_id[idx] = rp.poly_id;
+                        }
+                        Pass::Translucent if !opaque_pixel => {
+                            fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
+                            if rp.trans_depth_write {
+                                fb.depth[idx] = depth;
+                            }
+                        }
+                        // Shadow render (step 2): the front-face volume is nearer than the
+                        // scene here; darken the pixel only where the mask left the stencil
+                        // clear and the covered polygon has a different ID (never shadow a
+                        // surface onto itself). The stencil is reset after, per GBATEK.
+                        Pass::ShadowRender => {
+                            if !fb.stencil[idx] && fb.poly_id[idx] != rp.poly_id {
+                                fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
+                            }
+                            fb.stencil[idx] = false;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            // Shadow render (step 2): the front-face volume is nearer than the scene here;
-            // darken the pixel only where the mask left the stencil clear and the covered
-            // polygon has a different ID (never shadow a surface onto itself). The stencil
-            // is reset after this test, per GBATEK.
-            Pass::ShadowRender => {
-                if !fb.stencil[idx] && fb.poly_id[idx] != rp.poly_id {
-                    fb.pixels[idx] = blend_over(fb.pixels[idx], rgb, alpha);
-                }
-                fb.stencil[idx] = false;
-            }
-            _ => {}
         }
+        depth_fx += depth_step;
+        iw += iw_step;
+        cw[0] += cw_step[0];
+        cw[1] += cw_step[1];
+        cw[2] += cw_step[2];
+        stw[0] += stw_step[0];
+        stw[1] += stw_step[1];
     }
 }
 
