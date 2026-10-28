@@ -912,11 +912,15 @@ impl EventHandler<NdsEvent> for Machine {
             }
             NdsEvent::Ppu(event) => {
                 // Refresh the 3D engine's texture VRAM from the banked VRAM, then
-                // rasterize the sealed 3D frame (cached, so at most once per swap)
-                // before the PPU composites it as Engine A's BG0.
-                self.vram.assemble_texture_image(self.gpu3d.texture_image_mut());
-                self.vram.assemble_texture_palette(self.gpu3d.texture_palette_mut());
-                self.gpu3d.render_frame();
+                // rasterize the sealed 3D frame before the PPU composites it as Engine A's
+                // BG0. This PPU event fires every scanline, but the 3D frame only changes
+                // once per swap — so skip the costly VRAM texture assembly (and the render)
+                // whenever the sealed frame is unchanged, instead of redoing it per line.
+                if self.gpu3d.needs_render() {
+                    self.vram.assemble_texture_image(self.gpu3d.texture_image_mut());
+                    self.vram.assemble_texture_palette(self.gpu3d.texture_palette_mut());
+                    self.gpu3d.render_frame();
+                }
                 // `ppu`, `interrupts`, `vram`, `memory`, and `gpu3d` are disjoint fields.
                 self.ppu.handle_event(
                     event,
@@ -1146,6 +1150,12 @@ impl System {
     /// [`gpu3d::Gpu3d::debug_edge_overlay`]).
     pub fn gpu3d_edge_overlay(&self) -> Vec<u16> {
         self.machine.gpu3d.debug_edge_overlay()
+    }
+
+    /// Debug/benchmark: skip the 3D texture-assembly + rasterization pipeline, to isolate
+    /// its per-frame cost from CPU and 2D compositing.
+    pub fn gpu3d_set_bench_skip_render(&mut self, skip: bool) {
+        self.machine.gpu3d.set_bench_skip_render(skip);
     }
 
     /// Debug: toggle 3D winding culling off/on.

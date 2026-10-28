@@ -87,6 +87,9 @@ pub struct Gpu3d {
     /// direct command ports (0x4000440+) — which channel a game submits commands on.
     dbg_gxfifo_writes: u64,
     dbg_port_writes: u64,
+    /// Debug/benchmark: when set, [`Gpu3d::needs_render`] reports false so the glue skips
+    /// the whole 3D pipeline (texture assembly + rasterization) — to isolate its cost.
+    bench_skip_render: bool,
 }
 
 impl Default for Gpu3d {
@@ -117,7 +120,14 @@ impl Gpu3d {
             cmd_hist: Box::new([0; 128]),
             dbg_gxfifo_writes: 0,
             dbg_port_writes: 0,
+            bench_skip_render: false,
         }
+    }
+
+    /// Debug/benchmark: skip the 3D texture-assembly + rasterization pipeline (the screen
+    /// keeps its last 3D frame). Isolates the 3D render cost from CPU and 2D compositing.
+    pub fn set_bench_skip_render(&mut self, skip: bool) {
+        self.bench_skip_render = skip;
     }
 
     /// Debug: raw `(gxfifo_port_writes, command_port_writes)` — the two submission
@@ -268,6 +278,14 @@ impl Gpu3d {
                 if p.covered { c(p.color[0]) | (c(p.color[1]) << 5) | (c(p.color[2]) << 10) } else { 0 }
             })
             .collect()
+    }
+
+    /// Whether the sealed render list is newer than the last rasterized frame — i.e.
+    /// [`Gpu3d::render_frame`] would actually do work. The glue uses this to skip the
+    /// expensive per-frame texture-VRAM assembly when the 3D frame is unchanged (the PPU
+    /// fires this check every scanline, but the geometry only changes once per swap).
+    pub fn needs_render(&self) -> bool {
+        !self.bench_skip_render && self.geometry.render_list().frame != self.rendered_frame
     }
 
     /// Rasterize the sealed render list into the internal framebuffer (once per swap;
