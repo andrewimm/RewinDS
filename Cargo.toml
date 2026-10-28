@@ -4,3 +4,13 @@ members = ["crates/arm", "crates/emu-core", "crates/gba", "crates/nds", "crates/
 
 # Other crates (jit) will be added to the workspace as they gain source
 # and manifests.
+
+# The shipped build — the desktop host and the iOS/macOS XCFramework (built via
+# `cargo build -p emulator-ffi --release`). This is a performance-critical interpreter
+# hot loop (two ARM cores + a software 3D rasterizer), so trade build time for runtime:
+# whole-program LTO and a single codegen unit let the optimizer inline across crate
+# boundaries (the ARM decode/execute and the rasterizer span-fill especially).
+# NOT `panic = "abort"`: emulator-ffi relies on `catch_unwind` to recover from guest panics.
+[profile.release]
+lto = "fat"
+codegen-units = 1
