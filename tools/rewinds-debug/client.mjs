@@ -69,15 +69,16 @@ export class Debugger {
   registers() { return this.call('cpu.registers'); }
   setReg(index, value) { return this.call('cpu.setReg', { index, value }); }
 
-  // --- memory ---
-  async readU32(addr) { return (await this.call('memory.readU32', { addr })).value; }
-  async readU16(addr) { return (await this.call('memory.readU16', { addr })).value; }
-  async read(addr, len) {
-    const r = await this.call('memory.read', { addr, len });
+  // --- memory --- (`core` selects the DS bus: 0 = ARM9, 1 = ARM7; the GBA ignores it)
+  async readU32(addr, core = 0) { return (await this.call('memory.readU32', { addr, core })).value; }
+  async readU16(addr, core = 0) { return (await this.call('memory.readU16', { addr, core })).value; }
+  async read(addr, len, core = 0) {
+    const r = await this.call('memory.read', { addr, len, core });
     return Buffer.from(r.base64, 'base64');
   }
-  writeU32(addr, value) { return this.call('memory.writeU32', { addr, value }); }
-  writeU8(addr, value) { return this.call('memory.writeU8', { addr, value }); }
+  writeU32(addr, value, core = 0) { return this.call('memory.writeU32', { addr, value, core }); }
+  writeU16(addr, value, core = 0) { return this.call('memory.writeU16', { addr, value, core }); }
+  writeU8(addr, value, core = 0) { return this.call('memory.writeU8', { addr, value, core }); }
   watch(kind = 'writes', enable = true) { return this.call('memory.watch', { kind, enable }); }
   watchReport(kind = 'writes', top = 24) { return this.call('memory.watchReport', { kind, top }); }
 

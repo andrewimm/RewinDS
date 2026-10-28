@@ -32,10 +32,12 @@ const KEY_MAP: &[(Key, u32)] = &[
     (Key::Right, button::RIGHT),
     (Key::A, button::L),
     (Key::S, button::R),
+    (Key::C, button::X),
+    (Key::V, button::Y),
 ];
 
 const USAGE: &str = "usage: rewinds <rom.gba|rom.nds> [--bios <path>] [--bios7 <path>] \
-[--debug-port N] [--link listen <port> | --link connect <host:port>]";
+[--debug-port N | --debug-attach N] [--link listen <port> | --link connect <host:port>]";
 
 fn main() -> Result<(), Box<dyn Error>> {
     logging::init();
@@ -46,6 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut bios7_path: Option<String> = None;
     let mut firmware_path: Option<String> = None;
     let mut debug_port = None;
+    let mut debug_attach = None;
     let mut link_listen: Option<u16> = None;
     let mut link_connect: Option<String> = None;
     let mut args = std::env::args().skip(1);
@@ -56,6 +59,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--firmware" => firmware_path = Some(args.next().ok_or("--firmware needs a value")?),
             "--debug-port" => {
                 debug_port = Some(args.next().ok_or("--debug-port needs a value")?.parse::<u16>()?);
+            }
+            // Open the interactive window AND a debug port: play normally while a debug
+            // client attaches to inspect live (e.g. a hang the moment it happens).
+            "--debug-attach" => {
+                debug_attach = Some(args.next().ok_or("--debug-attach needs a value")?.parse::<u16>()?);
             }
             "--link" => match args.next().as_deref() {
                 Some("listen") => {
@@ -178,6 +186,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut last_write_epoch = emulator.save_write_epoch();
     let mut quiescent_frames = 0u32;
     let mut cull_disabled = false;
+    // Optional attached debug server: the game runs in real time in this window while a
+    // debug client inspects live over the socket — e.g. connect the moment a hang happens
+    // and run execution.hottestPc / disassemble to see where the CPU is stuck.
+    let attached = match debug_attach {
+        Some(port) => Some(debug::server::attach(port)?),
+        None => None,
+    };
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Mirror the host keyboard into a single input snapshot each frame.
         let mut input = Input::default();
@@ -298,6 +313,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         } else {
             emulator.run_frame();
+        }
+
+        // Service any attached debug-client requests against the just-advanced state.
+        if let Some(a) = &attached {
+            a.poll(&mut emulator);
         }
 
         // Present every screen, stacked top-to-bottom.

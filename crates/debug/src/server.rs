@@ -25,13 +25,16 @@ use serde_json::{json, Value};
 
 use crate::Debugger;
 
-/// Run the debug server on `port`, owning `emu`. Blocks forever (the caller's thread
-/// becomes the emulator/request loop).
-pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("[debug] listening on 127.0.0.1:{port} ({:?})", emu.console());
+/// One pending request line and the channel its response goes back on.
+type Request = (String, mpsc::Sender<String>);
 
-    let (tx, rx) = mpsc::channel::<(String, mpsc::Sender<String>)>();
+/// Bind the port and spawn the listener thread, returning the channel the main loop
+/// drains. Shared by [`serve`] (blocking/headless) and [`attach`] (polled alongside a
+/// window loop) — the socket protocol and request handling are identical; only how the
+/// emulator thread consumes requests differs.
+fn listen(port: u16) -> std::io::Result<mpsc::Receiver<Request>> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let (tx, rx) = mpsc::channel::<Request>();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             eprintln!("[debug] client connected");
@@ -59,11 +62,44 @@ pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
             eprintln!("[debug] client disconnected");
         }
     });
+    Ok(rx)
+}
 
+/// Run the debug server on `port`, owning `emu`. Blocks forever (the caller's thread
+/// becomes the emulator/request loop) — the headless mode used for automated testing,
+/// where the emulator advances only on `run.*` commands.
+pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
+    let rx = listen(port)?;
+    eprintln!("[debug] listening on 127.0.0.1:{port} ({:?})", emu.console());
     while let Ok((line, rtx)) = rx.recv() {
         let _ = rtx.send(handle(&mut emu, &line));
     }
     Ok(())
+}
+
+/// A debug server attached to a free-running host (e.g. the desktop window loop): the
+/// emulator runs in real time on the host thread, and [`Attached::poll`] services any
+/// debug requests between frames. Lets a user play interactively while a debug client
+/// inspects live — e.g. attaching to a hang the moment it happens.
+pub struct Attached {
+    rx: mpsc::Receiver<Request>,
+}
+
+/// Bind `port` for an attached session (see [`Attached`]). Does not block.
+pub fn attach(port: u16) -> std::io::Result<Attached> {
+    let rx = listen(port)?;
+    eprintln!("[debug] attached debug server on 127.0.0.1:{port} (play as normal; connect to inspect)");
+    Ok(Attached { rx })
+}
+
+impl Attached {
+    /// Handle every debug request received since the last call, without blocking. Call
+    /// once per frame from the host loop (single-threaded with the emulator).
+    pub fn poll(&self, emu: &mut Emulator) {
+        while let Ok((line, rtx)) = self.rx.try_recv() {
+            let _ = rtx.send(handle(emu, &line));
+        }
+    }
 }
 
 fn handle(emu: &mut Emulator, line: &str) -> String {
@@ -179,6 +215,34 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 guard += 1;
             }
             state_summary(emu)
+        }
+        // Timing benchmark: run N frames as fast as possible and report wall-clock
+        // throughput — frames/sec and per-frame microseconds. Real-time is 59.83 fps.
+        // Export the cartridge backup (save) bytes plus the write-epoch and dirty flag —
+        // to verify a game's save was written completely (e.g. both HGSS mirror copies).
+        "cart.saveData" => {
+            let data = emu.save_data();
+            json!({
+                "len": data.len(),
+                "writeEpoch": emu.save_write_epoch(),
+                "dirty": emu.save_dirty(),
+                "base64": base64(data),
+            })
+        }
+        "bench.frames" => {
+            let n = u64p(params, "n", 300).max(1);
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                emu.run_frame();
+            }
+            let secs = start.elapsed().as_secs_f64();
+            json!({
+                "frames": n,
+                "ms": (secs * 1000.0).round() / 1000.0,
+                "fps": ((n as f64 / secs) * 100.0).round() / 100.0,
+                "perFrameUs": ((secs / n as f64) * 1_000_000.0).round(),
+                "realtimeRatio": ((n as f64 / secs / 59.83) * 100.0).round() / 100.0,
+            })
         }
 
         // --- run control (single-step; `core` selects the DS CPU) ---
@@ -316,15 +380,18 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
         "memory.readU32" => json!({"value": Debugger::new(emu).memory().read32(corep(params), u32p(params, "addr"))}),
         "memory.readU16" => json!({"value": Debugger::new(emu).memory().read16(corep(params), u32p(params, "addr"))}),
         "memory.writeU32" => {
-            let (addr, value) = (u32p(params, "addr"), u32p(params, "value"));
-            let system = gba_only(emu)?;
-            system.gba.bus.write32(addr, value, Access::cpu_data(), &mut system.scheduler);
+            let (addr, value, core) = (u32p(params, "addr"), u32p(params, "value"), corep(params));
+            Debugger::new(emu).memory().write32(core, addr, value);
+            json!({"ok": true})
+        }
+        "memory.writeU16" => {
+            let (addr, value, core) = (u32p(params, "addr"), u32p(params, "value") as u16, corep(params));
+            Debugger::new(emu).memory().write16(core, addr, value);
             json!({"ok": true})
         }
         "memory.writeU8" => {
-            let (addr, value) = (u32p(params, "addr"), u32p(params, "value") as u8);
-            let system = gba_only(emu)?;
-            system.gba.bus.write8(addr, value, Access::cpu_data(), &mut system.scheduler);
+            let (addr, value, core) = (u32p(params, "addr"), u32p(params, "value") as u8, corep(params));
+            Debugger::new(emu).memory().write8(core, addr, value);
             json!({"ok": true})
         }
         "memory.watch" => {
@@ -571,6 +638,12 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
                 "polyCount": polys.len(),
                 "byMode": {"modulate": by_mode[0], "decal": by_mode[1], "toonHighlight": by_mode[2], "shadow": by_mode[3]},
             })
+        }
+        "video.setBenchSkipRender" => {
+            let nds = emu.as_nds_mut().ok_or_else(|| "DS-only".to_string())?;
+            let skip = params.get("skip").and_then(Value::as_bool).unwrap_or(false);
+            nds.gpu3d_set_bench_skip_render(skip);
+            json!({"skip": skip})
         }
         "video.edgeMarking" => {
             let nds = emu.as_nds().ok_or_else(|| "video.edgeMarking is DS-only".to_string())?;

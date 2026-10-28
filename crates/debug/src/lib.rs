@@ -202,8 +202,8 @@ impl Cpu<'_> {
     }
 }
 
-/// `emu.memory.*` — bus reads (writer tracking and watches are future work). `core`
-/// selects the DS bus (0 = ARM9, 1 = ARM7); the GBA ignores it.
+/// `emu.memory.*` — bus reads and writes (writer tracking and watches are future work).
+/// `core` selects the DS bus (0 = ARM9, 1 = ARM7); the GBA ignores it.
 pub struct Memory<'a> {
     emu: &'a mut Emulator,
 }
@@ -231,6 +231,31 @@ impl Memory<'_> {
             n.read(nds_core(core), address, bytes)
         } else {
             0
+        }
+    }
+
+    /// Write a byte through the bus as a CPU data access (honours I/O side effects), so
+    /// a debug client can poke registers/RAM live — e.g. clearing a stuck hardware flag
+    /// to confirm a fix without rebuilding.
+    pub fn write8(&mut self, core: usize, address: u32, value: u8) {
+        self.write(core, address, value as u32, 1);
+    }
+    pub fn write16(&mut self, core: usize, address: u32, value: u16) {
+        self.write(core, address, value as u32, 2);
+    }
+    pub fn write32(&mut self, core: usize, address: u32, value: u32) {
+        self.write(core, address, value, 4);
+    }
+
+    fn write(&mut self, core: usize, address: u32, value: u32, bytes: u32) {
+        if let Some(g) = self.emu.as_gba_mut() {
+            let _ = match bytes {
+                1 => g.gba.bus.write8(address, value as u8, Access::cpu_data(), &mut g.scheduler),
+                2 => g.gba.bus.write16(address, value as u16, Access::cpu_data(), &mut g.scheduler),
+                _ => g.gba.bus.write32(address, value, Access::cpu_data(), &mut g.scheduler),
+            };
+        } else if let Some(n) = self.emu.as_nds_mut() {
+            n.write(nds_core(core), address, value, bytes);
         }
     }
 }
