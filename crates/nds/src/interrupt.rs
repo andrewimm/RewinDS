@@ -42,6 +42,10 @@ pub enum IrqSource {
     /// sensor raises this on every open/close transition; a game's handler uses it to
     /// enter or leave sleep, so it also wakes the ARM7 from a halt.
     Hinge = 22,
+    /// The Wi-Fi hardware raised an interrupt (ARM7 only): any `W_IF & W_IE` cause,
+    /// notably the beacon / microsecond-compare timeslot the Wireless Manager waits on
+    /// during radio bring-up.
+    Wifi = 24,
 }
 
 impl IrqSource {

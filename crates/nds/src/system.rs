@@ -148,6 +148,10 @@ pub enum NdsEvent {
     /// the requester's `IntrWait` halt (the ARM7 firmware-boot pattern), rather
     /// than firing synchronously at the ROMCTRL start.
     CartTransferComplete { core: Core },
+    /// A Wi-Fi beacon / microsecond-compare timeslot elapsed: flag it in `W_IF` and, if
+    /// enabled, raise the ARM7 Wi-Fi IRQ. Reschedules while the µs counter runs. This is
+    /// the "radio alive" heartbeat the Wireless Manager waits on during bring-up.
+    WifiBeacon,
 }
 
 /// Per-core per-instruction timing state for the ARM pipeline model, where an
@@ -311,6 +315,10 @@ pub struct Machine {
     /// Stored and read back (games verify it); the display-swap bit acts once a
     /// second screen exists.
     pub(crate) powcnt1: u16,
+    /// `POWCNT2` (`0x4000304`, ARM7): bit0 = sound, bit1 = Wi-Fi power. Stored and read
+    /// back — the Wi-Fi firmware sets bit1 before touching any `W_` register and verifies
+    /// it stuck.
+    pub(crate) powcnt2: u16,
     /// Per-core local clocks in master ticks, indexed by [`Core::index`]. They run
     /// ahead of the scheduler's `now` up to the current deadline; the barrier
     /// reconciles them.
@@ -371,6 +379,7 @@ impl Machine {
             halted: [false, false],
             exmemcnt: 0,
             powcnt1: 0,
+            powcnt2: 0,
             clock: [0; 2],
             dbg_break_write: None,
             dbg_write_hit: false,
@@ -618,7 +627,7 @@ impl Machine {
             && (crate::wifi::Wifi::BASE..crate::wifi::Wifi::BASE + crate::wifi::Wifi::LEN)
                 .contains(&addr)
         {
-            return self.wifi.read(addr - crate::wifi::Wifi::BASE, bytes);
+            return self.wifi.read(addr - crate::wifi::Wifi::BASE, bytes, self.clock[core.index()]);
         }
         // 3D/geometry registers (ARM9): DISP3DCNT, the clear/fog/toon control block,
         // GXFIFO + command ports, GXSTAT, and matrix/test results. Sound occupies the
@@ -658,6 +667,7 @@ impl Machine {
             0x0400_0138 if core == Core::Arm7 => self.rtc.read(),
             0x0400_0204 => self.exmemcnt as u32, // EXMEMCNT/EXMEMSTAT (both cores)
             0x0400_0304 if core == Core::Arm9 => self.powcnt1 as u32,
+            0x0400_0304 if core == Core::Arm7 => self.powcnt2 as u32,
             0x0400_01A0 => self.cart.read_auxspicnt() as u32,
             0x0400_01A2 => self.cart.read_auxspidata() as u32,
             0x0400_01A4 => self.cart.read_romctrl(),
@@ -756,12 +766,21 @@ impl Machine {
             self.sound.write(addr - 0x0400_0000, value, bytes);
             return;
         }
-        // Wi-Fi registers (ARM7): storage-only, so the boot write-verify loop passes.
+        // Wi-Fi registers (ARM7). A write that starts the microsecond counter kicks off the
+        // beacon-IRQ schedule the Wireless Manager waits on during radio bring-up.
         if core == Core::Arm7
             && (crate::wifi::Wifi::BASE..crate::wifi::Wifi::BASE + crate::wifi::Wifi::LEN)
                 .contains(&addr)
         {
-            self.wifi.write(addr - crate::wifi::Wifi::BASE, value, bytes);
+            let start_beacon = self.wifi.write(
+                addr - crate::wifi::Wifi::BASE,
+                value,
+                bytes,
+                self.clock[core.index()],
+            );
+            if start_beacon {
+                scheduler.schedule_at(scheduler.now() + crate::wifi::BEACON_CYCLES, NdsEvent::WifiBeacon);
+            }
             return;
         }
         // 3D/geometry registers (ARM9): DISP3DCNT, clear/fog/toon control, GXFIFO +
@@ -864,6 +883,7 @@ impl Machine {
                     (self.exmemcnt & !0x7F) | (value as u16 & 0x7F)
                 };
             }
+            0x0400_0304 if core == Core::Arm7 => self.powcnt2 = value as u16,
             0x0400_0304 if core == Core::Arm9 => {
                 self.powcnt1 = value as u16;
                 self.ppu.set_powcnt1(value as u16);
@@ -956,6 +976,19 @@ impl EventHandler<NdsEvent> for Machine {
                 self.rtc.tick_second();
                 ctx.scheduler
                     .schedule_after(crate::rtc::CYCLES_PER_SECOND, NdsEvent::RtcTick);
+            }
+            NdsEvent::WifiBeacon => {
+                // Flag the beacon cause; raise the ARM7 Wi-Fi IRQ if the game enabled it,
+                // and keep the heartbeat going while the µs counter runs.
+                let (active, raise) = self.wifi.beacon_tick();
+                if raise {
+                    self.interrupts[Core::Arm7.index()]
+                        .request(crate::interrupt::IrqSource::Wifi);
+                }
+                if active {
+                    ctx.scheduler
+                        .schedule_after(crate::wifi::BEACON_CYCLES, NdsEvent::WifiBeacon);
+                }
             }
             NdsEvent::CartTransferComplete { core } => {
                 // The command/gap latency elapsed: release the data. `DRQ` may now
