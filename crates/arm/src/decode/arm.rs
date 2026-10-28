@@ -60,37 +60,46 @@ fn decode_blx_immediate(raw: u32) -> ArmOperation {
 /// Classify and decode the operation portion of an ARM word (everything below
 /// the condition).
 fn decode_operation(raw: u32) -> ArmOperation {
-    if matches_branch_exchange(raw) {
-        decode_branch_exchange(raw)
-    } else if matches_breakpoint(raw) {
-        decode_breakpoint(raw)
-    } else if matches_clz(raw) {
-        decode_clz(raw)
-    } else if matches_saturating(raw) {
-        decode_saturating(raw)
-    } else if matches_halfword_multiply(raw) {
-        decode_halfword_multiply(raw)
-    } else if matches_swap(raw) {
-        decode_swap(raw)
-    } else if matches_multiply(raw) {
-        decode_multiply(raw)
-    } else if matches_multiply_long(raw) {
-        decode_multiply_long(raw)
-    } else if matches_doubleword_transfer(raw) {
-        decode_doubleword_transfer(raw)
-    } else if matches_halfword_transfer(raw) {
-        decode_halfword_transfer(raw)
-    } else {
-        match (raw >> 25) & 0b111 {
-            0b000 | 0b001 => decode_data_processing(raw),
-            0b010 | 0b011 => decode_single_transfer(raw),
-            0b100 => decode_block_transfer(raw),
-            0b101 => decode_branch(raw),
-            // 0b110: coprocessor data transfer (LDC/STC) — not modelled.
-            0b110 => ArmOperation::Undefined { raw },
-            0b111 => decode_swi_or_coprocessor(raw),
-            _ => unreachable!(),
+    // Every special encoding below (BX/BLX, BKPT, CLZ, saturating/halfword multiply,
+    // swap, (half/double)word transfer) occupies the bits[27:25]==000 space. For any
+    // other class — immediate data-processing, load/store, block transfer, branch,
+    // coprocessor — the whole predicate chain is guaranteed to miss, so classify directly
+    // (the common path) instead of running ten failing mask tests per instruction.
+    if (raw >> 25) & 0b111 == 0b000 {
+        if matches_branch_exchange(raw) {
+            return decode_branch_exchange(raw);
+        } else if matches_breakpoint(raw) {
+            return decode_breakpoint(raw);
+        } else if matches_clz(raw) {
+            return decode_clz(raw);
+        } else if matches_saturating(raw) {
+            return decode_saturating(raw);
+        } else if matches_halfword_multiply(raw) {
+            return decode_halfword_multiply(raw);
+        } else if matches_swap(raw) {
+            return decode_swap(raw);
+        } else if matches_multiply(raw) {
+            return decode_multiply(raw);
+        } else if matches_multiply_long(raw) {
+            return decode_multiply_long(raw);
+        } else if matches_doubleword_transfer(raw) {
+            return decode_doubleword_transfer(raw);
+        } else if matches_halfword_transfer(raw) {
+            return decode_halfword_transfer(raw);
         }
+        // None of the extensions: a register-operand data-processing instruction.
+        return decode_data_processing(raw);
+    }
+    match (raw >> 25) & 0b111 {
+        0b001 => decode_data_processing(raw),
+        0b010 | 0b011 => decode_single_transfer(raw),
+        0b100 => decode_block_transfer(raw),
+        0b101 => decode_branch(raw),
+        // 0b110: coprocessor data transfer (LDC/STC) — not modelled.
+        0b110 => ArmOperation::Undefined { raw },
+        0b111 => decode_swi_or_coprocessor(raw),
+        // 0b000 is handled by the fast path above.
+        _ => unreachable!(),
     }
 }
 
