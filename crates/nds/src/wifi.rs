@@ -25,6 +25,12 @@ use emu_core::Timestamp;
 /// The Wi-Fi I/O register window, 4 KB of 16-bit registers at `0x4808000`.
 pub struct Wifi {
     regs: Box<[u16]>,
+    /// The 8 KB Wi-Fi RAM (`0x4804000..0x4806000`, GBATEK "Wifi RAM" / MAC memory — the
+    /// transmit/receive buffer area). Plain read/write storage: the Wireless Manager's
+    /// bring-up runs a pattern read-back *self-test* across this whole region, and treats
+    /// any mismatch as a dead radio (`WM_Initialize` fails → "communication error"). Backing
+    /// it as real RAM lets that test pass. No networking is modelled; it just holds bytes.
+    ram: Box<[u8]>,
     /// Baseband chip registers (Mitsumi MM3155), indices `0x00..=0x68`. R/W indices hold
     /// what firmware/game wrote; read-only indices are overridden on read (see `bb_read`).
     bb: [u8; 0x69],
@@ -41,6 +47,9 @@ pub struct Wifi {
     us_enabled: bool,
     us_base_count: u64,
     us_base_cycle: Timestamp,
+    /// `W_RANDOM` (`0x044`): an 11-bit LFSR the hardware advances on every read. A game that
+    /// seeds from it during radio bring-up rejects a stuck value, so model a changing one.
+    random: u16,
 }
 
 impl Default for Wifi {
@@ -49,11 +58,27 @@ impl Default for Wifi {
     }
 }
 
+/// What the glue must schedule after a Wi-Fi register write (returned by [`Wifi::write`]).
+#[derive(Default, Clone, Copy)]
+pub struct WifiAfterWrite {
+    /// The µs counter was just started — schedule the beacon / scan-dwell ticks.
+    pub start_beacon: bool,
+    /// The radio was just powered on — schedule the RF-wakeup IRQ.
+    pub power_on: bool,
+    /// Enabling a cause in `W_IE` left an already-pending `W_IF` flag enabled — assert the
+    /// ARM7 Wi-Fi IRQ now (the line is level-driven by `W_IF & W_IE`, and the WM enables the
+    /// cause *after* the flag is latched, then spins waiting for the interrupt).
+    pub raise_irq: bool,
+}
+
 // Register offsets within the window (relative to `BASE`).
 const W_ID: u32 = 0x000; // chip id (read-only): 0x1440 phat NDS, 0xC340 NDS-Lite
 const W_IE: u32 = 0x010; // interrupt enable
 const W_IF: u32 = 0x012; // interrupt flags (write-1-to-clear)
+const W_POWER_US: u32 = 0x036; // radio power enable (the WM writes this to power on)
 const W_POWERSTATE: u32 = 0x03C; // power request (bits 0-1) + status (bits 8-9)
+const W_POWERFORCE: u32 = 0x040; // force power state now (bit 15 = force, bit 0 = off/on)
+const W_RANDOM: u32 = 0x044; // 11-bit LFSR, advances on each read
 const W_US_COUNTCNT: u32 = 0x0E8; // microsecond-counter enable (bit 0)
 const W_US_COUNT0: u32 = 0x0F8; // µs counter, 4 × u16 at 0x0F8..0x0FE (64-bit)
 const W_BB_CNT: u32 = 0x158; // BB access start: index (0-7) + direction (12-15: 5=write, 6=read)
@@ -66,14 +91,21 @@ const W_RF_BUSY: u32 = 0x180; // RF transfer busy (bit0)
 const W_RF_PINS: u32 = 0x19C; // transceiver pin status
 const W_RF_STATUS: u32 = 0x214; // transceiver state machine status
 
-/// `W_IF` bit 14: beacon / µs-compare timeslot — the "radio alive" cause the Wireless
-/// Manager waits on during bring-up.
+/// `W_IF` bit 11: RF wakeup — raised when the radio finishes powering on. The Wireless
+/// Manager's `WM_PowerOn` blocks on this before it starts a scan; without it the whole
+/// bring-up times out.
+const W_IF_RF_WAKEUP: u16 = 1 << 11;
+/// `W_IF` bit 14: beacon / µs-compare timeslot. Once the WM powers on and starts the µs
+/// counter, this is the per-channel scan-dwell tick that lets the scan finish.
 const W_IF_BEACON: u16 = 1 << 14;
 /// The system clock rate (shared with the RTC). 1 µs = this / 1_000_000 master cycles.
 const CYCLES_PER_SECOND: u64 = 33_513_982;
 /// The beacon-IRQ cadence while the µs-counter runs: 1024 µs (the compare's 0x400-µs
 /// granularity) in master cycles (~34318). The WM expects periodic beacon interrupts.
 pub const BEACON_CYCLES: Timestamp = CYCLES_PER_SECOND * 0x400 / 1_000_000;
+/// Delay from a power-on request to the RF-wakeup IRQ: one µs timer tick (8 µs ≈ 268
+/// cycles). melonDS raises it effectively immediately; a tick keeps it off the write path.
+pub const POWER_ON_CYCLES: Timestamp = CYCLES_PER_SECOND * 8 / 1_000_000;
 
 /// Whether `REWINDS_WIFI_TRACE` is set — gates one stderr line per Wi-Fi register access,
 /// for diagnosing the Wireless-Manager bring-up handshake. Read once and cached.
@@ -87,6 +119,27 @@ impl Wifi {
     /// The window's base address and length (`0x4808000..0x4809000`).
     pub const BASE: u32 = 0x0480_8000;
     pub const LEN: u32 = 0x1000;
+    /// The Wi-Fi RAM window (`0x4804000..0x4806000`, 8 KB).
+    pub const RAM_BASE: u32 = 0x0480_4000;
+    pub const RAM_LEN: u32 = 0x2000;
+
+    /// Read `bytes` (1/2/4) from the Wi-Fi RAM at `offset` (relative to [`Self::RAM_BASE`]).
+    pub fn ram_read(&self, offset: u32, bytes: u32) -> u32 {
+        let mut v = 0u32;
+        for i in 0..bytes {
+            let idx = (offset + i) as usize & (self.ram.len() - 1);
+            v |= (self.ram[idx] as u32) << (i * 8);
+        }
+        v
+    }
+
+    /// Write `bytes` (1/2/4) of `value` to the Wi-Fi RAM at `offset`.
+    pub fn ram_write(&mut self, offset: u32, value: u32, bytes: u32) {
+        for i in 0..bytes {
+            let idx = (offset + i) as usize & (self.ram.len() - 1);
+            self.ram[idx] = (value >> (i * 8)) as u8;
+        }
+    }
 
     pub fn new() -> Self {
         let mut bb = [0u8; 0x69];
@@ -99,6 +152,7 @@ impl Wifi {
         bb[0x35] = 0x1F; // energy-detection threshold
         Wifi {
             regs: vec![0u16; (Self::LEN / 2) as usize].into_boxed_slice(),
+            ram: vec![0u8; Self::RAM_LEN as usize].into_boxed_slice(),
             bb,
             bb_read: 0,
             rf: [0; 0x20],
@@ -106,7 +160,15 @@ impl Wifi {
             us_enabled: false,
             us_base_count: 0,
             us_base_cycle: 0,
+            random: 1,
         }
+    }
+
+    /// Advance and return the `W_RANDOM` LFSR (11-bit Galois, GBATEK's documented taps).
+    fn next_random(&mut self) -> u16 {
+        let r = self.random;
+        self.random = ((r << 1) | (((r >> 10) ^ (r >> 2)) & 1)) & 0x7FF;
+        r
     }
 
     /// The microsecond counter's current value: once enabled it advances at 1 MHz, derived
@@ -129,6 +191,14 @@ impl Wifi {
         self.regs[(W_IF >> 1) as usize] |= W_IF_BEACON;
         let enabled = self.regs[(W_IE >> 1) as usize] & W_IF_BEACON != 0;
         (true, enabled)
+    }
+
+    /// A scheduled RF-wakeup fired (shortly after a power-on request): flag the RF-wakeup
+    /// cause in `W_IF` and report whether `W_IE` enables it (so the glue asserts ARM7 IRQ
+    /// 24). This is what lets the WM's `WM_PowerOn` proceed to the scan.
+    pub fn power_on_irq(&mut self) -> bool {
+        self.regs[(W_IF >> 1) as usize] |= W_IF_RF_WAKEUP;
+        self.regs[(W_IE >> 1) as usize] & W_IF_RF_WAKEUP != 0
     }
 
     /// The value the BB chip returns for register `index`. Read-only indices report their
@@ -179,7 +249,20 @@ impl Wifi {
 
     /// Read `bytes` (1/2/4) from a register at `offset` into the window. `now` is the
     /// scheduler time, used to derive the live microsecond counter.
-    pub fn read(&self, offset: u32, bytes: u32, now: Timestamp) -> u32 {
+    ///
+    /// Takes `&mut self` because the RF-wakeup flag (`W_IF` bit 11) is a momentary event,
+    /// not a write-1-clear flag: the WM's interrupt dispatcher loops `while (W_IE & W_IF)`
+    /// and its bit-11 sub-handler only re-arms `W_IE` (it never writes `W_IF` to ack), so
+    /// the bit must auto-clear once the CPU has observed it or the dispatcher spins forever.
+    pub fn read(&mut self, offset: u32, bytes: u32, now: Timestamp) -> u32 {
+        // W_RANDOM advances on every read, so serve it before the (immutable) word reader.
+        if offset & !1 == W_RANDOM {
+            let result = self.next_random() as u32;
+            if wifi_trace_enabled() {
+                eprintln!("[wifi] R {:03X} ({}) -> {:04X} (random)", offset, bytes, result);
+            }
+            return result;
+        }
         let count = self.us_count(now);
         let word = |o: u32| -> u32 {
             match o {
@@ -207,21 +290,31 @@ impl Wifi {
         if wifi_trace_enabled() {
             eprintln!("[wifi] R {:03X} ({}) -> {:04X}", offset, bytes, result);
         }
+        // Reading W_IF latches-and-clears the momentary RF-wakeup (bit 11) and beacon /
+        // µs-compare (bit 14) flags: the WM's interrupt dispatcher loops `while (W_IE & W_IF)`
+        // and neither sub-handler writes W_IF to ack (the beacon handler only re-arms W_IE and
+        // updates its timers), so the value returned above still shows the cause — handled
+        // this pass — but the next read sees it gone and the dispatch loop exits.
+        let base = offset & !1;
+        if base == W_IF || (bytes == 4 && base == W_IE) {
+            self.regs[(W_IF >> 1) as usize] &= !(W_IF_RF_WAKEUP | W_IF_BEACON);
+        }
         result
     }
 
     /// Write `bytes` (1/2/4) of `value` to a register at `offset` into the window. `now` is
-    /// the scheduler time. Returns `true` when the microsecond counter was just started, so
-    /// the glue schedules the first beacon tick.
+    /// the scheduler time. Returns which Wi-Fi events the glue should now schedule (the µs
+    /// beacon ticks and/or the RF-wakeup IRQ).
     #[must_use]
-    pub fn write(&mut self, offset: u32, value: u32, bytes: u32, now: Timestamp) -> bool {
+    pub fn write(&mut self, offset: u32, value: u32, bytes: u32, now: Timestamp) -> WifiAfterWrite {
         if wifi_trace_enabled() {
             eprintln!("[wifi] W {:03X} ({}) = {:04X}", offset, bytes, value);
         }
+        let mut after = WifiAfterWrite::default();
         // `W_IF` (0x012) is write-1-to-clear: clear the flagged causes rather than storing.
         if offset == W_IF && bytes != 4 {
             self.regs[(W_IF >> 1) as usize] &= !(value as u16);
-            return false;
+            return after;
         }
         // Store the raw value first (so W_BB_WRITE / W_RF_DATA1 are in place for a transfer),
         // then act on the control registers that start a BB/RF transfer.
@@ -271,6 +364,23 @@ impl Wifi {
                 _ => req,
             };
         }
+        // `W_POWERFORCE` (0x040): with bit 15 set, immediately forces the radio power state
+        // instead of going through the requested/ack handshake. The Wireless Manager's scan
+        // drives this to power the radio down between channels (bit 0 = 1) and back up (bit 0
+        // = 0), spin-waiting on `W_POWERSTATE` bits 8-9 for the forced state to take effect.
+        if base == W_POWERFORCE {
+            let v = self.regs[(W_POWERFORCE >> 1) as usize];
+            if v & 0x8000 != 0 {
+                self.regs[(W_POWERSTATE >> 1) as usize] = if v & 1 != 0 { 0x0200 } else { 0x0100 };
+            }
+        }
+        // Writing W_POWER_US powers the radio on; the WM waits for the RF-wakeup IRQ (W_IF
+        // bit 11) that the glue schedules in response. Only that bit — the WM's power-on
+        // wait expects a clean W_IF, so the µs-counter/beacon (bit 14) must NOT be running
+        // yet; the WM enables W_US_COUNTCNT itself once it reaches the scan.
+        if base == W_POWER_US {
+            after.power_on = true;
+        }
         // A direct write to the µs counter rebases it from `now`.
         if (W_US_COUNT0..W_US_COUNT0 + 8).contains(&base) {
             let i = (W_US_COUNT0 >> 1) as usize;
@@ -283,13 +393,19 @@ impl Wifi {
             if enable && !self.us_enabled {
                 self.us_base_cycle = now; // continue from the current frozen count
                 self.us_enabled = true;
-                return true; // the glue schedules the first beacon tick
+                after.start_beacon = true; // the glue schedules the first beacon tick
             } else if !enable && self.us_enabled {
                 self.us_base_count = self.us_count(now); // freeze at the current value
                 self.us_enabled = false;
             }
         }
-        false
+        // The Wi-Fi → ARM7 interrupt line is level-driven by `W_IF & W_IE`. Enabling a cause
+        // in `W_IE` while its flag is already latched must assert the line now — the WM
+        // latches the RF-wakeup flag, *then* sets `W_IE` bit 11 and spins on the IRQ.
+        if base == W_IE && self.regs[(W_IF >> 1) as usize] & self.regs[(W_IE >> 1) as usize] != 0 {
+            after.raise_irq = true;
+        }
+        after
     }
 
     /// Test-only: write at clock 0, discarding the "schedule beacon" flag.
@@ -299,7 +415,7 @@ impl Wifi {
     }
     /// Test-only: read at clock 0.
     #[cfg(test)]
-    fn tr(&self, offset: u32, bytes: u32) -> u32 {
+    fn tr(&mut self, offset: u32, bytes: u32) -> u32 {
         self.read(offset, bytes, 0)
     }
 }
@@ -380,7 +496,7 @@ mod tests {
         let mut w = Wifi::new();
         assert_eq!(w.read(W_US_COUNT0, 2, 1_000_000), 0, "counter idle until enabled");
         // Enable the µs counter at t=0; it should request the first beacon tick.
-        assert!(w.write(W_US_COUNTCNT, 1, 2, 0), "enabling the counter schedules a beacon");
+        assert!(w.write(W_US_COUNTCNT, 1, 2, 0).start_beacon, "enabling the counter schedules a beacon");
         // One second of master cycles later, the counter reads ~1,000,000 µs.
         let secs_later = CYCLES_PER_SECOND;
         let count = w.read(W_US_COUNT0, 2, secs_later) as u64

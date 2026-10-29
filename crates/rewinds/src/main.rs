@@ -104,7 +104,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Seed the real-time clock from the host wall clock (UTC) so games see the real date
     // for day/night and timed events. It ticks deterministically from here.
     {
-        let (y, mo, d, dow, h, mi, s) = utc_now();
+        // `REWINDS_FIXED_CLOCK` pins a constant date/time (for deterministic debugging:
+        // the wall clock otherwise perturbs time-dependent code paths and heap layout).
+        let (y, mo, d, dow, h, mi, s) = if std::env::var_os("REWINDS_FIXED_CLOCK").is_some() {
+            (2024, 6, 15, 6, 12, 0, 0) // 2024-06-15 12:00:00, Saturday
+        } else {
+            utc_now()
+        };
         emulator.set_clock(y, mo, d, dow, h, mi, s);
     }
 

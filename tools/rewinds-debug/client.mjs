@@ -63,7 +63,14 @@ export class Debugger {
   toFrame(frame) { return this.call('run.toFrame', { frame }); }
   steps(n = 1) { return this.call('run.steps', { n }); }
   untilPc(pc, maxSteps) { return this.call('run.untilPc', { pc, maxSteps }); }
-  untilWrite(addr, maxSteps) { return this.call('run.untilWrite', { addr, maxSteps }); }
+  // Returns { hit, writerPc, writerCore (0=ARM9,1=ARM7), value, steps } — writerPc/Core
+  // name the core that actually issued the write (DS shared RAM is often written by the
+  // core you are NOT stepping), pass `core` to choose which core's instructions to count.
+  untilWrite(addr, maxSteps, core = 0) { return this.call('run.untilWrite', { addr, maxSteps, core }); }
+  // Annotated execution trace to `path`: per instruction, its disassembly (decoded from the
+  // bytes actually executed — overlay/view correct) plus every memory write it made.
+  traceDisasm(path, { skip = 0, count = 1000, core = 0 } = {}) { return this.call('run.traceDisasm', { path, skip, count, core }); }
+  traceRegs(path, { skip = 0, count = 1000, core = 0 } = {}) { return this.call('run.traceRegs', { path, skip, count, core }); }
 
   // --- cpu ---
   registers() { return this.call('cpu.registers'); }

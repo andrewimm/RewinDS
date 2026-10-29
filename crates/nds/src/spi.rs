@@ -217,6 +217,9 @@ impl Spi {
                 if self.phase < 3 {
                     self.address = (self.address << 8) | value as u32;
                     self.phase += 1;
+                    if self.phase == 3 && std::env::var_os("REWINDS_FW_TRACE").is_some() {
+                        eprintln!("[fw] READ @{:05X}", self.address);
+                    }
                     0
                 } else {
                     let byte = self.flash[self.address as usize & (self.flash.len() - 1)];

@@ -152,6 +152,9 @@ pub enum NdsEvent {
     /// enabled, raise the ARM7 Wi-Fi IRQ. Reschedules while the µs counter runs. This is
     /// the "radio alive" heartbeat the Wireless Manager waits on during bring-up.
     WifiBeacon,
+    /// The radio finished powering on: raise the Wi-Fi RF-wakeup IRQ (`W_IF` bit 11) so the
+    /// Wireless Manager's `WM_PowerOn` proceeds past its wait instead of timing out.
+    WifiPowerOn,
 }
 
 /// Per-core per-instruction timing state for the ARM pipeline model, where an
@@ -331,9 +334,22 @@ pub struct Machine {
     /// `run.untilWrite`); the bus sets [`Self::dbg_write_hit`] and the run loop stops.
     pub(crate) dbg_break_write: Option<u32>,
     pub(crate) dbg_write_hit: bool,
+    /// On a [`Self::dbg_break_write`] hit: the core that actually performed the write, its
+    /// executing instruction PC, and the value. A write to shared RAM can come from the core
+    /// *not* being single-stepped (the ARM7 writing while the debugger steps the ARM9), so
+    /// these name the true writer rather than whichever core the caller happened to watch.
+    pub(crate) dbg_write_hit_core: Option<Core>,
+    pub(crate) dbg_write_hit_pc: u32,
+    pub(crate) dbg_write_hit_val: u32,
     /// Debug: when present, the bus tallies every guest data-write address here (the
     /// `memory.watch`/`watchReport` histogram).
     pub(crate) dbg_write_watch: Option<std::collections::HashMap<u32, u64>>,
+    /// Debug: when present, the bus appends every guest data write `(addr, value, bytes)`
+    /// made by [`Self::dbg_write_trace_core`] here — drained per instruction by the
+    /// annotated execution trace so each line's stores are attributed to it.
+    pub(crate) dbg_write_trace: Option<Vec<(u32, u32, u32)>>,
+    /// The only core whose writes [`Self::dbg_write_trace`] records (`None` = all).
+    pub(crate) dbg_write_trace_core: Option<usize>,
 }
 
 /// A register-transition watchpoint for [`System::debug_run`]: break when the watched
@@ -383,7 +399,12 @@ impl Machine {
             clock: [0; 2],
             dbg_break_write: None,
             dbg_write_hit: false,
+            dbg_write_hit_core: None,
+            dbg_write_hit_pc: 0,
+            dbg_write_hit_val: 0,
             dbg_write_watch: None,
+            dbg_write_trace: None,
+            dbg_write_trace_core: None,
         }
     }
 
@@ -629,6 +650,15 @@ impl Machine {
         {
             return self.wifi.read(addr - crate::wifi::Wifi::BASE, bytes, self.clock[core.index()]);
         }
+        // Wi-Fi RAM (ARM7, 0x4804000..0x4806000): 8 KB of plain storage that the Wireless
+        // Manager's bring-up self-tests with a pattern read-back (see `wifi::Wifi::ram_read`).
+        if core == Core::Arm7
+            && (crate::wifi::Wifi::RAM_BASE
+                ..crate::wifi::Wifi::RAM_BASE + crate::wifi::Wifi::RAM_LEN)
+                .contains(&addr)
+        {
+            return self.wifi.ram_read(addr - crate::wifi::Wifi::RAM_BASE, bytes);
+        }
         // 3D/geometry registers (ARM9): DISP3DCNT, the clear/fog/toon control block,
         // GXFIFO + command ports, GXSTAT, and matrix/test results. Sound occupies the
         // same 0x4000400 range on the ARM7, so this is ARM9-gated.
@@ -766,20 +796,39 @@ impl Machine {
             self.sound.write(addr - 0x0400_0000, value, bytes);
             return;
         }
+        // Wi-Fi RAM (ARM7, 0x4804000..0x4806000): plain storage for the bring-up self-test.
+        if core == Core::Arm7
+            && (crate::wifi::Wifi::RAM_BASE
+                ..crate::wifi::Wifi::RAM_BASE + crate::wifi::Wifi::RAM_LEN)
+                .contains(&addr)
+        {
+            self.wifi.ram_write(addr - crate::wifi::Wifi::RAM_BASE, value, bytes);
+            return;
+        }
         // Wi-Fi registers (ARM7). A write that starts the microsecond counter kicks off the
         // beacon-IRQ schedule the Wireless Manager waits on during radio bring-up.
         if core == Core::Arm7
             && (crate::wifi::Wifi::BASE..crate::wifi::Wifi::BASE + crate::wifi::Wifi::LEN)
                 .contains(&addr)
         {
-            let start_beacon = self.wifi.write(
+            let after = self.wifi.write(
                 addr - crate::wifi::Wifi::BASE,
                 value,
                 bytes,
                 self.clock[core.index()],
             );
-            if start_beacon {
+            if after.start_beacon {
                 scheduler.schedule_at(scheduler.now() + crate::wifi::BEACON_CYCLES, NdsEvent::WifiBeacon);
+            }
+            if after.power_on {
+                // The radio was powered on; the WM's WM_PowerOn blocks until the RF-wakeup
+                // IRQ, so raise it shortly after (one µs timer tick).
+                scheduler.schedule_at(scheduler.now() + crate::wifi::POWER_ON_CYCLES, NdsEvent::WifiPowerOn);
+            }
+            if after.raise_irq {
+                // Enabling W_IE over an already-pending W_IF cause asserts the (level-driven)
+                // ARM7 Wi-Fi line — the WM depends on this to wake from its power-on spin.
+                self.interrupts[Core::Arm7.index()].request(crate::interrupt::IrqSource::Wifi);
             }
             return;
         }
@@ -988,6 +1037,13 @@ impl EventHandler<NdsEvent> for Machine {
                 if active {
                     ctx.scheduler
                         .schedule_after(crate::wifi::BEACON_CYCLES, NdsEvent::WifiBeacon);
+                }
+            }
+            NdsEvent::WifiPowerOn => {
+                // Flag RF-wakeup; raise the ARM7 Wi-Fi IRQ if the game enabled that cause.
+                if self.wifi.power_on_irq() {
+                    self.interrupts[Core::Arm7.index()]
+                        .request(crate::interrupt::IrqSource::Wifi);
                 }
             }
             NdsEvent::CartTransferComplete { core } => {
@@ -1381,6 +1437,77 @@ impl System {
         Ok(count)
     }
 
+    /// After [`Self::debug_run`] stopped on a `break_write`: the core that performed the
+    /// write (the authoritative writer, which may differ from the stepped core), or `None`
+    /// if the run did not hit a write break.
+    pub fn dbg_write_hit_core(&self) -> Option<Core> {
+        self.machine.dbg_write_hit_core
+    }
+    /// The executing-instruction PC of the core that performed the breaking write.
+    pub fn dbg_write_hit_pc(&self) -> u32 {
+        self.machine.dbg_write_hit_pc
+    }
+    /// The value of the breaking write.
+    pub fn dbg_write_hit_val(&self) -> u32 {
+        self.machine.dbg_write_hit_val
+    }
+
+    /// Debug: an **annotated execution trace** of `core` — one line per instruction, the
+    /// instruction disassembled *from the bytes it actually executes* (read at execution
+    /// time, so swappable VRAM overlays and per-core memory views are always correct, unlike
+    /// re-reading the address later), followed by every memory write that instruction made.
+    ///
+    /// Format per line: `PC  OPCODE  mnemonic   ; [addr]<=value ...`. This is the tool for
+    /// following a path through overlaid code and seeing exactly what each instruction stores
+    /// (e.g. locating the step that *should* populate a field but doesn't).
+    pub fn debug_trace_disasm(
+        &mut self,
+        core: Core,
+        skip: u64,
+        count: u64,
+        path: &str,
+    ) -> std::io::Result<u64> {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        if skip > 0 {
+            self.debug_run(core, skip, None, None, None);
+        }
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        // Record only this core's writes, so each traced instruction's stores are isolated
+        // from the interleaved core's (one `debug_run(core, 1)` executes exactly one
+        // instruction of `core`, so its writes all belong to that line).
+        self.machine.dbg_write_trace = Some(Vec::new());
+        self.machine.dbg_write_trace_core = Some(core.index());
+        let mut line = String::with_capacity(96);
+        for _ in 0..count {
+            // `register(15)` is the exact address of the executing instruction (the pipeline
+            // offset is applied only when r15 is read as an operand), so no fixup is needed.
+            let pc = self.core_reg(core, 15);
+            let thumb = self.core_cpsr(core) & (1 << 5) != 0;
+            line.clear();
+            if thumb {
+                let op = self.read(core, pc, 2) as u16;
+                let _ = write!(line, "{pc:08X}  {op:04X}      {}", arm::format_thumb(&arm::decode_thumb(op)));
+            } else {
+                let op = self.read(core, pc, 4);
+                let _ = write!(line, "{pc:08X}  {op:08X}  {}", arm::format_arm(&arm::decode_arm(op)));
+            }
+            if let Some(log) = self.machine.dbg_write_trace.as_mut() {
+                log.clear();
+            }
+            self.debug_run(core, 1, None, None, None);
+            if let Some(log) = self.machine.dbg_write_trace.as_ref() {
+                for &(a, v, b) in log {
+                    let _ = write!(line, "   ; [{a:08X}]<={v:0width$X}", width = (b as usize) * 2);
+                }
+            }
+            writeln!(w, "{line}")?;
+        }
+        self.machine.dbg_write_trace = None;
+        self.machine.dbg_write_trace_core = None;
+        Ok(count)
+    }
+
     /// Enable/disable the guest-write address histogram (`memory.watch`).
     pub fn set_write_watch(&mut self, on: bool) {
         self.machine.dbg_write_watch = on.then(Default::default);
@@ -1420,6 +1547,7 @@ impl System {
         self.start_rtc();
         self.machine.dbg_break_write = break_write;
         self.machine.dbg_write_hit = false;
+        self.machine.dbg_write_hit_core = None;
         let mut steps = 0u64;
         let mut slices = 0u64;
         // A halted, event-starved machine advances time without executing; cap the number

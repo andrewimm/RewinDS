@@ -301,8 +301,17 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             } else if let Some(nds) = emu.as_nds_mut() {
                 let dc = crate::nds_core(core);
                 let (steps, hit) = nds.debug_run(dc, max, None, Some(addr), None);
-                // The writer's PC is the core's PC at the break (the store instruction).
-                json!({"hit": hit, "writerPc": nds.core_pc(dc), "steps": steps, "value": nds.read(dc, addr, 4)})
+                // Attribute the write to the core that actually issued it (shared RAM is
+                // written by the core NOT being stepped as often as by it), and report that
+                // core's executing-instruction PC — not the stepped core's.
+                let writer = nds.dbg_write_hit_core();
+                json!({
+                    "hit": hit,
+                    "writerPc": writer.map(|_| nds.dbg_write_hit_pc()),
+                    "writerCore": writer.map(|c| c.index()),
+                    "value": if hit { nds.dbg_write_hit_val() } else { nds.read(dc, addr, 4) },
+                    "steps": steps,
+                })
             } else {
                 Value::Null
             }
@@ -351,6 +360,21 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             let skip = u64p(params, "skip", 0);
             let count = u64p(params, "count", 1000);
             match nds.debug_trace_regs(crate::nds_core(core), skip, count, path) {
+                Ok(n) => json!({"wrote": n, "path": path}),
+                Err(e) => return Err(format!("trace write failed: {e}")),
+            }
+        }
+        // Annotated execution trace (DS only): one line per instruction, disassembled from
+        // the bytes it actually executes (overlay- and per-core-view correct), with every
+        // memory write it performs. Unlike traceRegs this shows the instruction text and its
+        // stores — the tool for following a path through swappable VRAM-overlay code.
+        "run.traceDisasm" => {
+            let core = corep(params);
+            let nds = emu.as_nds_mut().ok_or_else(|| "run.traceDisasm is DS-only".to_string())?;
+            let path = params.get("path").and_then(Value::as_str).ok_or("run.traceDisasm needs a path")?;
+            let skip = u64p(params, "skip", 0);
+            let count = u64p(params, "count", 1000);
+            match nds.debug_trace_disasm(crate::nds_core(core), skip, count, path) {
                 Ok(n) => json!({"wrote": n, "path": path}),
                 Err(e) => return Err(format!("trace write failed: {e}")),
             }

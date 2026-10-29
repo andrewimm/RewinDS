@@ -215,13 +215,28 @@ impl NdsCpuBus<'_> {
                 clock,
             );
         }
-        // Debug write watch / break (guest data writes only; both idle when unset).
-        if self.machine.dbg_write_watch.is_some() || self.machine.dbg_break_write.is_some() {
+        // Debug write watch / break / trace (guest data writes only; all idle when unset).
+        if self.machine.dbg_write_watch.is_some()
+            || self.machine.dbg_break_write.is_some()
+            || self.machine.dbg_write_trace.is_some()
+        {
             if let Some(w) = self.machine.dbg_write_watch.as_mut() {
                 *w.entry(address).or_insert(0) += 1;
             }
+            // Per-instruction write log for the annotated trace, filtered to one core so
+            // each traced instruction's stores aren't mixed with the interleaved core's.
+            if self.machine.dbg_write_trace_core.map_or(true, |c| c == self.core.index()) {
+                if let Some(log) = self.machine.dbg_write_trace.as_mut() {
+                    log.push((address, value, bytes));
+                }
+            }
             if self.machine.dbg_break_write == Some(address) {
                 self.machine.dbg_write_hit = true;
+                // Attribute the write to the core that issued it (`self.core`) and the
+                // instruction executing on it — not to whichever core the caller is stepping.
+                self.machine.dbg_write_hit_core = Some(self.core);
+                self.machine.dbg_write_hit_pc = self.machine.exec_pc[self.core.index()];
+                self.machine.dbg_write_hit_val = value;
             }
         }
         if is_io(address) {
