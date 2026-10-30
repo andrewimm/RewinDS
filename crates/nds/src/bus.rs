@@ -225,7 +225,7 @@ impl NdsCpuBus<'_> {
             }
             // Per-instruction write log for the annotated trace, filtered to one core so
             // each traced instruction's stores aren't mixed with the interleaved core's.
-            if self.machine.dbg_write_trace_core.map_or(true, |c| c == self.core.index()) {
+            if self.machine.dbg_write_trace_core.is_none_or(|c| c == self.core.index()) {
                 if let Some(log) = self.machine.dbg_write_trace.as_mut() {
                     log.push((address, value, bytes));
                 }
