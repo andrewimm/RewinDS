@@ -199,6 +199,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(port) => Some(debug::server::attach(port)?),
         None => None,
     };
+    // In debug mode, record a rewind timeline so the window offers an in-place scrubber.
+    // Keyframe interval / ring size (→ history depth and memory) are overridable by env.
+    let mut scrubbing = false;
+    if let Some(a) = attached.as_mut() {
+        let interval = env_u32("REWINDS_REWIND_INTERVAL", 12);
+        let capacity = env_u32("REWINDS_REWIND_KEYFRAMES", 50) as usize;
+        a.enable_rewind(interval, capacity);
+        eprintln!(
+            "[rewind] recording: keyframe every {interval} frames, {capacity} kept \
+             (~{}s). F7 = scrub (pause), ←/→ step a frame, Shift+←/→ jump 30, F7 resume.",
+            interval as usize * capacity / 60
+        );
+    }
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // Mirror the host keyboard into a single input snapshot each frame.
         let mut input = Input::default();
@@ -218,6 +231,50 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        // Rewind scrubber (debug mode only): F7 toggles a paused scrub mode where the arrows
+        // step through recorded history; F7 again resumes live play (branching the timeline
+        // from the rewound point). While scrubbing, the game does not advance.
+        if let Some(a) = attached.as_mut() {
+            if a.rewind().is_some() && window.is_key_pressed(Key::F7, minifb::KeyRepeat::No) {
+                scrubbing = !scrubbing;
+                if !scrubbing {
+                    window.set_title("RewinDS");
+                }
+            }
+        }
+        if scrubbing {
+            window.set_target_fps(60);
+            if let Some(a) = attached.as_mut() {
+                if let Some(tl) = a.rewind() {
+                    let shift =
+                        window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+                    let step = if shift { 30 } else { 1 };
+                    let cur = tl.cursor();
+                    if window.is_key_pressed(Key::Left, minifb::KeyRepeat::Yes) {
+                        tl.seek(&mut emulator, cur.saturating_sub(step));
+                    } else if window.is_key_pressed(Key::Right, minifb::KeyRepeat::Yes) {
+                        tl.seek(&mut emulator, cur + step);
+                    }
+                    window.set_title(&format!(
+                        "RewinDS — REWIND  frame {}/{}  (F7 resume)",
+                        tl.cursor(),
+                        tl.newest_frame()
+                    ));
+                }
+                a.poll(&mut emulator);
+            }
+            // Present the scrubbed frame (the same stacked-screens blit as live play).
+            for i in 0..screen_count {
+                let screen = emulator.screen(i).expect("screen");
+                let base = i * screen_h * win_w;
+                for (out, px) in buffer[base..].iter_mut().zip(screen.rgba.as_chunks::<4>().0) {
+                    *out = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+                }
+            }
+            window.update_with_buffer(&buffer, win_w, win_h)?;
+            continue;
+        }
+
         emulator.set_input(input);
         // Hold L to shut the clamshell lid — the same discrete call a native host makes
         // on background/foreground (raises the hinge interrupt; the game sleeps while
@@ -321,8 +378,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             emulator.run_frame();
         }
 
-        // Service any attached debug-client requests against the just-advanced state.
+        // Record this live frame into the rewind timeline, then service any attached
+        // debug-client requests against the just-advanced state.
         if let Some(a) = &mut attached {
+            a.record_frame(&emulator);
             a.poll(&mut emulator);
         }
 
@@ -382,6 +441,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// and resume, so the transfer completes in-frame and the two machines stay clock-locked —
 /// the fix real-time link games (Advance Wars, Pokémon VS) need. A stalled peer (no reply
 /// within the timeout) ends the frame early rather than hanging the window.
+/// Parse an unsigned env var, falling back to `default` if unset or malformed.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn run_linked_frame(emulator: &mut Emulator, link: &mut impl Transport) {
     const BARRIER_TIMEOUT: Duration = Duration::from_millis(50);
     // Advance in small slices, servicing the carrier between each, so a burst of transfers

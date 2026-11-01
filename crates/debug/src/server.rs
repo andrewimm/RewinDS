@@ -98,16 +98,35 @@ pub fn attach(port: u16) -> std::io::Result<Attached> {
 }
 
 impl Attached {
-    /// Handle every debug request received since the last call, without blocking. Call
-    /// once per frame from the host loop (single-threaded with the emulator), *after* the
-    /// host has run the frame — so an enabled rewind timeline records the live play.
+    /// Handle every debug request received since the last call, without blocking. Call once
+    /// per frame from the host loop (single-threaded with the emulator).
     pub fn poll(&mut self, emu: &mut Emulator) {
-        if let Some(tl) = self.timeline.as_mut() {
-            tl.record(emu);
-        }
         while let Ok((line, rtx)) = self.rx.try_recv() {
             let _ = rtx.send(handle(emu, &mut self.timeline, &line));
         }
+    }
+
+    /// Record the frame the host just ran into the rewind timeline (no-op unless rewind is
+    /// enabled). Call once after each *live* `run_frame` — not while scrubbing, where no new
+    /// frame is produced.
+    pub fn record_frame(&mut self, emu: &Emulator) {
+        if let Some(tl) = self.timeline.as_mut() {
+            tl.record(emu);
+        }
+    }
+
+    /// Turn on rewind recording with the given keyframe interval and ring capacity, so the
+    /// host can offer an in-window scrubber. No-op if already enabled.
+    pub fn enable_rewind(&mut self, keyframe_interval: u32, capacity: usize) {
+        if self.timeline.is_none() {
+            self.timeline = Some(Timeline::new(keyframe_interval, capacity));
+        }
+    }
+
+    /// The rewind timeline, if enabled — for the host to drive a scrubber (`seek`/`step_back`)
+    /// and read the recorded range.
+    pub fn rewind(&mut self) -> Option<&mut Timeline> {
+        self.timeline.as_mut()
     }
 }
 
