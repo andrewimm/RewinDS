@@ -26,6 +26,9 @@ const REG_TIME: u8 = 3;
 /// Control-register flags. Bit 6 selects 24-hour mode; `WRITABLE` masks the bits a
 /// write command may change (24-hour plus the three interrupt enables) — the
 /// power-failure flag (bit 7) is not one of them.
+/// GBA system clock (16.78 MHz). The reported RTC time advances one second per this many
+/// emulated cycles, so it tracks the (snapshotted, deterministic) scheduler clock.
+const CYCLES_PER_SECOND: u64 = 16_777_216;
 const CONTROL_24HOUR: u8 = 0x40;
 const CONTROL_WRITABLE: u8 = 0x6A;
 
@@ -62,6 +65,15 @@ pub struct Rtc {
     sio_out: bool,
 
     control: u8,
+
+    /// The host wall-clock seconds latched once at construction. The reported time is this
+    /// plus the elapsed emulated seconds (`now / clock-rate`), so the clock advances with the
+    /// machine rather than the host — making it a deterministic function of the (snapshotted)
+    /// scheduler clock, which is what lets rewind replay a timed game exactly.
+    base_unix_secs: u64,
+    /// The scheduler clock at the most recent GPIO access, kept in sync by the bus so a read
+    /// can derive the current time without threading `now` through the serial protocol.
+    now: emu_core::Timestamp,
 }
 
 impl Default for Rtc {
@@ -81,6 +93,11 @@ impl Default for Rtc {
             out: Vec::new(),
             out_index: 0,
             sio_out: false,
+            base_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            now: 0,
             // A healthy, initialised clock: 24-hour mode set, no power-failure flag.
             // Games (e.g. Pokémon) treat a clear 24-hour bit as an error and show
             // "the internal battery has run dry", so a real-time RTC must start here.
@@ -92,6 +109,12 @@ impl Default for Rtc {
 impl Rtc {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sync the scheduler clock the next time-read will derive its value from. The bus calls
+    /// this on every GPIO access so a datetime read reflects the current emulated time.
+    pub fn set_now(&mut self, now: emu_core::Timestamp) {
+        self.now = now;
     }
 
     /// Read one of the three GPIO registers (offset `0xC4`/`0xC6`/`0xC8` within the
@@ -230,10 +253,14 @@ impl Rtc {
     /// The bytes a read command clocks out, flattened LSB-first (bit 0 of each byte
     /// leaves the chip first — the parameter convention the game's driver expects).
     fn read_register(&self, reg: u8) -> Vec<bool> {
+        // Current time = the base wall clock plus the elapsed emulated seconds.
+        let secs = self
+            .base_unix_secs
+            .wrapping_add(self.now / CYCLES_PER_SECOND);
         let bytes: Vec<u8> = match reg {
             REG_CONTROL => vec![self.control],
-            REG_DATETIME => datetime_bcd(self.control).to_vec(),
-            REG_TIME => datetime_bcd(self.control)[4..7].to_vec(),
+            REG_DATETIME => datetime_bcd(self.control, secs).to_vec(),
+            REG_TIME => datetime_bcd(self.control, secs)[4..7].to_vec(),
             _ => vec![],
         };
         let mut bits = Vec::with_capacity(bytes.len() * 8);
@@ -266,10 +293,9 @@ fn register_len(reg: u8) -> u8 {
 }
 
 /// The 7-byte datetime register (year, month, day, weekday, hour, minute, second)
-/// in packed BCD, sampled from the host wall clock (UTC). Bit 6 of `control`
+/// in packed BCD, for the given UTC `secs` since the Unix epoch. Bit 6 of `control`
 /// selects 24-hour mode; otherwise the hour uses the 12-hour form with the PM flag.
-fn datetime_bcd(control: u8) -> [u8; 7] {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+fn datetime_bcd(control: u8, secs: u64) -> [u8; 7] {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hour24, minute, second) = ((rem / 3600) as u8, ((rem % 3600) / 60) as u8, (rem % 60) as u8);
@@ -388,7 +414,7 @@ mod tests {
 
     #[test]
     fn datetime_read_is_valid_bcd() {
-        let dt = datetime_bcd(0x40); // 24-hour mode
+        let dt = datetime_bcd(0x40, 1_700_000_000); // 24-hour mode, a fixed UTC instant
         let month = (dt[1] >> 4) * 10 + (dt[1] & 0xF);
         let day = (dt[2] >> 4) * 10 + (dt[2] & 0xF);
         let hour = (dt[4] >> 4) * 10 + (dt[4] & 0xF);

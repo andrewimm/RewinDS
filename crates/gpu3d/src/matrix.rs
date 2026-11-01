@@ -128,6 +128,7 @@ const POSVEC_DEPTH: u32 = 31;
 
 /// The four current matrices, their stacks, the matrix mode, and the cached clip
 /// matrix. Drives every `MTX_*` command.
+#[derive(Clone)]
 pub struct MatrixEngine {
     /// Current matrix mode (`MTX_MODE`): 0 projection, 1 position, 2 position&vector,
     /// 3 texture.

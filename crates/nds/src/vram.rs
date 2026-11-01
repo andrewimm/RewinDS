@@ -36,6 +36,7 @@ const LCDC_BASE: [u32; 9] = [
 ];
 
 /// VRAM plus the nine `VRAMCNT` registers.
+#[derive(Clone)]
 pub struct Vram {
     banks: [Box<[u8]>; 9],
     vramcnt: [u8; 9],

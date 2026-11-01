@@ -109,7 +109,7 @@ pub fn param_count(id: u8) -> u32 {
 /// following words are parameters, dealt out to those opcodes in order. Zero-
 /// parameter opcodes are emitted immediately with a dummy parameter of `0` and
 /// consume no word.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Decoder {
     /// The four opcodes of the packing word currently being consumed.
     packed: [u8; 4],

@@ -35,6 +35,7 @@ pub struct Pixel3d {
 }
 
 /// The 3D engine's 256×192 output buffer plus its depth, polygon-ID, and stencil buffers.
+#[derive(Clone)]
 pub struct Framebuffer3d {
     pub pixels: Vec<Pixel3d>,
     /// Per-pixel depth; smaller is nearer. Cleared to the far value each frame.

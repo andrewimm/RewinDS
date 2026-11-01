@@ -23,7 +23,7 @@ const FIFO_DEPTH: usize = 16;
 /// The shared IPC state for both cores. Per-core arrays are indexed by
 /// [`Core::index`]; `fifo[c]` is the queue core `c` **sends into** (the remote
 /// receives from it).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Ipc {
     /// IPCSYNC data output (bits 8-11) each core presents to the other.
     sync_out: [u8; 2],

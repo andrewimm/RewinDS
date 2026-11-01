@@ -23,6 +23,7 @@
 use emu_core::Timestamp;
 
 /// The Wi-Fi I/O register window, 4 KB of 16-bit registers at `0x4808000`.
+#[derive(Clone)]
 pub struct Wifi {
     regs: Box<[u16]>,
     /// The 8 KB Wi-Fi RAM (`0x4804000..0x4806000`, GBATEK "Wifi RAM" / MAC memory — the

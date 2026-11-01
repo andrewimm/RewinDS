@@ -20,7 +20,7 @@ const DIV_CYCLES_64: Timestamp = 68; // 64/32 and 64/64
 const SQRT_CYCLES: Timestamp = 26;
 
 /// The division (`0x280`) and square-root (`0x2B0`) units.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Math {
     /// `DIVCNT`: bits 0-1 = mode (0 = 32/32, 1 = 64/32, 2 = 64/64), bit 14 = div-by-
     /// zero flag, bit 15 = busy (set until [`Self::div_done_at`]).

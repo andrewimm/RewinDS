@@ -50,6 +50,7 @@ impl IrqMode {
 }
 
 /// The command ring buffer plus its IRQ mode.
+#[derive(Clone)]
 pub struct Fifo {
     buf: Box<[Entry]>,
     /// Index of the next entry to pop.

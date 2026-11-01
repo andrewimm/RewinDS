@@ -21,6 +21,7 @@ const INVALID: u32 = u32::MAX;
 
 /// A timing-only N-way set-associative cache: tracks which 32-byte lines are
 /// resident (by line number = `address >> 5`) so accesses can be charged hit/miss.
+#[derive(Clone)]
 pub struct Cache {
     sets: usize,
     ways: usize,

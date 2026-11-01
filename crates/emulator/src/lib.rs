@@ -27,6 +27,7 @@
 //! it is deferred until an NDS machine exists.
 
 pub mod audio;
+pub mod rewind;
 
 pub use audio::AudioSource;
 
@@ -176,6 +177,15 @@ pub enum Emulator {
     Nds(NdsEmulator),
 }
 
+/// A full-state snapshot of the emulated machine, produced by [`Emulator::snapshot`] and
+/// restored by [`Emulator::restore`]. It is a deep clone of the inner `System` (so it holds
+/// only emulated state — no host present/audio buffers), boxed to keep it off the stack.
+/// The rewind [`Timeline`](crate::rewind::Timeline) keeps a ring of these as keyframes.
+pub enum Snapshot {
+    Gba(Box<gba::System>),
+    Nds(Box<nds::System>),
+}
+
 impl Emulator {
     /// Build a machine from the given image. See [`LoadError`] for the failures.
     pub fn load(cfg: Load) -> Result<Emulator, LoadError> {
@@ -284,15 +294,54 @@ impl Emulator {
     /// Set the input state applied on subsequent frames.
     pub fn set_input(&mut self, input: Input) {
         match self {
-            Emulator::Gba(g) => g.set_input(input),
+            Emulator::Gba(g) => {
+                g.last_input = input;
+                g.set_input(input);
+            }
             // The DS keypad shares the low-ten bit order; touch maps the lower screen.
             Emulator::Nds(n) => {
+                n.last_input = input;
                 n.system.set_keypad(input.buttons);
                 n.system.set_touch(input.touch_pressed.then_some((
                     input.touch_x as i32,
                     input.touch_y as i32,
                 )));
             }
+        }
+    }
+
+    /// The input most recently applied via [`Self::set_input`]. The rewind
+    /// [`Timeline`](crate::rewind::Timeline) records this each frame to replay deterministically.
+    pub fn last_input(&self) -> Input {
+        match self {
+            Emulator::Gba(g) => g.last_input,
+            Emulator::Nds(n) => n.last_input,
+        }
+    }
+
+    /// A full-state snapshot of the emulated machine (not the host-facing present/audio
+    /// buffers): a deep clone of the inner `System`, for rewind/time-travel. Deliberately
+    /// out of the hot path — nothing takes one unless rewind is enabled.
+    pub fn snapshot(&self) -> Snapshot {
+        match self {
+            Emulator::Gba(g) => Snapshot::Gba(Box::new(g.system.clone())),
+            Emulator::Nds(n) => Snapshot::Nds(Box::new(n.system.clone())),
+        }
+    }
+
+    /// Restore a snapshot taken by [`Self::snapshot`], returning the machine to that exact
+    /// state and refreshing the present buffer. A snapshot from the other console is ignored.
+    pub fn restore(&mut self, snapshot: &Snapshot) {
+        match (self, snapshot) {
+            (Emulator::Gba(g), Snapshot::Gba(s)) => {
+                g.system = (**s).clone();
+                g.refresh_rgba();
+            }
+            (Emulator::Nds(n), Snapshot::Nds(s)) => {
+                n.system = (**s).clone();
+                n.refresh_rgba();
+            }
+            _ => {}
         }
     }
 
@@ -614,6 +663,9 @@ pub struct NdsEmulator {
     rgba: [Vec<u8>; 2],
     audio: Option<audio::AudioSink>,
     audio_muted: bool,
+    /// The input most recently applied via [`Emulator::set_input`], so the rewind
+    /// [`Timeline`](crate::rewind::Timeline) can record what drove each frame for replay.
+    last_input: Input,
 }
 
 impl NdsEmulator {
@@ -626,6 +678,7 @@ impl NdsEmulator {
             ],
             audio: None,
             audio_muted: false,
+            last_input: Input::default(),
         }
     }
 
@@ -684,6 +737,8 @@ pub struct GbaEmulator {
     /// Stable backing for the outbound serial frame returned by
     /// [`Emulator::link_poll_out`] (valid until the next mutating call).
     link_out: [u8; gba::LINK_FRAME_LEN],
+    /// The input most recently applied via [`Emulator::set_input`] (see the NDS field).
+    last_input: Input,
 }
 
 impl GbaEmulator {
@@ -694,6 +749,7 @@ impl GbaEmulator {
             audio: None,
             audio_muted: false,
             link_out: [0; gba::LINK_FRAME_LEN],
+            last_input: Input::default(),
         };
         g.refresh_rgba();
         g
@@ -897,5 +953,130 @@ mod tests {
         emu.set_input(input);
         let system = emu.as_gba().unwrap();
         assert!(system.gba.bus.io.keypad.is_pressed(gba::Key::A));
+    }
+
+    /// A DS ROM whose ARM9 spins incrementing a counter and writes it to the BG backdrop
+    /// palette every iteration, so the top-screen colour changes deterministically every
+    /// frame. That makes a rewind round-trip a real test: a reconstructed frame must match a
+    /// fresh run bit-for-bit, which can only hold if the snapshot captured *all* state (CPU
+    /// registers, memory, and the exact cycle position).
+    fn counter_rom() -> Vec<u8> {
+        fn put(rom: &mut [u8], off: usize, v: u32) {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut rom = vec![0u8; 0x6000];
+        put(&mut rom, 0x20, 0x4000);
+        put(&mut rom, 0x24, 0x0200_0000);
+        put(&mut rom, 0x28, 0x0200_0000);
+        put(&mut rom, 0x2C, 8 * 4); // ARM9 size
+        put(&mut rom, 0x30, 0x5000);
+        put(&mut rom, 0x34, 0x0210_0000);
+        put(&mut rom, 0x38, 0x0210_0000);
+        put(&mut rom, 0x3C, 4);
+        let arm9 = [
+            0xE3A0_0650u32, // mov r0, #0x0500_0000   (BG palette)
+            0xE3A0_4640,    // mov r4, #0x0400_0000   (DISPCNT)
+            0xE3A0_3801,    // mov r3, #0x0001_0000   (display mode 1 = graphics)
+            0xE584_3000,    // str r3, [r4]
+            0xE3A0_1000,    // mov r1, #0             (counter)
+            0xE281_1001,    // add r1, r1, #1   <- loop
+            0xE1C0_10B0,    // strh r1, [r0]          (backdrop = counter low 16 bits)
+            0xEAFF_FFFC,    // b loop
+        ];
+        for (i, w) in arm9.iter().enumerate() {
+            put(&mut rom, 0x4000 + i * 4, *w);
+        }
+        put(&mut rom, 0x5000, 0xEAFF_FFFE); // ARM7: b .
+        rom
+    }
+
+    #[test]
+    fn rewind_reconstructs_past_frames_exactly() {
+        use crate::rewind::Timeline;
+        let rom = counter_rom();
+        let load = || {
+            Emulator::load(Load {
+                console: Some(Console::Nds),
+                rom: Some(&rom),
+                bios: None,
+                bios7: None,
+                firmware: None,
+            })
+            .unwrap()
+        };
+        // Vary the input while recording, to exercise the input log's record/replay path.
+        let input_for = |f: u64| {
+            let mut i = Input::default();
+            i.set(button::A, f.is_multiple_of(2));
+            i.set(button::RIGHT, f.is_multiple_of(3));
+            i
+        };
+
+        let mut a = load();
+        let mut tl = Timeline::new(4, 16); // keyframe every 4 frames, 16 retained
+        for f in 1..=40u64 {
+            a.set_input(input_for(f));
+            a.run_frame();
+            tl.record(&a);
+        }
+        assert_eq!(tl.newest_frame(), 40);
+        assert_eq!(tl.cursor(), 40);
+
+        // The backdrop at a seeked frame must equal a fresh run to that frame, for several
+        // targets: ones that land on a keyframe (instant restore) and ones that need replay.
+        for target in [40u64, 20, 21, 13, 8] {
+            tl.seek(&mut a, target);
+            assert_eq!(tl.cursor(), target);
+            let seeked = a.screen(0).unwrap().rgba[0..4].to_vec();
+
+            let mut b = load();
+            for f in 1..=target {
+                b.set_input(input_for(f));
+                b.run_frame();
+            }
+            let fresh = b.screen(0).unwrap().rgba[0..4].to_vec();
+            assert_eq!(seeked, fresh, "frame {target}: rewound state must match a fresh run");
+        }
+
+        // The colour must actually change across frames, or the comparison is vacuous.
+        tl.seek(&mut a, 8);
+        let c8 = a.screen(0).unwrap().rgba[0..4].to_vec();
+        tl.seek(&mut a, 40);
+        let c40 = a.screen(0).unwrap().rgba[0..4].to_vec();
+        assert_ne!(c8, c40, "frames must diverge, else the round-trip test is vacuous");
+
+        // step_back walks one frame at a time and stays exact.
+        assert_eq!(tl.step_back(&mut a), 39);
+        let back39 = a.screen(0).unwrap().rgba[0..4].to_vec();
+        tl.seek(&mut a, 39);
+        assert_eq!(a.screen(0).unwrap().rgba[0..4].to_vec(), back39);
+    }
+
+    #[test]
+    fn rewind_branches_when_resuming_from_the_past() {
+        use crate::rewind::Timeline;
+        let rom = counter_rom();
+        let load = || {
+            Emulator::load(Load {
+                console: Some(Console::Nds),
+                rom: Some(&rom),
+                bios: None,
+                bios7: None,
+                firmware: None,
+            })
+            .unwrap()
+        };
+        let mut a = load();
+        let mut tl = Timeline::new(2, 32);
+        for _ in 1..=20u64 {
+            a.run_frame();
+            tl.record(&a);
+        }
+        // Rewind into the past and resume: the live edge moves back to the branch point.
+        tl.seek(&mut a, 10);
+        a.run_frame();
+        tl.record(&a);
+        assert_eq!(tl.newest_frame(), 11, "resuming from frame 10 branches the timeline");
+        assert_eq!(tl.cursor(), 11);
     }
 }

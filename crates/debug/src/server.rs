@@ -19,6 +19,7 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 
+use emulator::rewind::Timeline;
 use emulator::Emulator;
 use gba::{Access, System};
 use serde_json::{json, Value};
@@ -71,8 +72,9 @@ fn listen(port: u16) -> std::io::Result<mpsc::Receiver<Request>> {
 pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
     let rx = listen(port)?;
     eprintln!("[debug] listening on 127.0.0.1:{port} ({:?})", emu.console());
+    let mut timeline: Option<Timeline> = None;
     while let Ok((line, rtx)) = rx.recv() {
-        let _ = rtx.send(handle(&mut emu, &line));
+        let _ = rtx.send(handle(&mut emu, &mut timeline, &line));
     }
     Ok(())
 }
@@ -83,26 +85,33 @@ pub fn serve(mut emu: Emulator, port: u16) -> std::io::Result<()> {
 /// inspects live — e.g. attaching to a hang the moment it happens.
 pub struct Attached {
     rx: mpsc::Receiver<Request>,
+    /// The rewind recorder, present only while rewind is enabled (via `rewind.enable`), so a
+    /// live session carries no overhead until the user turns it on.
+    timeline: Option<Timeline>,
 }
 
 /// Bind `port` for an attached session (see [`Attached`]). Does not block.
 pub fn attach(port: u16) -> std::io::Result<Attached> {
     let rx = listen(port)?;
     eprintln!("[debug] attached debug server on 127.0.0.1:{port} (play as normal; connect to inspect)");
-    Ok(Attached { rx })
+    Ok(Attached { rx, timeline: None })
 }
 
 impl Attached {
     /// Handle every debug request received since the last call, without blocking. Call
-    /// once per frame from the host loop (single-threaded with the emulator).
-    pub fn poll(&self, emu: &mut Emulator) {
+    /// once per frame from the host loop (single-threaded with the emulator), *after* the
+    /// host has run the frame — so an enabled rewind timeline records the live play.
+    pub fn poll(&mut self, emu: &mut Emulator) {
+        if let Some(tl) = self.timeline.as_mut() {
+            tl.record(emu);
+        }
         while let Ok((line, rtx)) = self.rx.try_recv() {
-            let _ = rtx.send(handle(emu, &line));
+            let _ = rtx.send(handle(emu, &mut self.timeline, &line));
         }
     }
 }
 
-fn handle(emu: &mut Emulator, line: &str) -> String {
+fn handle(emu: &mut Emulator, timeline: &mut Option<Timeline>, line: &str) -> String {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "error": format!("bad json: {e}")}).to_string(),
@@ -110,7 +119,7 @@ fn handle(emu: &mut Emulator, line: &str) -> String {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(emu, method, &params) {
+    match dispatch(emu, timeline, method, &params) {
         Ok(result) => json!({"id": id, "ok": true, "result": result}).to_string(),
         Err(e) => json!({"id": id, "ok": false, "error": e}).to_string(),
     }
@@ -198,12 +207,20 @@ fn state_summary(emu: &mut Emulator) -> Value {
     json!({ "console": format!("{:?}", dbg.emulator().console()), "frame": frame, "pc": pc, "videoMode": mode })
 }
 
-fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, String> {
+fn dispatch(
+    emu: &mut Emulator,
+    timeline: &mut Option<Timeline>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
     Ok(match method {
         // --- run control (console-agnostic) ---
         "run.frames" => {
             for _ in 0..u64p(params, "n", 1) {
                 emu.run_frame();
+                if let Some(tl) = timeline.as_mut() {
+                    tl.record(emu);
+                }
             }
             state_summary(emu)
         }
@@ -212,9 +229,59 @@ fn dispatch(emu: &mut Emulator, method: &str, params: &Value) -> Result<Value, S
             let mut guard = 0;
             while emu.frame() < target && guard < 100_000 {
                 emu.run_frame();
+                if let Some(tl) = timeline.as_mut() {
+                    tl.record(emu);
+                }
                 guard += 1;
             }
             state_summary(emu)
+        }
+        // --- rewind / time-travel debugging ---
+        // Turn on recording: from here each frame logs its input, and a full snapshot is
+        // kept every `keyframeInterval` frames (default 30), up to `capacity` keyframes
+        // (default 60 → ~30 s of history). Both bound the memory cost; rewind is off (and
+        // free) until this is called.
+        "rewind.enable" => {
+            let interval = u32p_or(params, "keyframeInterval", 30);
+            let capacity = u64p(params, "capacity", 60) as usize;
+            let mut tl = Timeline::new(interval, capacity);
+            // Capture the current frame as the first keyframe so the past starts here.
+            tl.record(emu);
+            *timeline = Some(tl);
+            json!({"enabled": true, "keyframeInterval": interval, "capacity": capacity})
+        }
+        "rewind.disable" => {
+            *timeline = None;
+            json!({"enabled": false})
+        }
+        // The recorded range and where the cursor sits (what the emulator currently shows).
+        "rewind.timeline" => match timeline.as_ref() {
+            Some(tl) => json!({
+                "enabled": true,
+                "oldest": tl.oldest_frame(),
+                "newest": tl.newest_frame(),
+                "cursor": tl.cursor(),
+                "keyframes": tl.keyframe_frames(),
+            }),
+            None => json!({"enabled": false}),
+        },
+        // Reconstruct a past frame: restore the nearest keyframe and replay inputs to it.
+        // Leaves the emulator at that frame for inspection.
+        "rewind.seek" => {
+            let tl = timeline.as_mut().ok_or("rewind is not enabled")?;
+            let target = u64p(params, "frame", tl.cursor());
+            let reached = tl.seek(emu, target);
+            let mut out = state_summary(emu);
+            out["cursor"] = json!(reached);
+            out
+        }
+        // Step one frame into the past.
+        "rewind.stepBack" => {
+            let tl = timeline.as_mut().ok_or("rewind is not enabled")?;
+            let reached = tl.step_back(emu);
+            let mut out = state_summary(emu);
+            out["cursor"] = json!(reached);
+            out
         }
         // Timing benchmark: run N frames as fast as possible and report wall-clock
         // throughput — frames/sec and per-frame microseconds. Real-time is 59.83 fps.

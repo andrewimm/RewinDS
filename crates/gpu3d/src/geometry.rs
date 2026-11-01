@@ -98,7 +98,7 @@ fn explain_polygon_from(polygons: &[Polygon], i: usize) -> Option<Polygon3dProve
 /// geometry engine and the rasterizer. `SWAP_BUFFERS` moves the build buffer here; the
 /// rasterizer (Phase 8) consumes it. Carries the swap parameter (depth mode and
 /// translucent sort) and its own provenance so a rendered pixel is explainable.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RenderList {
     vertices: Vec<Vertex>,
     polygons: Vec<Polygon>,
@@ -169,6 +169,7 @@ struct Light {
 
 /// Material colors, the shininess table, and the four lights — the lighting state
 /// sampled by `NORMAL`. Colors are 6-bit (0-63); levels use a 1/512 fixed scale.
+#[derive(Clone)]
 struct Lighting {
     emission: [i32; 3],
     diffuse: [i32; 3],
@@ -349,7 +350,7 @@ struct State {
 
 /// Groups the stream of submitted vertices into primitives per the `BEGIN_VTXS` type,
 /// returning a primitive's (pre-clip) vertices as soon as one completes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Assembler {
     prim: u8,
     /// Vertices submitted since `begin` (kept for strips; cleared after each complete
@@ -399,7 +400,7 @@ impl Assembler {
 }
 
 /// The geometry engine: matrix stack, current state, and the post-clip build buffers.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GeometryEngine {
     pub matrix: MatrixEngine,
     state: State,

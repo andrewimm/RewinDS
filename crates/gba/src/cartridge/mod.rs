@@ -140,9 +140,13 @@ impl Cartridge {
         self.gpio.as_ref()?.read(addr & 0x01FF_FFFF)
     }
 
-    /// Write a cartridge GPIO register; returns whether it was a GPIO write.
-    pub fn gpio_write(&mut self, addr: u32, value: u16) -> bool {
-        self.gpio.as_mut().is_some_and(|g| g.write(addr & 0x01FF_FFFF, value))
+    /// Write a cartridge GPIO register; returns whether it was a GPIO write. `now` is the
+    /// scheduler clock, so an RTC datetime read reflects the current emulated time.
+    pub fn gpio_write(&mut self, addr: u32, value: u16, now: emu_core::Timestamp) -> bool {
+        self.gpio.as_mut().is_some_and(|g| {
+            g.set_now(now);
+            g.write(addr & 0x01FF_FFFF, value)
+        })
     }
 
     /// The detected (or overridden) save type. For EEPROM the reported size tracks

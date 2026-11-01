@@ -32,6 +32,7 @@ const DEVICE_FIRMWARE: u16 = 1;
 const DEVICE_TOUCH: u16 = 2;
 
 /// The SPI bus controller and the firmware-flash device on it.
+#[derive(Clone)]
 pub struct Spi {
     /// `SPICNT` (`0x40001C0`). The busy flag (bit 7) always reads 0.
     cnt: u16,

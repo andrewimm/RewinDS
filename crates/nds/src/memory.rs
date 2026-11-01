@@ -65,6 +65,7 @@ enum Slot {
 }
 
 /// The DS memory image: all backing stores plus the `WRAMCNT` split.
+#[derive(Clone)]
 pub struct Memory {
     pub main: Box<[u8]>,
     pub shared_wram: Box<[u8]>,

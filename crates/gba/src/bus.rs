@@ -315,7 +315,7 @@ impl Bus {
                 if self.cartridge.is_eeprom_at(addr) {
                     self.cartridge.eeprom_write(value & 1 != 0);
                 } else {
-                    self.cartridge.gpio_write(addr, value as u16);
+                    self.cartridge.gpio_write(addr, value as u16, scheduler.now());
                 }
                 BusResult::plain((), self.rom_cycles(addr >> 24, width, access.sequence))
             }

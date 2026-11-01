@@ -72,6 +72,17 @@ export class Debugger {
   traceDisasm(path, { skip = 0, count = 1000, core = 0 } = {}) { return this.call('run.traceDisasm', { path, skip, count, core }); }
   traceRegs(path, { skip = 0, count = 1000, core = 0 } = {}) { return this.call('run.traceRegs', { path, skip, count, core }); }
 
+  // --- rewind / time-travel debugging ---
+  // Start recording. keyframeInterval = frames between full snapshots (default 30);
+  // capacity = snapshots retained (default 60). History depth ~= interval*capacity frames.
+  rewindEnable({ keyframeInterval = 30, capacity = 60 } = {}) { return this.call('rewind.enable', { keyframeInterval, capacity }); }
+  rewindDisable() { return this.call('rewind.disable'); }
+  // { enabled, oldest, newest, cursor, keyframes } — the recorded range and current position.
+  rewindTimeline() { return this.call('rewind.timeline'); }
+  // Reconstruct a past frame (restore nearest keyframe + replay); leaves the emulator there.
+  rewindSeek(frame) { return this.call('rewind.seek', { frame }); }
+  rewindStepBack() { return this.call('rewind.stepBack'); }
+
   // --- cpu ---
   registers() { return this.call('cpu.registers'); }
   setReg(index, value) { return this.call('cpu.setReg', { index, value }); }

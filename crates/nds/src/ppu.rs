@@ -52,6 +52,7 @@ pub enum PpuEvent {
 
 /// One 2D engine: its `DISPCNT`, the shared 2D register block, a reusable flat VRAM
 /// view, the renderer's working state, and the output framebuffer.
+#[derive(Clone)]
 struct Engine {
     /// Sub-engine (B) vs main (A): selects the VRAM regions and the limited display
     /// modes, and drops the DISPCNT char/screen base bits.
@@ -309,6 +310,7 @@ impl Engine {
 }
 
 /// The two 2D engines plus the shared scanline timeline.
+#[derive(Clone)]
 pub struct Ppu {
     /// Index 0 = Engine A (main), 1 = Engine B (sub).
     engines: [Engine; 2],

@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Optional attached debug server: the game runs in real time in this window while a
     // debug client inspects live over the socket — e.g. connect the moment a hang happens
     // and run execution.hottestPc / disassemble to see where the CPU is stuck.
-    let attached = match debug_attach {
+    let mut attached = match debug_attach {
         Some(port) => Some(debug::server::attach(port)?),
         None => None,
     };
@@ -322,7 +322,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Service any attached debug-client requests against the just-advanced state.
-        if let Some(a) = &attached {
+        if let Some(a) = &mut attached {
             a.poll(&mut emulator);
         }
 

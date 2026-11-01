@@ -49,6 +49,7 @@ mod reg {
 
 /// The 3D engine device: the command FIFO and its decoder, the geometry engine, the
 /// rasterizer's output buffer, texture VRAM, and the GX control registers.
+#[derive(Clone)]
 pub struct Gpu3d {
     fifo: Fifo,
     decoder: Decoder,

@@ -166,7 +166,7 @@ pub enum NdsEvent {
 /// step; the boundary combines them (with the CPU's taken-branch signal) into one
 /// cost. `code_last`/`data_last` are the separate sequential-access trackers (an
 /// access is sequential iff its address is the previous one plus its width).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct CoreTiming {
     /// Code-fetch cost of this instruction (i-cache hit/miss on ARM9), the `cFetch`.
     pub fetch: u32,
@@ -256,6 +256,7 @@ impl CoreTiming {
 
 /// Everything reachable through the bus: the memory image, CP15, the per-core
 /// local clocks, and (later) the devices. It is the timeline's [`EventHandler`].
+#[derive(Clone)]
 pub struct Machine {
     pub(crate) memory: Memory,
     pub(crate) cp15: Cp15,
@@ -1092,6 +1093,7 @@ impl EventHandler<NdsEvent> for Machine {
 }
 
 /// The Nintendo DS: two cores, one shared timeline, one machine.
+#[derive(Clone)]
 pub struct System {
     pub arm9: Cpu,
     pub arm7: Cpu,

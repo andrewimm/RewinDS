@@ -33,6 +33,7 @@ mod reg {
 }
 
 /// The RTC serial device behind the `0x4000138` port.
+#[derive(Clone)]
 pub struct Rtc {
     // --- serial bus state ---
     /// Last value written to the port (upper control bits echo back on reads).

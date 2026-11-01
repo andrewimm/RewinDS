@@ -43,7 +43,7 @@ enum Format {
 }
 
 /// One of the 16 sound channels: its registers plus the playback cursor.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Channel {
     /// The channel's index 0..=15 (8-13 are PSG square, 14-15 are PSG noise).
     index: usize,
@@ -297,6 +297,7 @@ impl Channel {
 }
 
 /// The 16-channel sound engine and the master control registers.
+#[derive(Clone)]
 pub struct Sound {
     channels: [Channel; 16],
     /// `SOUNDCNT` (`0x4000500`): master volume (bits 0-6) and master enable (bit 15).
